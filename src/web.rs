@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -214,18 +214,17 @@ impl WebStore {
 
 	/// Opens or creates the IndexedDB database
 	async fn open_database(&self) -> Result<IdbDatabase> {
-		let window =
-			web_sys::window().ok_or_else(|| Error::new(ErrorKind::Other, "No window object"))?;
+		let window = web_sys::window().ok_or_else(|| Error::other("No window object"))?;
 
 		let idb_factory = window
 			.indexed_db()
-			.map_err(|e| Error::new(ErrorKind::Other, format!("IndexedDB error: {:?}", e)))?
-			.ok_or_else(|| Error::new(ErrorKind::Other, "IndexedDB not available"))?;
+			.map_err(|e| Error::other(format!("IndexedDB error: {:?}", e)))?
+			.ok_or_else(|| Error::other("IndexedDB not available"))?;
 
 		// Create open request
 		let open_request = idb_factory
 			.open_with_f64(&self.config.database_name, DB_VERSION as f64)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Failed to open DB: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Failed to open DB: {:?}", e)))?;
 
 		// Set up upgrade handler for first-time creation
 		let on_upgrade = Closure::once(move |event: web_sys::IdbVersionChangeEvent| {
@@ -261,15 +260,15 @@ impl WebStore {
 
 		let transaction = db
 			.transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readonly)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Transaction error: {:?}", e)))?;
 
 		let store = transaction
 			.object_store(STORE_NAME)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Object store error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Object store error: {:?}", e)))?;
 
 		let request = store
 			.get_all()
-			.map_err(|e| Error::new(ErrorKind::Other, format!("GetAll error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("GetAll error: {:?}", e)))?;
 
 		let result = Self::await_request::<JsValue>(&request).await?;
 
@@ -322,22 +321,22 @@ impl WebStore {
 	async fn write_to_idb(db: &IdbDatabase, _write_key: &str, event: &StoredEvent) -> Result<()> {
 		let transaction = db
 			.transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Transaction error: {:?}", e)))?;
 
 		let store = transaction
 			.object_store(STORE_NAME)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Object store error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Object store error: {:?}", e)))?;
 
 		// Convert to JsValue
 		let json_str = serde_json::to_string(&event.value)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("JSON error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("JSON error: {:?}", e)))?;
 
 		let js_value = js_sys::JSON::parse(&json_str)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("JS JSON parse error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("JS JSON parse error: {:?}", e)))?;
 
 		let request = store
 			.add(&js_value)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Add error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Add error: {:?}", e)))?;
 
 		Self::await_request::<JsValue>(&request).await?;
 
@@ -360,15 +359,15 @@ impl WebStore {
 	async fn delete_from_idb(db: &IdbDatabase, idb_key: u32) -> Result<()> {
 		let transaction = db
 			.transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Transaction error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Transaction error: {:?}", e)))?;
 
 		let store = transaction
 			.object_store(STORE_NAME)
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Object store error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Object store error: {:?}", e)))?;
 
 		let request = store
 			.delete(&JsValue::from(idb_key))
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Delete error: {:?}", e)))?;
+			.map_err(|e| Error::other(format!("Delete error: {:?}", e)))?;
 
 		Self::await_request::<JsValue>(&request).await?;
 
@@ -390,10 +389,7 @@ impl WebStore {
 		let error_sender = sender.clone();
 		let onerror = Closure::once(move |_event: web_sys::Event| {
 			if let Some(sender) = error_sender.borrow_mut().take() {
-				let _ = sender.send(Err(Error::new(
-					ErrorKind::Other,
-					"IndexedDB request failed",
-				)));
+				let _ = sender.send(Err(Error::other("IndexedDB request failed")));
 			}
 		});
 
@@ -405,13 +401,13 @@ impl WebStore {
 
 		receiver
 			.await
-			.map_err(|_| Error::new(ErrorKind::Other, "Channel closed"))??;
+			.map_err(|_| Error::other("Channel closed"))??;
 
 		request
 			.result()
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Result error: {:?}", e)))?
+			.map_err(|e| Error::other(format!("Result error: {:?}", e)))?
 			.dyn_into::<T>()
-			.map_err(|_| Error::new(ErrorKind::Other, "Type cast failed"))
+			.map_err(|_| Error::other("Type cast failed"))
 	}
 
 	/// Creates a JSON batch object containing the provided items and metadata.

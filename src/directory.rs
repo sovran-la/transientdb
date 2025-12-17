@@ -208,8 +208,7 @@ impl DirectoryStore {
 					attempts += 1;
 
 					if attempts >= MAX_ATTEMPTS {
-						return Err(io::Error::new(
-							io::ErrorKind::Other,
+						return Err(io::Error::other(
 							"Failed to find available index after maximum attempts",
 						));
 					}
@@ -385,7 +384,7 @@ impl DataStore for DirectoryStore {
 		let writer = self
 			.writer
 			.as_mut()
-			.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No active writer"))?;
+			.ok_or_else(|| io::Error::other("No active writer"))?;
 
 		if self.current_size >= self.config.max_file_size {
 			self.finish_file()?;
