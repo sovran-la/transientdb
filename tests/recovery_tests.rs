@@ -1,3 +1,6 @@
+//! Recovery tests for DirectoryStore - native only (uses filesystem APIs)
+#![cfg(not(target_arch = "wasm32"))]
+
 use rand::seq::IteratorRandom;
 use rand::Rng;
 use serde_json::json;

@@ -2,6 +2,9 @@ mod directory;
 mod memory;
 mod transient;
 
+#[cfg(feature = "web")]
+mod web;
+
 use serde_json::Value;
 use std::any::Any;
 use std::fmt::Debug;
@@ -10,6 +13,9 @@ use std::io::Result;
 pub use directory::{DirectoryConfig, DirectoryStore};
 pub use memory::{MemoryConfig, MemoryStore};
 pub use transient::TransientDB;
+
+#[cfg(feature = "web")]
+pub use web::{PersistenceState, WebConfig, WebStore};
 
 /// Represents the result of a data fetch operation.
 /// Contains either raw data bytes or paths to data files, along with items that can be removed.

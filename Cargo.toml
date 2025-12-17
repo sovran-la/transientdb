@@ -1,7 +1,7 @@
 
 [package]
 name = "transientdb"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["Sovran.la <support@sovran.la>"]
 description = "A lightweight, thread-safe temporary data storage system designed for efficient handling of transient data in Rust applications"
@@ -11,16 +11,56 @@ readme = "README.md"
 keywords = ["database", "storage", "temporary", "thread-safe"]
 categories = ["database"]
 
+[features]
+default = []
+web = ["web-sys", "js-sys", "wasm-bindgen", "wasm-bindgen-futures", "futures-channel"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
 toml_edit = "0.22"
 
+# Web/WASM dependencies (optional)
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+futures-channel = { version = "0.3", optional = true }
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+features = [
+    "console",
+    "Window",
+    "Event",
+    "EventTarget",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "DomStringList",
+]
+
 [dev-dependencies]
 tempfile = "3.14.0"
 rand = "0.9.0-alpha.2"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
 [[bin]]
 name = "release"
 path = "tools/release.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(wasm_bindgen_unstable_test_coverage)"] }
