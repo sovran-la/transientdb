@@ -7,6 +7,7 @@ TransientDB is a lightweight, thread-safe temporary data storage system designed
 - **Multiple Storage Backends**
     - In-memory storage with configurable size limits
     - File-based storage with automatic file rotation
+    - Browser-based IndexedDB storage for WASM targets
     - Extensible interface for custom implementations
 
 - **Thread-Safe Operations**
@@ -33,7 +34,14 @@ Add TransientDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-transientdb = "0.1.0"  # Replace with actual version
+transientdb = "0.1.8"  # Replace with actual version
+```
+
+For WASM/browser targets, enable the `web` feature:
+
+```toml
+[dependencies]
+transientdb = { version = "0.1.8", features = ["web"] }
 ```
 
 ## Core Types
@@ -153,6 +161,58 @@ if let Some(result) = db.fetch(None, None)? {
 }
 ```
 
+### Web Store Example (WASM)
+
+```rust
+use transientdb::{WebConfig, WebStore, PersistenceState};
+use serde_json::json;
+
+// Configure a browser-based store
+let config = WebConfig {
+    write_key: "my-app".into(),
+    database_name: "my-app-events".into(),
+    max_items: 1000,
+    max_fetch_size: 1024 * 1024, // 1MB
+};
+
+// Create the store (async - opens IndexedDB)
+let mut store = WebStore::new(config).await;
+
+// Check persistence state - IndexedDB may be unavailable
+// in private browsing or third-party iframe contexts
+match store.persistence_state() {
+    PersistenceState::Persisted => {
+        // Full persistence available
+    }
+    PersistenceState::MemoryOnly => {
+        // Degraded mode - consider flushing more frequently
+        println!("Warning: Running in memory-only mode");
+    }
+}
+
+// Append data (sync operation)
+store.append(json!({
+    "event": "page_view",
+    "url": "/home"
+}))?;
+
+// Fetch data
+if let Some(result) = store.fetch(Some(100), None)? {
+    if let Some(batch) = result.data {
+        // Process the batch
+        if let Some(items) = batch["batch"].as_array() {
+            for item in items {
+                println!("Processing event: {}", item["event"]);
+            }
+        }
+    }
+    // Clean up processed items
+    if let Some(removable) = result.removable {
+        store.remove(&removable)?;
+    }
+}
+```
+
 ## Storage Implementations
 
 ### MemoryStore
@@ -170,6 +230,20 @@ if let Some(result) = db.fetch(None, None)? {
 - Requires explicit cleanup via remove()
 - Ideal for larger datasets and persistent storage needs
 
+### WebStore (WASM)
+- Browser-based storage using IndexedDB
+- Async construction, sync operations (fire-and-forget persistence)
+- Graceful fallback to memory-only if IndexedDB unavailable
+- Automatic hydration from IndexedDB on startup
+- Ideal for web applications and browser-based analytics
+- Requires the `web` feature flag
+
+**Persistence States:**
+- `PersistenceState::Persisted` - IndexedDB available, data survives page refresh
+- `PersistenceState::MemoryOnly` - IndexedDB unavailable (private browsing, third-party context), data lost on refresh
+
+When in memory-only mode, consider increasing flush frequency to minimize data loss window.
+
 ## Configuration Options
 
 ### MemoryConfig
@@ -182,6 +256,12 @@ if let Some(result) = db.fetch(None, None)? {
 - `storage_location`: Directory path for storing files
 - `base_filename`: Base name for generated files
 - `max_file_size`: Maximum size in bytes for individual files (must be ≥ 100)
+
+### WebConfig
+- `write_key`: Identifier for the data source
+- `database_name`: Name of the IndexedDB database (use unique names per store)
+- `max_items`: Maximum number of items to store (must be > 0)
+- `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
 
 ## Data Format
 
@@ -231,7 +311,13 @@ The library includes an extensive test suite covering:
 Run the tests using:
 
 ```bash
+# Native tests
 cargo test
+
+# WASM tests (requires wasm-pack)
+wasm-pack test --headless --chrome --features web
+wasm-pack test --headless --firefox --features web
+wasm-pack test --headless --safari --features web  # macOS only
 ```
 
 ## License
