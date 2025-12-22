@@ -17,11 +17,28 @@ pub struct TransientDB<T> {
 	store: Mutex<Box<dyn DataStore<Output = T>>>,
 }
 
+// SAFETY: On WASM32, there are no threads. Send and Sync are vacuously satisfied
+// because there's nowhere to send to and nothing to synchronize with.
+//
+// This allows types like WebStore (which contains Rc<IdbDatabase>) to be used
+// with TransientDB on WASM targets without requiring complex trait gymnastics
+// that would propagate through the entire codebase.
+//
+// NOTE: If WASM gains real threading support (wasm32 + atomics + shared memory),
+// this will need to be revisited. However, that would likely be a different
+// compilation target requiring explicit opt-in.
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Send for TransientDB<T> {}
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Sync for TransientDB<T> {}
+
 impl<T> TransientDB<T> {
 	/// Creates a new TransientDB instance with the provided data store implementation.
 	///
 	/// # Arguments
-	/// * `store` - Any implementation of DataStore that is Send + 'static
+	/// * `store` - Any implementation of DataStore that is Send + 'static (on native)
+	///   or just DataStore + 'static (on WASM)
 	///
 	/// # Examples
 	/// ```
@@ -43,9 +60,6 @@ impl<T> TransientDB<T> {
 	}
 
 	/// Creates a new TransientDB instance with the provided data store implementation.
-	///
-	/// # Arguments
-	/// * `store` - Any implementation of DataStore
 	#[cfg(target_arch = "wasm32")]
 	pub fn new(store: impl DataStore<Output = T> + 'static) -> Self {
 		Self {

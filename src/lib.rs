@@ -14,29 +14,6 @@ pub use directory::{DirectoryConfig, DirectoryStore};
 pub use memory::{MemoryConfig, MemoryStore};
 pub use transient::TransientDB;
 
-// MaybeSend trait - allows Send bound on native, but is a no-op on WASM
-// since WASM is single-threaded and doesn't need Send.
-//
-// This enables WebStore (which uses Rc<IdbDatabase>) to work with TransientDB
-// on WASM targets while still requiring Send on native targets where
-// multi-threaded access is possible.
-
-/// A trait that requires `Send` on native targets but is automatically
-/// implemented for all types on WASM targets.
-///
-/// This allows types like `WebStore` (which contain `Rc<IdbDatabase>`)
-/// to be used with `TransientDB` on WASM, where the `Send` bound is
-/// meaningless since there are no threads.
-#[cfg(not(target_arch = "wasm32"))]
-pub trait MaybeSend: Send {}
-#[cfg(not(target_arch = "wasm32"))]
-impl<T: Send> MaybeSend for T {}
-
-#[cfg(target_arch = "wasm32")]
-pub trait MaybeSend {}
-#[cfg(target_arch = "wasm32")]
-impl<T> MaybeSend for T {}
-
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use web::{PersistenceState, WebConfig, WebStore};
 
@@ -61,11 +38,7 @@ pub trait Equivalent: Any + Debug {
 /// A trait for implementing persistent data stores that support batched operations.
 /// Provides a common interface for storing, retrieving, and managing data with support
 /// for size limits and batch processing.
-///
-/// This trait requires `MaybeSend`, which means:
-/// - On native targets: implementations must be `Send` (thread-safe)
-/// - On WASM targets: no restrictions (single-threaded environment)
-pub trait DataStore: MaybeSend {
+pub trait DataStore {
 	/// The type of data returned by fetch operations.
 	type Output;
 
