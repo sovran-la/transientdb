@@ -1,7 +1,7 @@
 
 [package]
 name = "transientdb"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Sovran.la <support@sovran.la>"]
 description = "A lightweight, thread-safe temporary data storage system designed for efficient handling of transient data in Rust applications"
