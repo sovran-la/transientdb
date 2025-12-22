@@ -2,7 +2,7 @@ mod directory;
 mod memory;
 mod transient;
 
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod web;
 
 use serde_json::Value;
@@ -37,7 +37,7 @@ pub trait MaybeSend {}
 #[cfg(target_arch = "wasm32")]
 impl<T> MaybeSend for T {}
 
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use web::{PersistenceState, WebConfig, WebStore};
 
 /// Represents the result of a data fetch operation.
