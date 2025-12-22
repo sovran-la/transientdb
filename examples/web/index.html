@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TransientDB WebStore Example</title>
+    <style>
+        :root {
+            --bg-color: #1a1a2e;
+            --card-bg: #16213e;
+            --text-color: #eee;
+            --accent-color: #e94560;
+            --success-color: #4ecca3;
+            --border-color: #0f3460;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: var(--accent-color);
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #888;
+            margin-bottom: 30px;
+        }
+
+        .output-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            font-family: 'Fira Code', 'Consolas', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-entry.error {
+            color: var(--accent-color);
+        }
+
+        .loading {
+            color: #888;
+            font-style: italic;
+        }
+
+        .footer {
+            margin-top: 20px;
+            color: #666;
+            font-size: 12px;
+            text-align: center;
+        }
+
+        .footer a {
+            color: var(--accent-color);
+            text-decoration: none;
+        }
+
+        .footer a:hover {
+            text-decoration: underline;
+        }
+
+        /* Scrollbar styling */
+        .output-card::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .output-card::-webkit-scrollbar-track {
+            background: var(--bg-color);
+            border-radius: 4px;
+        }
+
+        .output-card::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+
+        .output-card::-webkit-scrollbar-thumb:hover {
+            background: var(--accent-color);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🦀 TransientDB WebStore Example</h1>
+        <p class="subtitle">Demonstrating browser-based analytics storage with IndexedDB persistence</p>
+        
+        <div class="output-card">
+            <div id="output">
+                <div class="loading">Loading WASM module...</div>
+            </div>
+        </div>
+
+        <p class="footer">
+            <a href="https://github.com/sovran-rs/transientdb">TransientDB on GitHub</a>
+            &nbsp;|&nbsp;
+            Built with Rust + wasm-bindgen
+        </p>
+    </div>
+
+    <script type="module">
+        import init from './pkg/transientdb_web_example.js';
+        
+        async function run() {
+            try {
+                await init();
+            } catch (e) {
+                document.getElementById('output').innerHTML = 
+                    `<div class="log-entry error">❌ Failed to load WASM: ${e.message}</div>` +
+                    `<div class="log-entry">Make sure you've built with: wasm-pack build --target web</div>`;
+                console.error('Failed to load WASM:', e);
+            }
+        }
+        
+        run();
+    </script>
+</body>
+</html>

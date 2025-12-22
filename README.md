@@ -34,15 +34,17 @@ Add TransientDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-transientdb = "0.1.8"  # Replace with actual version
+transientdb = "0.2"  # Replace with actual version
 ```
 
 For WASM/browser targets, enable the `web` feature:
 
 ```toml
-[dependencies]
-transientdb = { version = "0.1.8", features = ["web"] }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+transientdb = { version = "0.2", features = ["web"] }
 ```
+
+> **Note:** The `web` feature only compiles on WASM targets. On native targets, it's automatically excluded.
 
 ## Core Types
 
@@ -164,7 +166,7 @@ if let Some(result) = db.fetch(None, None)? {
 ### Web Store Example (WASM)
 
 ```rust
-use transientdb::{WebConfig, WebStore, PersistenceState};
+use transientdb::{TransientDB, WebConfig, WebStore, PersistenceState};
 use serde_json::json;
 
 // Configure a browser-based store
@@ -176,7 +178,7 @@ let config = WebConfig {
 };
 
 // Create the store (async - opens IndexedDB)
-let mut store = WebStore::new(config).await;
+let store = WebStore::new(config).await;
 
 // Check persistence state - IndexedDB may be unavailable
 // in private browsing or third-party iframe contexts
@@ -190,14 +192,17 @@ match store.persistence_state() {
     }
 }
 
-// Append data (sync operation)
-store.append(json!({
+// Wrap in TransientDB for thread-safe access
+let db = TransientDB::new(store);
+
+// Append data
+db.append(json!({
     "event": "page_view",
     "url": "/home"
 }))?;
 
 // Fetch data
-if let Some(result) = store.fetch(Some(100), None)? {
+if let Some(result) = db.fetch(Some(100), None)? {
     if let Some(batch) = result.data {
         // Process the batch
         if let Some(items) = batch["batch"].as_array() {
@@ -208,10 +213,12 @@ if let Some(result) = store.fetch(Some(100), None)? {
     }
     // Clean up processed items
     if let Some(removable) = result.removable {
-        store.remove(&removable)?;
+        db.remove(&removable)?;
     }
 }
 ```
+
+> **See also:** The [`examples/web/`](examples/web/) directory contains a complete, runnable WASM example with HTML and build instructions.
 
 ## Storage Implementations
 
@@ -311,13 +318,18 @@ The library includes an extensive test suite covering:
 Run the tests using:
 
 ```bash
-# Native tests
+# Run all tests (native + WASM)
+./test_all.sh
+
+# Native tests only
 cargo test
 
-# WASM tests (requires wasm-pack)
+# WASM tests only (requires wasm-pack)
 wasm-pack test --headless --chrome --features web
+
+# Or use Firefox/Safari
 wasm-pack test --headless --firefox --features web
-wasm-pack test --headless --safari --features web  # macOS only
+wasm-pack test --safari --features web  # macOS only, not headless
 ```
 
 ## License
