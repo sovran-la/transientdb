@@ -199,10 +199,34 @@ edge cases where it's already at the size cap. Starting fresh eliminates all of 
 concerns. Small trailing files are not a problem — they get sent and deleted on the next
 flush cycle.
 
+### Multi-instance safety
+
+LedgerStore supports multiple instances writing to the same directory concurrently
+(e.g., two analytics instances configured with the same API key). This is safe because
+of two properties:
+
+1. **In-process:** `next_index` is an atomic integer (`AtomicU32` in Rust, atomic
+   property in Swift). Multiple threads within the same process get unique indices
+   without locking.
+
+2. **Cross-process:** Files are created with exclusive-create semantics
+   (`O_CREAT | O_EXCL` / `create_new(true)`). If two instances race to create the
+   same index, one succeeds and the other gets `AlreadyExists`, bumps its index,
+   and retries. This is atomic at the filesystem level.
+
+Because each record is self-contained and each instance writes to its own file, there
+is no interleaving. Instance A's files and instance B's files coexist in the directory.
+`fetch()` returns all of them. They all get sent and deleted independently.
+
+This eliminates the need for a duplicate-instance panic guard. What was previously a
+fatal error becomes a supported configuration.
+
 ### append(data: bytes) -> Result<()>
 
-1. If no active file is open, create `{next_index}-{base_filename}` and open for
-   append. Increment `next_index`.
+1. If no active file is open, create `{next_index}-{base_filename}` using
+   exclusive-create (`O_CREAT | O_EXCL`). If the file already exists (another instance
+   claimed this index), increment `next_index` and retry. This loop is bounded by
+   a maximum attempt count as a safety measure.
 2. Serialize the record: `payload_length` (4 LE) + `crc32` (4 LE) + `payload`.
    Build the complete record in a single buffer.
 3. Write the entire buffer in a **single `write()` syscall**. This is critical for
