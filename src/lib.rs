@@ -27,7 +27,7 @@ pub struct DataResult<T> {
 
 /// Trait for types that can be compared for equality and downcasted.
 /// Used primarily for tracking removable items in the data stores.
-pub trait Equivalent: Any + Debug {
+pub trait Equivalent: Any + Debug + Send {
 	/// Checks if this item equals another Equivalent item
 	fn equals(&self, other: &dyn Equivalent) -> bool;
 
