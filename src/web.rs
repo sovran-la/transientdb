@@ -19,7 +19,7 @@
 //! └─────────────────────────────────────────────────────┘
 //! ```
 
-use crate::{DataResult, DataStore, Equivalent};
+use crate::{batch, DataResult, DataStore, Equivalent};
 use serde_json::{json, Value};
 use std::any::Any;
 use std::cell::RefCell;
@@ -46,7 +46,18 @@ pub struct WebConfig {
 	/// Oldest items are dropped when this limit is exceeded.
 	/// This does not limit how many items a single fetch returns; see `max_fetch_items`.
 	pub max_items: usize,
-	/// Maximum size in bytes for a single fetch operation.
+	/// Maximum size in bytes of the batch a single fetch returns, unless `fetch` is given
+	/// its own `max_bytes`.
+	///
+	/// This is a hard ceiling on the whole batch serialized compactly with
+	/// `serde_json::to_string`: envelope (`sentAt`, `writeKey`), every item, and every
+	/// separator count. An item too large to fit in a batch by itself under this limit is
+	/// rejected by `append` with `ErrorKind::InvalidInput`. Such an item persisted earlier
+	/// (by an older version, or under a larger limit) is dropped by `fetch` when it reaches
+	/// the head of the queue.
+	///
+	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once the
+	/// envelope is counted (the envelope grows with `write_key`'s length).
 	pub max_fetch_size: usize,
 	/// Maximum number of items returned by a single fetch (the size of one batch).
 	/// When `fetch` is also given a `count`, the smaller of the two applies.
@@ -128,6 +139,8 @@ pub struct WebStore {
 	temp_key_counter: u32,
 	/// Current persistence state
 	persistence_state: PersistenceState,
+	/// The largest serialized item that fits alone in a batch under `max_fetch_size`
+	max_item_size: usize,
 }
 
 impl WebStore {
@@ -145,6 +158,8 @@ impl WebStore {
 	/// * If max_fetch_size is less than 100 bytes
 	/// * If max_items is 0
 	/// * If max_fetch_items is `Some(0)`
+	/// * If max_fetch_size leaves no room for even a 1-byte item once the batch
+	///   envelope (which grows with `write_key`) is counted
 	pub async fn new(config: WebConfig) -> Self {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
@@ -155,8 +170,13 @@ impl WebStore {
 		if config.max_fetch_items == Some(0) {
 			panic!("max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold.");
 		}
+		let envelope_len = Self::widest_envelope_len(&config.write_key);
+		if envelope_len + 1 > config.max_fetch_size {
+			panic!("max_fetch_size is all envelope and no room for an item? That's packaging, not a batch.");
+		}
 
 		let mut store = Self {
+			max_item_size: config.max_fetch_size - envelope_len,
 			config,
 			items: VecDeque::new(),
 			db: None,
@@ -421,23 +441,99 @@ impl WebStore {
 	}
 
 	/// Creates a JSON batch object containing the provided items and metadata.
-	fn create_batch(&self, items: &[StoredEvent]) -> Value {
+	///
+	/// `sent_at` is the batch's `sentAt` value, the same one its size was measured with.
+	fn create_batch(&self, items: &[StoredEvent], sent_at: &str) -> Value {
 		let values: Vec<&Value> = items.iter().map(|e| &e.value).collect();
 		json!({
 			"batch": values,
-			"sentAt": Self::now_rfc3339(),
+			"sentAt": sent_at,
 			"writeKey": self.config.write_key
 		})
 	}
 
-	/// Get current timestamp in RFC3339 format using js_sys::Date
-	fn now_rfc3339() -> String {
-		let date = js_sys::Date::new_0();
+	/// The `sentAt` value for a batch created at `date`, in RFC3339 format
+	fn sent_at(date: &js_sys::Date) -> String {
 		date.to_iso_string().into()
+	}
+
+	/// The envelope length with the widest `sentAt` this store can produce.
+	///
+	/// ISO strings are fixed-width for years 0 to 9999, so any such date measures it.
+	fn widest_envelope_len(write_key: &str) -> usize {
+		let epoch = js_sys::Date::new(&JsValue::from_f64(0.0));
+		batch::envelope_len(&Self::sent_at(&epoch), write_key)
 	}
 
 	fn get_item_size(item: &StoredEvent) -> usize {
 		item.value.to_string().len()
+	}
+
+	/// Drops items at the head of the queue that cannot fit in a batch by themselves
+	/// under `max_fetch_size`, deleting them from IndexedDB.
+	///
+	/// `append` rejects such items, but IndexedDB may still hold some persisted by an
+	/// older version or under a larger `max_fetch_size`; left at the head they would
+	/// block every fetch. Only the head is examined, when a fetch reaches it.
+	fn drop_oversized_head(&mut self) {
+		let oversized = batch::leading_oversized(
+			self.items.iter().map(Self::get_item_size),
+			self.max_item_size,
+		);
+		let dropped: Vec<StoredEvent> = self.items.drain(..oversized).collect();
+		for event in dropped {
+			web_sys::console::warn_1(
+				&format!(
+					"Dropping a stored item of {} bytes: the largest item that fits under \
+					 max_fetch_size = {} bytes is {} bytes.",
+					Self::get_item_size(&event),
+					self.config.max_fetch_size,
+					self.max_item_size
+				)
+				.into(),
+			);
+			if let Some(key) = event.idb_key {
+				self.remove_from_idb(key);
+			}
+		}
+	}
+
+	/// `fetch` with the batch's `sentAt` supplied, so its envelope length is known.
+	fn fetch_with_sent_at(
+		&mut self,
+		count: Option<usize>,
+		max_bytes: Option<usize>,
+		sent_at: &str,
+	) -> Option<DataResult<Value>> {
+		// Unlike MemoryStore, the queue can hold items too large for max_fetch_size:
+		// IndexedDB may hydrate them from an earlier version or configuration.
+		self.drop_oversized_head();
+
+		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
+		let count = batch::effective_count(count, self.config.max_fetch_items);
+		let envelope_len = batch::envelope_len(sent_at, &self.config.write_key);
+		let num_items = batch::leading_items_that_fit(
+			self.items.iter().map(Self::get_item_size),
+			envelope_len,
+			max_bytes,
+			count,
+		);
+
+		if num_items == 0 {
+			return None;
+		}
+
+		let items: Vec<StoredEvent> = self.items.iter().take(num_items).cloned().collect();
+
+		let removable: Vec<Box<dyn Equivalent>> = items
+			.iter()
+			.map(|item| Box::new(item.clone()) as Box<dyn Equivalent>)
+			.collect();
+
+		Some(DataResult {
+			data: Some(self.create_batch(&items, sent_at)),
+			removable: Some(removable),
+		})
 	}
 }
 
@@ -460,7 +556,22 @@ impl DataStore for WebStore {
 		}
 	}
 
+	/// Appends an item, dropping the oldest items beyond `max_items`.
+	///
+	/// # Errors
+	/// Returns an `InvalidInput` error, leaving the store and IndexedDB unchanged, if the
+	/// serialized item cannot fit in a batch by itself under `max_fetch_size`.
 	fn append(&mut self, data: Value) -> Result<()> {
+		let item_size = data.to_string().len();
+		if item_size > self.max_item_size {
+			return Err(batch::item_too_large(
+				item_size,
+				self.max_item_size,
+				"max_fetch_size",
+				self.config.max_fetch_size,
+			));
+		}
+
 		let event = StoredEvent {
 			idb_key: Some(self.temp_key_counter),
 			value: data,
@@ -485,51 +596,23 @@ impl DataStore for WebStore {
 		Ok(())
 	}
 
+	/// Returns the oldest items as one batch, without removing them.
+	///
+	/// The batch, serialized compactly, is at most `max_bytes` (or `max_fetch_size` if
+	/// `None`) bytes, envelope included, and holds at most `count` and `max_fetch_items`
+	/// items. A `max_bytes` too small for the oldest item returns `Ok(None)` even though
+	/// the store has data; a fetch at the configured `max_fetch_size` always returns it.
+	///
+	/// Items at the head of the queue too large for any batch under `max_fetch_size`
+	/// (persisted before this limit applied) are dropped, deleted from IndexedDB, and
+	/// logged with `console.warn`; if that empties the queue, this returns `Ok(None)`.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
 		max_bytes: Option<usize>,
 	) -> Result<Option<DataResult<Self::Output>>> {
-		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
-		// The configured item limit caps the caller's count; a larger count is clamped.
-		let count = match (count, self.config.max_fetch_items) {
-			(Some(count), Some(limit)) => Some(count.min(limit)),
-			(count, limit) => count.or(limit),
-		};
-		let mut accumulated_size = 0;
-		let mut num_items = 0;
-
-		for item in self.items.iter() {
-			let item_size = Self::get_item_size(item);
-			if accumulated_size + item_size > max_bytes {
-				break;
-			}
-			if let Some(count) = count {
-				if num_items >= count {
-					break;
-				}
-			}
-			accumulated_size += item_size;
-			num_items += 1;
-		}
-
-		if num_items == 0 {
-			return Ok(None);
-		}
-
-		let items: Vec<StoredEvent> = self.items.iter().take(num_items).cloned().collect();
-
-		let removable: Vec<Box<dyn Equivalent>> = items
-			.iter()
-			.map(|item| Box::new(item.clone()) as Box<dyn Equivalent>)
-			.collect();
-
-		let batch = self.create_batch(&items);
-
-		Ok(Some(DataResult {
-			data: Some(batch),
-			removable: Some(removable),
-		}))
+		let sent_at = Self::sent_at(&js_sys::Date::new_0());
+		Ok(self.fetch_with_sent_at(count, max_bytes, &sent_at))
 	}
 
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
@@ -560,6 +643,11 @@ mod tests {
 	use wasm_bindgen_test::*;
 
 	wasm_bindgen_test_configure!(run_in_browser);
+
+	mod ceiling;
+	mod head_drop;
+	mod oversized;
+	mod support;
 
 	fn test_config(db_name: &str) -> WebConfig {
 		WebConfig {
@@ -964,8 +1052,10 @@ mod tests {
 			.to_string()
 			.len();
 
-		// Room for exactly 3 items by bytes, fewer than the item limit.
-		let indexes = fetch_indexes(&mut store, None, Some(item_size * 3 + 1));
+		// Room for exactly 3 items and their 2 separators by bytes, envelope included,
+		// fewer than the item limit.
+		let envelope = WebStore::widest_envelope_len("test-key");
+		let indexes = fetch_indexes(&mut store, None, Some(envelope + item_size * 3 + 2));
 		assert_eq!(indexes, vec![0, 1, 2]);
 
 		// Byte limit large enough for all 20: the item limit still caps it.
