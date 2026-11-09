@@ -22,7 +22,7 @@ impl Equivalent for Value {
 /// Configuration options for the in-memory data store.
 ///
 /// This struct provides the configuration parameters needed to create a new MemoryStore instance.
-/// It controls the store's identification, capacity, and fetch size limits.
+/// It controls the store's identification, capacity, and fetch size and item limits.
 ///
 /// # Examples
 /// ```
@@ -32,6 +32,7 @@ impl Equivalent for Value {
 ///     write_key: "my-store".into(),
 ///     max_items: 1000,
 ///     max_fetch_size: 1024 * 1024, // 1MB
+///     max_fetch_items: Some(8),    // at most 8 items per fetch
 /// };
 ///
 /// let store = MemoryStore::new(config);
@@ -41,12 +42,18 @@ pub struct MemoryConfig {
 	/// Key used to identify writes to this store.
 	/// This is included in the metadata of each batch of data fetched from the store.
 	pub write_key: String,
-	/// Maximum number of items to store before old items are removed.
+	/// Total capacity: the maximum number of items held in the store before old items are removed.
 	/// Once this limit is reached, adding new items will remove the oldest items to make space.
+	/// This does not limit how many items a single fetch returns; see `max_fetch_items`.
 	pub max_items: usize,
 	/// Maximum size in bytes that can be fetched in a single operation.
 	/// This prevents memory spikes during fetch operations by limiting the amount of data returned.
 	pub max_fetch_size: usize,
+	/// Maximum number of items returned by a single fetch (the size of one batch).
+	/// When `fetch` is also given a `count`, the smaller of the two applies.
+	/// This is unrelated to store capacity; see `max_items`.
+	/// `None` means fetches are limited only by `count` and bytes. Must not be `Some(0)`.
+	pub max_fetch_items: Option<usize>,
 }
 
 /// A FIFO data store that keeps items in memory.
@@ -70,12 +77,16 @@ impl MemoryStore {
 	/// # Panics
 	/// * If max_fetch_size is less than 100 bytes
 	/// * If max_items is 0
+	/// * If max_fetch_items is `Some(0)`
 	pub fn new(config: MemoryConfig) -> Self {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
 		}
 		if config.max_items == 0 {
 			panic!("max_items = 0? So... you want a store that stores nothing? That's what /dev/null is for.");
+		}
+		if config.max_fetch_items == Some(0) {
+			panic!("max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold.");
 		}
 
 		Self {
@@ -134,6 +145,11 @@ impl DataStore for MemoryStore {
 		max_bytes: Option<usize>,
 	) -> Result<Option<DataResult<Self::Output>>> {
 		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
+		// The configured item limit caps the caller's count; a larger count is clamped.
+		let count = match (count, self.config.max_fetch_items) {
+			(Some(count), Some(limit)) => Some(count.min(limit)),
+			(count, limit) => count.or(limit),
+		};
 		let mut accumulated_size = 0;
 		let mut num_items = 0;
 
@@ -193,6 +209,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 1000,
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		};
 
 		let mut store = MemoryStore::new(config);
@@ -236,6 +253,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 3, // Small limit to test FIFO
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		};
 
 		let mut store = MemoryStore::new(config);
@@ -267,6 +285,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 100,
 			max_fetch_size: 1000,
+			max_fetch_items: None,
 		};
 
 		let mut store = MemoryStore::new(config);
@@ -303,10 +322,7 @@ mod tests {
 			assert!(items.len() <= 3, "Too many items for byte limit");
 
 			// Each raw item should be under the limit
-			let total_raw_size: usize = items
-				.iter()
-				.map(|item| MemoryStore::get_item_size(item))
-				.sum();
+			let total_raw_size: usize = items.iter().map(MemoryStore::get_item_size).sum();
 			assert!(total_raw_size <= 200, "Raw items exceed byte limit");
 		}
 
@@ -319,6 +335,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 100,
 			max_fetch_size: 1000,
+			max_fetch_items: None,
 		};
 
 		let mut store = MemoryStore::new(config);
@@ -343,6 +360,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 100,
 			max_fetch_size: 300, // Reasonable size that's easy to stay under/go over
+			max_fetch_items: None,
 		};
 
 		let mut store = MemoryStore::new(config);
@@ -391,6 +409,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 100,
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		};
 
 		let mut store = MemoryStore::new(config);
@@ -426,6 +445,7 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 1000,
 			max_fetch_size: 50, // Ridiculously small
+			max_fetch_items: None,
 		};
 
 		let _store = MemoryStore::new(config);
@@ -440,8 +460,159 @@ mod tests {
 			write_key: "test-key".to_string(),
 			max_items: 0, // Why even bother?
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		};
 
 		let _store = MemoryStore::new(config);
+	}
+
+	fn item_limit_store(max_fetch_items: Option<usize>) -> MemoryStore {
+		MemoryStore::new(MemoryConfig {
+			write_key: "test-key".to_string(),
+			max_items: 1000,
+			max_fetch_size: 1024 * 1024,
+			max_fetch_items,
+		})
+	}
+
+	fn append_indexed(store: &mut MemoryStore, range: std::ops::Range<i64>) -> Result<()> {
+		for i in range {
+			store.append(json!({"index": i}))?;
+		}
+		Ok(())
+	}
+
+	/// Fetches and returns the indexes in the batch, asserting removable matches the batch.
+	fn fetch_indexes(
+		store: &mut MemoryStore,
+		count: Option<usize>,
+		max_bytes: Option<usize>,
+	) -> Result<Vec<i64>> {
+		let Some(result) = store.fetch(count, max_bytes)? else {
+			return Ok(Vec::new());
+		};
+		let batch = result.data.unwrap();
+		let items = batch["batch"].as_array().unwrap();
+		assert_eq!(items.len(), result.removable.unwrap().len());
+		Ok(items.iter().map(|v| v["index"].as_i64().unwrap()).collect())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_returns_oldest_n_in_order() -> Result<()> {
+		let mut store = item_limit_store(Some(4));
+		append_indexed(&mut store, 0..10)?;
+		assert_eq!(fetch_indexes(&mut store, None, None)?, vec![0, 1, 2, 3]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_fewer_than_n_returns_all() -> Result<()> {
+		let mut store = item_limit_store(Some(8));
+		append_indexed(&mut store, 0..3)?;
+		assert_eq!(fetch_indexes(&mut store, None, None)?, vec![0, 1, 2]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_combines_with_count() -> Result<()> {
+		let mut store = item_limit_store(Some(5));
+		append_indexed(&mut store, 0..20)?;
+
+		// count below the limit wins
+		assert_eq!(fetch_indexes(&mut store, Some(2), None)?, vec![0, 1]);
+		// count equal to the limit
+		assert_eq!(fetch_indexes(&mut store, Some(5), None)?.len(), 5);
+		// count above the limit is clamped silently
+		assert_eq!(
+			fetch_indexes(&mut store, Some(100), None)?,
+			vec![0, 1, 2, 3, 4]
+		);
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_byte_limit_wins() -> Result<()> {
+		let mut store = item_limit_store(Some(8));
+		for i in 0..20 {
+			store.append(json!({"index": i, "padding": "x".repeat(50)}))?;
+		}
+		let item_size = MemoryStore::get_item_size(&json!({"index": 0, "padding": "x".repeat(50)}));
+
+		// Room for exactly 3 items by bytes, fewer than the item limit.
+		let indexes = fetch_indexes(&mut store, None, Some(item_size * 3 + 1))?;
+		assert_eq!(indexes, vec![0, 1, 2]);
+
+		// Byte limit large enough for all 20: the item limit still caps it.
+		let indexes = fetch_indexes(&mut store, None, Some(item_size * 20))?;
+		assert_eq!(indexes.len(), 8);
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_walks_store_in_batches() -> Result<()> {
+		let mut store = item_limit_store(Some(8));
+		append_indexed(&mut store, 0..20)?;
+
+		let mut sizes = Vec::new();
+		let mut seen = Vec::new();
+		while let Some(result) = store.fetch(None, None)? {
+			let batch = result.data.unwrap();
+			let items = batch["batch"].as_array().unwrap().clone();
+			let removable = result.removable.unwrap();
+			assert_eq!(items.len(), removable.len());
+			sizes.push(items.len());
+			seen.extend(items.iter().map(|v| v["index"].as_i64().unwrap()));
+			store.remove(&removable)?;
+		}
+
+		assert_eq!(sizes, vec![8, 8, 4]);
+		assert_eq!(seen, (0..20).collect::<Vec<_>>());
+		assert!(!store.has_data());
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_no_item_limit_unchanged() -> Result<()> {
+		let mut store = item_limit_store(None);
+		append_indexed(&mut store, 0..50)?;
+		assert_eq!(
+			fetch_indexes(&mut store, None, None)?,
+			(0..50).collect::<Vec<_>>()
+		);
+		assert_eq!(fetch_indexes(&mut store, Some(7), None)?.len(), 7);
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_of_one() -> Result<()> {
+		let mut store = item_limit_store(Some(1));
+		append_indexed(&mut store, 0..3)?;
+		assert_eq!(fetch_indexes(&mut store, None, None)?, vec![0]);
+		assert_eq!(fetch_indexes(&mut store, Some(10), None)?, vec![0]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_fetch_item_limit_with_max_items_drop_oldest() -> Result<()> {
+		let mut store = MemoryStore::new(MemoryConfig {
+			write_key: "test-key".to_string(),
+			max_items: 10,
+			max_fetch_size: 1024 * 1024,
+			max_fetch_items: Some(4),
+		});
+		append_indexed(&mut store, 0..15)?;
+
+		// Capacity dropped 0..5; the fetch limit still applies to what remains.
+		assert_eq!(store.items.len(), 10);
+		assert_eq!(fetch_indexes(&mut store, None, None)?, vec![5, 6, 7, 8]);
+		Ok(())
+	}
+
+	#[test]
+	#[should_panic(
+		expected = "max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold."
+	)]
+	fn test_rejects_zero_max_fetch_items() {
+		let _store = item_limit_store(Some(0));
 	}
 }

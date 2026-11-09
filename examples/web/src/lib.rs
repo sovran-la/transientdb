@@ -70,6 +70,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         database_name: "transientdb-demo".to_string(),
         max_items: 100,
         max_fetch_size: 1024 * 1024,
+        max_fetch_items: None,
     };
 
     let store = WebStore::new(config).await;

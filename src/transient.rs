@@ -48,6 +48,7 @@ impl<T> TransientDB<T> {
 	///     write_key: "my-store".into(),
 	///     max_items: 1000,
 	///     max_fetch_size: 1024 * 1024, // 1MB
+	///     max_fetch_items: None,
 	/// };
 	/// let store = MemoryStore::new(config);
 	/// let db = TransientDB::new(store);
@@ -78,6 +79,7 @@ impl<T> TransientDB<T> {
 	///     write_key: "test".into(),
 	///     max_items: 100,
 	///     max_fetch_size: 1024,
+	///     max_fetch_items: None,
 	/// }));
 	///
 	/// assert!(!db.has_data());
@@ -99,6 +101,7 @@ impl<T> TransientDB<T> {
 	///     write_key: "test".into(),
 	///     max_items: 100,
 	///     max_fetch_size: 1024,
+	///     max_fetch_items: None,
 	/// }));
 	///
 	/// db.append(json!({"test": "data"})).unwrap();
@@ -125,6 +128,7 @@ impl<T> TransientDB<T> {
 	///     write_key: "test".into(),
 	///     max_items: 100,
 	///     max_fetch_size: 1024,
+	///     max_fetch_items: None,
 	/// }));
 	///
 	/// // Append a single value
@@ -159,6 +163,7 @@ impl<T> TransientDB<T> {
 	///     write_key: "test".into(),
 	///     max_items: 100,
 	///     max_fetch_size: 1024,
+	///     max_fetch_items: None,
 	/// }));
 	///
 	/// // Add some data
@@ -204,6 +209,7 @@ impl<T> TransientDB<T> {
 	///     write_key: "test".into(),
 	///     max_items: 100,
 	///     max_fetch_size: 1024,
+	///     max_fetch_items: None,
 	/// }));
 	///
 	/// // Add and fetch data
