@@ -210,11 +210,14 @@ impl DirectoryStore {
 	/// Bytes written at the end of every data file when it is finished.
 	///
 	/// Its length does not depend on `sent_at`: the timestamp format is fixed-width.
+	/// `write_key` is written as a JSON string, escaped as needed.
 	fn closing(&self, sent_at: DateTime<Utc>) -> Vec<u8> {
+		let write_key =
+			serde_json::to_string(&self.config.write_key).expect("a string always serializes");
 		format!(
-			"],\"sentAt\":\"{}\",\"writeKey\":\"{}\"}}",
+			"],\"sentAt\":\"{}\",\"writeKey\":{}}}",
 			sent_at.format("%Y-%m-%dT%H:%M:%S.%3fZ"),
-			self.config.write_key
+			write_key
 		)
 		.into_bytes()
 	}
@@ -587,6 +590,7 @@ mod tests {
 	mod oversized;
 	mod recovery;
 	mod support;
+	mod write_key;
 
 	#[test]
 	fn test_directory_store_basic_operations() -> Result<()> {
