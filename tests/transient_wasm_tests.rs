@@ -18,6 +18,7 @@ fn test_config(db_name: &str) -> WebConfig {
 		database_name: db_name.to_string(),
 		max_items: 1000,
 		max_fetch_size: 1024 * 1024,
+		max_fetch_items: None,
 	}
 }
 
@@ -364,6 +365,7 @@ async fn test_transientdb_max_items_eviction() {
 		database_name: "test-max-items".to_string(),
 		max_items: 5, // Small limit
 		max_fetch_size: 1024 * 1024,
+		max_fetch_items: None,
 	};
 	let store = WebStore::new(config).await;
 	let db = TransientDB::new(store);
@@ -551,4 +553,43 @@ async fn test_transientdb_numeric_edge_cases() {
 		assert_eq!(items[0]["zero"], 0);
 		assert_eq!(items[0]["negative"], -42);
 	}
+}
+
+// =============================================================================
+// Fetch Item Limit
+// =============================================================================
+
+#[wasm_bindgen_test]
+async fn test_transientdb_fetch_item_limit() {
+	let mut config = test_config("test-transient-item-limit");
+	config.max_fetch_items = Some(8);
+	let store = WebStore::new(config).await;
+	let db = TransientDB::new(store);
+	// Discard anything hydrated from a previous run.
+	db.reset();
+
+	for i in 0..20 {
+		db.append(json!({"index": i})).unwrap();
+	}
+
+	// A count above the limit is clamped, below it wins.
+	let batch: Value = db.fetch(Some(100), None).unwrap().unwrap().data.unwrap();
+	assert_eq!(batch["batch"].as_array().unwrap().len(), 8);
+	let batch: Value = db.fetch(Some(3), None).unwrap().unwrap().data.unwrap();
+	assert_eq!(batch["batch"].as_array().unwrap().len(), 3);
+
+	let mut sizes = Vec::new();
+	let mut seen = Vec::new();
+	while let Some(result) = db.fetch(None, None).unwrap() {
+		let batch: Value = result.data.unwrap();
+		let items = batch["batch"].as_array().unwrap();
+		let removable = result.removable.unwrap();
+		assert_eq!(items.len(), removable.len());
+		sizes.push(items.len());
+		seen.extend(items.iter().map(|v| v["index"].as_i64().unwrap()));
+		db.remove(&removable).unwrap();
+	}
+	assert_eq!(sizes, vec![8, 8, 4]);
+	assert_eq!(seen, (0..20).collect::<Vec<_>>());
+	assert!(!db.has_data());
 }

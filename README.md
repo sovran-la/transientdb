@@ -77,6 +77,7 @@ let config = MemoryConfig {
     write_key: "my-app".into(),
     max_items: 1000,
     max_fetch_size: 1024 * 1024, // 1MB
+    max_fetch_items: None,
 };
 
 // Create the store
@@ -115,6 +116,7 @@ let config = DirectoryConfig {
     storage_location: PathBuf::from("/tmp/events"),
     base_filename: "batch".into(),
     max_file_size: 1024 * 1024, // 1MB
+    max_file_items: None,
 };
 
 // Create the store with custom validation
@@ -175,6 +177,7 @@ let config = WebConfig {
     database_name: "my-app-events".into(),
     max_items: 1000,
     max_fetch_size: 1024 * 1024, // 1MB
+    max_fetch_items: None,
 };
 
 // Create the store (async - opens IndexedDB)
@@ -255,20 +258,56 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 
 ### MemoryConfig
 - `write_key`: Identifier for the data source
-- `max_items`: Maximum number of items to store (must be > 0)
+- `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
 - `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
+- `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
 
 ### DirectoryConfig
 - `write_key`: Identifier for the data source
 - `storage_location`: Directory path for storing files
 - `base_filename`: Base name for generated files
 - `max_file_size`: Maximum size in bytes for individual files (must be ≥ 100)
+- `max_file_items`: Maximum number of items in one file, or `None` for no limit (must not be `Some(0)`)
 
 ### WebConfig
 - `write_key`: Identifier for the data source
 - `database_name`: Name of the IndexedDB database (use unique names per store)
-- `max_items`: Maximum number of items to store (must be > 0)
+- `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
 - `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
+- `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
+
+### Item limits per batch
+
+Some consumers send each batch as one request and need a hard cap on items per batch.
+Each store can enforce one:
+
+- `DirectoryConfig::max_file_items` caps the items in each file. When the open file holds
+  that many items, the next `append` finishes it and starts a new one. It is independent of
+  `max_file_size`; whichever is reached first rotates the file.
+
+  ```rust
+  let config = DirectoryConfig {
+      write_key: "my-app".into(),
+      storage_location: PathBuf::from("/tmp/events"),
+      base_filename: "batch".into(),
+      max_file_size: 1024 * 1024,
+      max_file_items: Some(8), // no file ever holds more than 8 items
+  };
+  ```
+
+- `MemoryConfig::max_fetch_items` and `WebConfig::max_fetch_items` cap the items returned by
+  one `fetch`. If `fetch` is also given a `count`, the smaller of the two applies; a larger
+  `count` is clamped silently. The byte limit still applies. This is separate from
+  `max_items`, which is the store's total capacity.
+
+  ```rust
+  let config = MemoryConfig {
+      write_key: "my-app".into(),
+      max_items: 1000,
+      max_fetch_size: 1024 * 1024,
+      max_fetch_items: Some(8), // every fetch returns at most 8 items
+  };
+  ```
 
 ## Data Format
 

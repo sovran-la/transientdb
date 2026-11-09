@@ -22,6 +22,7 @@ fn test_concurrent_appends() -> Result<()> {
 		write_key: "test-key-concurrent-appends".to_string(),
 		max_items: 10000,
 		max_fetch_size: 1024,
+		max_fetch_items: None,
 	};
 	let store = MemoryStore::new(config);
 	let db = Arc::new(TransientDB::new(store));
@@ -76,6 +77,7 @@ fn test_concurrent_append_and_fetch() -> Result<()> {
 		write_key: "test-key-append-and-fetch".to_string(), // Unique key
 		max_items: 1000,
 		max_fetch_size: 1024,
+		max_fetch_items: None,
 	};
 
 	let store = MemoryStore::new(config);
@@ -123,6 +125,7 @@ fn test_concurrent_reset() -> Result<()> {
 		write_key: "test-key-reset".to_string(), // Unique key
 		max_items: 1000,
 		max_fetch_size: 1024,
+		max_fetch_items: None,
 	};
 	let store = MemoryStore::new(config);
 	let db = Arc::new(TransientDB::new(store));
@@ -186,6 +189,7 @@ fn test_concurrent_directory_store() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 200, // Small size to force rotation
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -259,6 +263,7 @@ fn test_directory_store_stress() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 10, // 10KB files to force lots of rotation
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -334,6 +339,7 @@ fn test_memory_store_chaos() -> Result<()> {
 		write_key: "test-key".to_string(),
 		max_items: 100_000,
 		max_fetch_size: 1024 * 1024,
+		max_fetch_items: None,
 	};
 
 	let store = MemoryStore::new(config);
@@ -455,6 +461,7 @@ fn test_directory_store_chaos() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 2, // Tiny 2KB files for maximum pain
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -557,6 +564,7 @@ fn test_directory_store_malformed_files() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -613,6 +621,7 @@ fn test_transient_db_panic_recovery() -> Result<()> {
 		write_key: "test-key".to_string(),
 		max_items: 100,
 		max_fetch_size: 1024,
+		max_fetch_items: None,
 	};
 
 	let store = MemoryStore::new(config);
@@ -641,6 +650,7 @@ fn test_directory_store_concurrent_validation() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 256, // Small size to force more file rotations
+		max_file_items: None,
 	};
 
 	let mut store = DirectoryStore::new(config)?;
@@ -784,6 +794,7 @@ fn test_heavy_concurrent_load() -> Result<()> {
 		write_key: "test-key".to_string(),
 		max_items: 100_000,
 		max_fetch_size: 1024 * 1024,
+		max_fetch_items: None,
 	};
 	let store = MemoryStore::new(config);
 	let db = Arc::new(TransientDB::new(store));
@@ -840,5 +851,128 @@ fn test_heavy_concurrent_load() -> Result<()> {
 		handle.join().unwrap();
 	}
 
+	Ok(())
+}
+
+/// Drains a TransientDB backed by MemoryStore, returning the size of each fetched batch
+/// and every item index seen, in order.
+fn drain_memory_batches(db: &TransientDB<Value>) -> Result<(Vec<usize>, Vec<i64>)> {
+	let mut sizes = Vec::new();
+	let mut seen = Vec::new();
+	while let Some(result) = db.fetch(None, None)? {
+		let batch = result.data.unwrap();
+		let items = batch["batch"].as_array().unwrap();
+		let removable = result.removable.unwrap();
+		assert_eq!(items.len(), removable.len());
+		sizes.push(items.len());
+		seen.extend(items.iter().map(|v| v["index"].as_i64().unwrap()));
+		db.remove(&removable)?;
+	}
+	Ok((sizes, seen))
+}
+
+#[test]
+fn test_memory_fetch_item_limit_through_transientdb() -> Result<()> {
+	let db = TransientDB::new(MemoryStore::new(MemoryConfig {
+		write_key: "test-key".to_string(),
+		max_items: 1000,
+		max_fetch_size: 1024 * 1024,
+		max_fetch_items: Some(8),
+	}));
+	for i in 0..20 {
+		db.append(json!({"index": i}))?;
+	}
+
+	// A count above the limit is clamped, below it wins.
+	let batch = db.fetch(Some(100), None)?.unwrap().data.unwrap();
+	assert_eq!(batch["batch"].as_array().unwrap().len(), 8);
+	let batch = db.fetch(Some(3), None)?.unwrap().data.unwrap();
+	assert_eq!(batch["batch"].as_array().unwrap().len(), 3);
+
+	let (sizes, seen) = drain_memory_batches(&db)?;
+	assert_eq!(sizes, vec![8, 8, 4]);
+	assert_eq!(seen, (0..20).collect::<Vec<_>>());
+	assert!(!db.has_data());
+	Ok(())
+}
+
+#[test]
+fn test_directory_file_item_limit_through_transientdb() -> Result<()> {
+	let temp_dir = TempDir::new()?;
+	let db = TransientDB::new(DirectoryStore::new(DirectoryConfig {
+		write_key: "test-key".to_string(),
+		storage_location: temp_dir.path().to_owned(),
+		base_filename: "events".to_string(),
+		max_file_size: 1024 * 1024,
+		max_file_items: Some(8),
+	})?);
+	for i in 0..20 {
+		db.append(json!({"index": i}))?;
+	}
+
+	let result = db.fetch(None, None)?.unwrap();
+	let files = result.data.unwrap();
+	let mut counts = Vec::new();
+	let mut seen = Vec::new();
+	for file in &files {
+		let parsed: Value = serde_json::from_str(&fs::read_to_string(file)?)?;
+		assert!(parsed["sentAt"].is_string());
+		assert_eq!(parsed["writeKey"], "test-key");
+		let batch = parsed["batch"].as_array().unwrap();
+		counts.push(batch.len());
+		seen.extend(batch.iter().map(|v| v["index"].as_i64().unwrap()));
+	}
+	assert_eq!(counts, vec![8, 8, 4]);
+	assert_eq!(seen, (0..20).collect::<Vec<_>>());
+
+	db.remove(&result.removable.unwrap())?;
+	assert!(!db.has_data());
+	Ok(())
+}
+
+#[test]
+fn test_directory_file_item_limit_concurrent_appends() -> Result<()> {
+	let temp_dir = TempDir::new()?;
+	let db = Arc::new(TransientDB::new(DirectoryStore::new(DirectoryConfig {
+		write_key: "test-key".to_string(),
+		storage_location: temp_dir.path().to_owned(),
+		base_filename: "events".to_string(),
+		max_file_size: 1024 * 1024,
+		max_file_items: Some(8),
+	})?));
+
+	let handles: Vec<_> = (0..4)
+		.map(|t| {
+			let db = db.clone();
+			thread::spawn(move || {
+				for i in 0..50 {
+					db.append(json!({"thread": t, "index": i})).unwrap();
+				}
+			})
+		})
+		.collect();
+	for handle in handles {
+		handle.join().unwrap();
+	}
+
+	let files = db.fetch(None, None)?.unwrap().data.unwrap();
+	let mut total = 0;
+	let mut seen = HashSet::new();
+	for file in &files {
+		let parsed: Value = serde_json::from_str(&fs::read_to_string(file)?)?;
+		let batch = parsed["batch"].as_array().unwrap();
+		assert!(
+			!batch.is_empty() && batch.len() <= 8,
+			"bad batch size {}",
+			batch.len()
+		);
+		total += batch.len();
+		for item in batch {
+			seen.insert((item["thread"].as_i64(), item["index"].as_i64()));
+		}
+	}
+	assert_eq!(total, 200);
+	assert_eq!(seen.len(), 200);
+	assert_eq!(files.len(), 25);
 	Ok(())
 }

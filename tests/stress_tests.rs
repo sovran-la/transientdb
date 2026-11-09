@@ -65,6 +65,7 @@ fn test_memory_store_stress() -> Result<()> {
 		write_key: "test-key-mem".to_string(),
 		max_items: 10_000,
 		max_fetch_size: 1024 * 1024,
+		max_fetch_items: None,
 	};
 
 	let store = MemoryStore::new(config);
@@ -226,6 +227,7 @@ fn test_directory_store_stress() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 2, // 2KB files to force frequent rotation
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;

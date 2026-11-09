@@ -54,6 +54,7 @@ fn test_recovery_from_corrupted_files() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -97,6 +98,7 @@ fn test_concurrent_corruption_recovery() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 512, // Small size to force more files
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -159,6 +161,7 @@ fn test_file_system_edge_cases() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
+		max_file_items: None,
 	};
 
 	let mut store = DirectoryStore::new(config)?;
