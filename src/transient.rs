@@ -150,6 +150,9 @@ impl<T> TransientDB<T> {
 
 	/// Fetches a batch of data from the store, respecting optional count and size limits.
 	///
+	/// Fetching removes nothing: the data stays in the store until the returned
+	/// `removable` items are passed to [`remove`](Self::remove).
+	///
 	/// # Arguments
 	/// * `count` - Optional maximum number of items to fetch
 	/// * `max_bytes` - Optional maximum total size in bytes to fetch

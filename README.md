@@ -64,6 +64,11 @@ The core interface that storage implementations must provide:
 - `has_data()`: Check if data is available
 - `reset()`: Clear all stored data
 
+`fetch()` never removes anything, in any store: it returns the batch and its `removable`
+items, and the data stays in the store until you pass `removable` to `remove()`. Fetching
+again before removing returns the same items. Remove a batch only once it has been
+processed (for example, after the upload succeeded), so a failure never loses data.
+
 ## Usage
 
 ### Memory Store Example
@@ -99,6 +104,10 @@ if let Some(result) = db.fetch(Some(100), None)? {
                 println!("Processing event: {}", item["event"]);
             }
         }
+    }
+    // The items stay in the store until removed
+    if let Some(removable) = result.removable {
+        db.remove(&removable)?;
     }
 }
 ```
@@ -230,7 +239,7 @@ if let Some(result) = db.fetch(Some(100), None)? {
 - Automatically removes old items when max_items is reached
 - Returns data as serde_json::Value
 - Ideal for high-throughput, temporary data storage
-- No cleanup required (fetch automatically removes returned items)
+- Requires explicit cleanup via remove(); fetch does not remove returned items
 
 ### DirectoryStore
 - Stores data in rotating files in a specified directory

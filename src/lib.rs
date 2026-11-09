@@ -72,6 +72,8 @@ pub trait DataStore {
 	/// the total size of the returned files, each of which is at most `max_file_size`.
 	///
 	/// Returns the fetched data along with items that can be passed to `remove()`.
+	/// Fetching removes nothing: the data stays in the store, and a later fetch returns it
+	/// again, until those items are passed to `remove()`.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
