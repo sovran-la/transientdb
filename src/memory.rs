@@ -303,10 +303,7 @@ mod tests {
 			assert!(items.len() <= 3, "Too many items for byte limit");
 
 			// Each raw item should be under the limit
-			let total_raw_size: usize = items
-				.iter()
-				.map(|item| MemoryStore::get_item_size(item))
-				.sum();
+			let total_raw_size: usize = items.iter().map(MemoryStore::get_item_size).sum();
 			assert!(total_raw_size <= 200, "Raw items exceed byte limit");
 		}
 
