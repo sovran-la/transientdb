@@ -494,6 +494,7 @@ mod tests {
 	mod head_drop;
 	mod oversized;
 	mod persistence;
+	mod reopen;
 	mod schema;
 	mod support;
 

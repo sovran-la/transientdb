@@ -303,6 +303,7 @@ mod tests {
 	mod ceiling;
 	mod duplicates;
 	mod oversized;
+	mod repeat;
 	mod support;
 
 	#[test]
