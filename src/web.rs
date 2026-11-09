@@ -490,6 +490,7 @@ mod tests {
 	wasm_bindgen_test_configure!(run_in_browser);
 
 	mod ceiling;
+	mod duplicates;
 	mod head_drop;
 	mod oversized;
 	mod persistence;

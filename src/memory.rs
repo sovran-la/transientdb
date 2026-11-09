@@ -3,7 +3,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use serde_json::Value;
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Result;
 
 impl Equivalent for Value {
@@ -13,6 +13,27 @@ impl Equivalent for Value {
 		} else {
 			false
 		}
+	}
+
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+}
+
+/// A queued item and its sequence number, unique within its store.
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedItem {
+	seq: u64,
+	value: Value,
+}
+
+/// A removable from `MemoryStore::fetch`: the sequence number of one fetched item.
+#[derive(Debug, PartialEq)]
+struct MemoryKey(u64);
+
+impl Equivalent for MemoryKey {
+	fn equals(&self, other: &dyn Equivalent) -> bool {
+		other.as_any().downcast_ref::<MemoryKey>() == Some(self)
 	}
 
 	fn as_any(&self) -> &dyn Any {
@@ -79,9 +100,14 @@ pub struct MemoryConfig {
 ///
 /// A fetched batch, serialized compactly, is never larger than the byte limit in effect
 /// for that fetch.
+///
+/// Every appended item is a distinct entry, even if it equals another: `remove` deletes
+/// exactly the items a fetch returned, never an identical item still waiting.
 pub struct MemoryStore {
 	config: MemoryConfig,
-	items: VecDeque<Value>,
+	items: VecDeque<QueuedItem>,
+	/// The sequence number the next appended item gets
+	next_seq: u64,
 	/// The largest serialized item that fits alone in a batch under `max_fetch_size`,
 	/// whatever the timestamp.
 	max_item_size: usize,
@@ -115,6 +141,7 @@ impl MemoryStore {
 			max_item_size: config.max_fetch_size - envelope_len,
 			config,
 			items: VecDeque::new(),
+			next_seq: 0,
 		}
 	}
 
@@ -146,7 +173,7 @@ impl MemoryStore {
 	/// - A `batch` array of the provided items
 	/// - A `sentAt` timestamp in RFC3339 format
 	/// - The store's `writeKey`
-	fn create_batch(&self, items: &[Value], sent_at: &str) -> Value {
+	fn create_batch(&self, items: &[&Value], sent_at: &str) -> Value {
 		json!({
 			"batch": items,
 			"sentAt": sent_at,
@@ -171,7 +198,9 @@ impl MemoryStore {
 		let count = batch::effective_count(count, self.config.max_fetch_items);
 		let envelope_len = batch::envelope_len(sent_at, &self.config.write_key);
 		let num_items = batch::leading_items_that_fit(
-			self.items.iter().map(Self::get_item_size),
+			self.items
+				.iter()
+				.map(|item| Self::get_item_size(&item.value)),
 			envelope_len,
 			max_bytes,
 			count,
@@ -181,12 +210,10 @@ impl MemoryStore {
 			return None;
 		}
 
-		// Create vectors of items and removable references
-		let items: Vec<Value> = self.items.iter().take(num_items).cloned().collect();
-
-		let removable: Vec<Box<dyn Equivalent>> = items
-			.iter()
-			.map(|item| Box::new(item.clone()) as Box<dyn Equivalent>)
+		let fetched = self.items.iter().take(num_items);
+		let items: Vec<&Value> = fetched.clone().map(|item| &item.value).collect();
+		let removable: Vec<Box<dyn Equivalent>> = fetched
+			.map(|item| Box::new(MemoryKey(item.seq)) as Box<dyn Equivalent>)
 			.collect();
 
 		Some(DataResult {
@@ -223,7 +250,11 @@ impl DataStore for MemoryStore {
 			));
 		}
 
-		self.items.push_back(data);
+		self.items.push_back(QueuedItem {
+			seq: self.next_seq,
+			value: data,
+		});
+		self.next_seq += 1;
 
 		while self.items.len() > self.config.max_items {
 			self.items.pop_front();
@@ -247,10 +278,17 @@ impl DataStore for MemoryStore {
 		Ok(self.fetch_with_sent_at(count, max_bytes, &sent_at))
 	}
 
+	/// Removes exactly the items a previous `fetch` returned.
+	///
+	/// Identical items that were not fetched stay queued. Items already gone (removed
+	/// before, or dropped by `max_items` since the fetch) are skipped.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
-		// Remove items that match the provided equivalents
-		self.items
-			.retain(|item| !data.iter().any(|removable| removable.equals(item)));
+		let fetched: HashSet<u64> = data
+			.iter()
+			.filter_map(|removable| removable.as_any().downcast_ref::<MemoryKey>())
+			.map(|key| key.0)
+			.collect();
+		self.items.retain(|item| !fetched.contains(&item.seq));
 		Ok(())
 	}
 }
@@ -263,6 +301,7 @@ mod tests {
 	use std::io::Result;
 
 	mod ceiling;
+	mod duplicates;
 	mod oversized;
 	mod support;
 

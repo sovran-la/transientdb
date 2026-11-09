@@ -557,6 +557,7 @@ mod tests {
 	use tempfile::TempDir;
 
 	mod ceiling;
+	mod duplicates;
 	mod lifecycle;
 	mod oversized;
 	mod support;
