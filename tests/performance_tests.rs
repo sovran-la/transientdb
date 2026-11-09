@@ -1,8 +1,6 @@
 //! Performance benchmarks - native only (uses filesystem APIs)
 #![cfg(not(target_arch = "wasm32"))]
 
-use transientdb;
-
 use serde_json::json;
 use std::io::Result;
 use std::time::{Duration, Instant};
@@ -63,6 +61,7 @@ fn benchmark_memory_store() -> Result<()> {
 		write_key: "bench-key".to_string(),
 		max_items: 2_000_000,             // 2M to avoid FIFO cleanup during test
 		max_fetch_size: 1024 * 1024 * 10, // 10MB
+		max_fetch_items: None,
 	};
 
 	let store = MemoryStore::new(config);
@@ -156,6 +155,7 @@ fn benchmark_directory_store() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 1024, // 1MB files
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;

@@ -10,6 +10,7 @@ fn memory_store_example() -> Result<()> {
 		write_key: "analytics-key".into(),
 		max_items: 1000,           // Store up to 1000 items
 		max_fetch_size: 1024 * 64, // 64KB max fetch size
+		max_fetch_items: None,
 	};
 
 	// Initialize the store and wrap it in TransientDB

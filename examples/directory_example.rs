@@ -14,6 +14,7 @@ fn directory_store_example() -> Result<()> {
 		storage_location: dir.path().to_owned(),
 		base_filename: "events".into(),
 		max_file_size: 1024 * 10, // 10KB max file size
+		max_file_items: None,
 	};
 
 	// Initialize store with a validator

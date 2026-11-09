@@ -36,6 +36,7 @@ impl Equivalent for PathBuf {
 ///     storage_location: PathBuf::from("/tmp/data"),
 ///     base_filename: "events".into(),
 ///     max_file_size: 1024 * 1024, // 1MB
+///     max_file_items: Some(8),    // at most 8 items per file
 /// };
 /// ```
 #[derive(Clone)]
@@ -54,6 +55,11 @@ pub struct DirectoryConfig {
 	/// Once a file reaches this size, a new file will be created.
 	/// Must be at least 100 bytes.
 	pub max_file_size: usize,
+	/// Maximum number of items in an individual data file.
+	/// Once a file holds this many items, the next append starts a new file.
+	/// This limit is independent of `max_file_size`; whichever is reached first rotates the file.
+	/// `None` means files are limited by size only. Must not be `Some(0)`.
+	pub max_file_items: Option<usize>,
 }
 
 /// Type alias for the file validator function
@@ -62,7 +68,7 @@ pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 /// A data store that persists items to files in a directory.
 ///
 /// Files are created with incrementing numerical prefixes and contain batched JSON data.
-/// When a file reaches the configured size limit, a new file is created.
+/// When a file reaches the configured size limit or item limit, a new file is created.
 /// Completed files are marked with a .temp extension to indicate they are ready for processing.
 ///
 /// Each file contains a JSON object with:
@@ -73,6 +79,7 @@ pub struct DirectoryStore {
 	config: DirectoryConfig,
 	writer: Option<BufWriter<File>>,
 	current_size: usize,
+	current_items: usize,
 	current_path: Option<PathBuf>,
 	file_validator: Option<FileValidator>,
 	next_index: AtomicU32,
@@ -96,9 +103,13 @@ impl DirectoryStore {
 	///
 	/// # Panics
 	/// * If max_file_size is less than 100 bytes
+	/// * If max_file_items is `Some(0)`
 	pub fn new(config: DirectoryConfig) -> Result<Self> {
 		if config.max_file_size < 100 {
 			panic!("Seriously? max_file_size < 100 bytes? What exactly do you expect to store in there?");
+		}
+		if config.max_file_items == Some(0) {
+			panic!("max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory.");
 		}
 
 		fs::create_dir_all(&config.storage_location)?;
@@ -107,6 +118,7 @@ impl DirectoryStore {
 			config,
 			writer: None,
 			current_size: 0,
+			current_items: 0,
 			current_path: None,
 			file_validator: None,
 			next_index: AtomicU32::new(0),
@@ -139,6 +151,7 @@ impl DirectoryStore {
 	///     storage_location: PathBuf::from("/tmp/data"),
 	///     base_filename: "events".into(),
 	///     max_file_size: 1024,
+	///     max_file_items: None,
 	/// })?;
 	///
 	/// // Add a validator that checks file size and JSON validity
@@ -294,6 +307,7 @@ impl DirectoryStore {
 		}
 
 		self.current_size = 0;
+		self.current_items = 0;
 		Ok(())
 	}
 
@@ -369,6 +383,13 @@ impl DataStore for DirectoryStore {
 	}
 
 	fn reset(&mut self) {
+		// The open file is about to be deleted, so discard it rather than finalizing it.
+		// Otherwise later appends land in an unlinked file and the next fetch fails.
+		self.writer = None;
+		self.current_path = None;
+		self.current_size = 0;
+		self.current_items = 0;
+
 		if let Ok(files) = self.sorted_files(true) {
 			let _ = self.remove(
 				&files
@@ -386,7 +407,12 @@ impl DataStore for DirectoryStore {
 			.as_mut()
 			.ok_or_else(|| io::Error::other("No active writer"))?;
 
-		if self.current_size >= self.config.max_file_size {
+		// The open file is full by size or by item count; rotate before writing.
+		let item_limit_reached = self
+			.config
+			.max_file_items
+			.is_some_and(|max| self.current_items >= max);
+		if self.current_size >= self.config.max_file_size || item_limit_reached {
 			self.finish_file()?;
 			return self.append(data);
 		}
@@ -398,6 +424,7 @@ impl DataStore for DirectoryStore {
 		writer.flush()?;
 
 		self.current_size += data.to_string().len();
+		self.current_items += 1;
 		Ok(())
 	}
 
@@ -467,6 +494,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024,
+			max_file_items: None,
 		};
 
 		let mut store = DirectoryStore::new(config)?;
@@ -508,6 +536,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024,
+			max_file_items: None,
 		};
 
 		// First store instance - create some unfinished files
@@ -575,6 +604,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 100, // Small size to force rotation
+			max_file_items: None,
 		};
 
 		let mut store = DirectoryStore::new(config)?;
@@ -622,6 +652,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 200,
+			max_file_items: None,
 		};
 
 		let mut store = DirectoryStore::new(config)?;
@@ -654,6 +685,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 200,
+			max_file_items: None,
 		};
 
 		let mut store = DirectoryStore::new(config)?;
@@ -692,6 +724,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024,
+			max_file_items: None,
 		};
 
 		let mut store = DirectoryStore::new(config)?;
@@ -700,7 +733,7 @@ mod tests {
 		store.set_file_validator(|path| {
 			let metadata = fs::metadata(path)?;
 			if metadata.len() < 10 {
-				return Err(io::Error::new(io::ErrorKind::Other, "File too small"));
+				return Err(io::Error::other("File too small"));
 			}
 			Ok(())
 		});
@@ -723,6 +756,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 100, // Small size to force multiple files
+			max_file_items: None,
 		};
 
 		let mut store = DirectoryStore::new(config)?;
@@ -779,6 +813,7 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 50, // Try to use a ridiculously small size
+			max_file_items: None,
 		};
 
 		// This should panic
@@ -796,9 +831,315 @@ mod tests {
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 0, // Try to use zero
+			max_file_items: None,
 		};
 
 		// This should panic
 		let _store = DirectoryStore::new(config).unwrap();
+	}
+
+	fn item_limit_config(dir: &TempDir, max_file_items: Option<usize>) -> DirectoryConfig {
+		DirectoryConfig {
+			write_key: "test-key".to_string(),
+			storage_location: dir.path().to_owned(),
+			base_filename: "events".to_string(),
+			max_file_size: 1024 * 1024,
+			max_file_items,
+		}
+	}
+
+	/// Parses a finished file, checks the envelope, and returns its `batch` array.
+	fn read_batch(path: &std::path::Path) -> Result<Vec<Value>> {
+		let content = fs::read_to_string(path)?;
+		assert!(
+			content.starts_with("{ \"batch\": ["),
+			"Bad envelope start: {content}"
+		);
+		assert!(!content.contains("[,"), "Leading comma: {content}");
+		assert!(!content.contains(",,"), "Doubled comma: {content}");
+		let parsed: Value = serde_json::from_str(&content)?;
+		assert!(parsed.get("sentAt").and_then(Value::as_str).is_some());
+		assert_eq!(
+			parsed.get("writeKey").and_then(Value::as_str),
+			Some("test-key")
+		);
+		Ok(parsed["batch"].as_array().expect("batch array").clone())
+	}
+
+	/// Fetches every finished file and returns the item count of each, in file order.
+	fn fetch_counts(store: &mut DirectoryStore) -> Result<Vec<usize>> {
+		let Some(result) = store.fetch(None, None)? else {
+			return Ok(Vec::new());
+		};
+		let files = result.data.unwrap();
+		assert_eq!(files.len(), result.removable.unwrap().len());
+		files.iter().map(|f| Ok(read_batch(f)?.len())).collect()
+	}
+
+	fn append_indexed(store: &mut DirectoryStore, range: std::ops::Range<usize>) -> Result<()> {
+		for i in range {
+			store.append(json!({"event": "test", "index": i}))?;
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_exact_n_single_file() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(5)))?;
+		append_indexed(&mut store, 0..5)?;
+		assert_eq!(fetch_counts(&mut store)?, vec![5]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_n_plus_one_two_files() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(5)))?;
+		append_indexed(&mut store, 0..6)?;
+		assert_eq!(fetch_counts(&mut store)?, vec![5, 1]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_multiples_and_remainders() -> Result<()> {
+		for n in [2usize, 3, 5] {
+			for k in 1..=4usize {
+				for r in 0..n {
+					let temp_dir = TempDir::new()?;
+					let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(n)))?;
+					append_indexed(&mut store, 0..k * n + r)?;
+
+					let mut expected = vec![n; k];
+					if r > 0 {
+						expected.push(r);
+					}
+					let counts = fetch_counts(&mut store)?;
+					assert_eq!(counts, expected, "n={n} k={k} r={r}");
+					assert!(counts.iter().all(|&c| c > 0 && c <= n));
+				}
+			}
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_of_one() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(1)))?;
+		append_indexed(&mut store, 0..7)?;
+		assert_eq!(fetch_counts(&mut store)?, vec![1; 7]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_eight_with_twenty_items() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(8)))?;
+		append_indexed(&mut store, 0..20)?;
+		assert_eq!(fetch_counts(&mut store)?, vec![8, 8, 4]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_preserves_append_order() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(3)))?;
+		append_indexed(&mut store, 0..11)?;
+
+		let files = store.fetch(None, None)?.unwrap().data.unwrap();
+		let mut indexes = Vec::new();
+		for file in &files {
+			for item in read_batch(file)? {
+				indexes.push(item["index"].as_u64().unwrap() as usize);
+			}
+		}
+		assert_eq!(indexes, (0..11).collect::<Vec<_>>());
+		Ok(())
+	}
+
+	#[test]
+	fn test_no_item_limit_keeps_small_items_in_one_file() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, None))?;
+		append_indexed(&mut store, 0..500)?;
+		assert_eq!(fetch_counts(&mut store)?, vec![500]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_size_limit_trips_before_item_limit() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut config = item_limit_config(&temp_dir, Some(8));
+		config.max_file_size = 100;
+		let mut store = DirectoryStore::new(config)?;
+
+		// Each item is ~60 bytes, so the 100 byte size check rotates after 2 items,
+		// long before the item limit of 8 is reached.
+		for i in 0..9 {
+			store.append(json!({"index": i, "data": "padding to reach the size limit."}))?;
+		}
+		let counts = fetch_counts(&mut store)?;
+		assert_eq!(counts, vec![2, 2, 2, 2, 1]);
+		assert!(counts.iter().all(|&c| c <= 8));
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_trips_before_size_limit() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut config = item_limit_config(&temp_dir, Some(3));
+		config.max_file_size = 10_000;
+		let mut store = DirectoryStore::new(config)?;
+
+		for i in 0..10 {
+			store.append(json!({"index": i, "data": "padding to reach the size limit."}))?;
+		}
+		let counts = fetch_counts(&mut store)?;
+		assert_eq!(counts, vec![3, 3, 3, 1]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_rotation_is_lazy() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(4)))?;
+		append_indexed(&mut store, 0..4)?;
+
+		// The file that just reached the limit stays open: one unfinished file, nothing finished.
+		let on_disk = store.sorted_files(true)?;
+		assert_eq!(on_disk.len(), 1);
+		assert_ne!(
+			on_disk[0].extension().and_then(|e| e.to_str()),
+			Some(DirectoryStore::TEMP_EXTENSION)
+		);
+		assert!(store.sorted_files(false)?.is_empty());
+
+		// Fetch closes it; still exactly one file, and no empty file was created.
+		assert_eq!(fetch_counts(&mut store)?, vec![4]);
+		assert_eq!(store.sorted_files(true)?.len(), 1);
+
+		// Nothing appended since: the next fetch must not produce an empty file.
+		let files = store.fetch(None, None)?.unwrap().data.unwrap();
+		assert_eq!(files.len(), 1);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_count_resets_after_fetch() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(5)))?;
+
+		append_indexed(&mut store, 0..4)?;
+		let result = store.fetch(None, None)?.unwrap();
+		store.remove(&result.removable.unwrap())?;
+
+		append_indexed(&mut store, 4..9)?;
+		assert_eq!(fetch_counts(&mut store)?, vec![5]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_count_resets_after_reset() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(5)))?;
+
+		append_indexed(&mut store, 0..4)?;
+		store.reset();
+		assert!(!store.has_data());
+		assert!(store.sorted_files(true)?.is_empty());
+
+		append_indexed(&mut store, 4..9)?;
+		let files = store.fetch(None, None)?.unwrap().data.unwrap();
+		assert_eq!(files.len(), 1);
+		let batch = read_batch(&files[0])?;
+		let indexes: Vec<u64> = batch.iter().map(|v| v["index"].as_u64().unwrap()).collect();
+		assert_eq!(indexes, vec![4, 5, 6, 7, 8]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_count_starts_at_zero_after_recovery() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		{
+			let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(3)))?;
+			append_indexed(&mut store, 0..2)?;
+			// Dropped with an unfinished file holding 2 items.
+		}
+
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(3)))?;
+		append_indexed(&mut store, 2..5)?;
+		// Recovered file keeps its 2 items; the new store fills a fresh file with 3.
+		assert_eq!(fetch_counts(&mut store)?, vec![2, 3]);
+		Ok(())
+	}
+
+	#[test]
+	fn test_item_limit_files_are_valid_json() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(2)))?;
+		store.append(json!(null))?;
+		store.append(json!("string, with comma"))?;
+		store.append(json!([1, 2, 3]))?;
+		store.append(json!({"key": "value"}))?;
+		store.append(json!(42))?;
+
+		let files = store.fetch(None, None)?.unwrap().data.unwrap();
+		assert_eq!(files.len(), 3);
+		for file in &files {
+			assert_eq!(
+				file.extension().and_then(|e| e.to_str()),
+				Some(DirectoryStore::TEMP_EXTENSION)
+			);
+			// read_batch asserts the envelope and parses the JSON.
+			assert!(!read_batch(file)?.is_empty());
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn test_validator_runs_on_item_limit_rotation() -> Result<()> {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		use std::sync::Arc;
+
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(2)))?;
+		let validated = Arc::new(AtomicUsize::new(0));
+		let counter = validated.clone();
+		store.set_file_validator(move |path| {
+			let content = fs::read_to_string(path)?;
+			serde_json::from_str::<Value>(&content)?;
+			counter.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		});
+
+		append_indexed(&mut store, 0..5)?;
+		// Two files were closed by item-limit rotation; the third is still open.
+		assert_eq!(validated.load(Ordering::SeqCst), 2);
+
+		assert_eq!(fetch_counts(&mut store)?, vec![2, 2, 1]);
+		assert_eq!(validated.load(Ordering::SeqCst), 3);
+		Ok(())
+	}
+
+	#[test]
+	fn test_validator_failure_on_item_limit_rotation_propagates() -> Result<()> {
+		let temp_dir = TempDir::new()?;
+		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(2)))?;
+		store.set_file_validator(|_| Err(io::Error::other("rejected")));
+
+		append_indexed(&mut store, 0..2)?;
+		let err = store.append(json!({"index": 2})).unwrap_err();
+		assert_eq!(err.to_string(), "rejected");
+		Ok(())
+	}
+
+	#[test]
+	#[should_panic(
+		expected = "max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory."
+	)]
+	fn test_rejects_zero_max_file_items() {
+		let temp_dir = TempDir::new().unwrap();
+		let _store = DirectoryStore::new(item_limit_config(&temp_dir, Some(0))).unwrap();
 	}
 }

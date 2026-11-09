@@ -54,6 +54,7 @@ fn test_recovery_from_corrupted_files() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -97,6 +98,7 @@ fn test_concurrent_corruption_recovery() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 512, // Small size to force more files
+		max_file_items: None,
 	};
 
 	let store = DirectoryStore::new(config)?;
@@ -159,6 +161,7 @@ fn test_file_system_edge_cases() -> Result<()> {
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
+		max_file_items: None,
 	};
 
 	let mut store = DirectoryStore::new(config)?;
@@ -168,11 +171,11 @@ fn test_file_system_edge_cases() -> Result<()> {
 	let fail_counter_clone = fail_counter.clone();
 	store.set_file_validator(move |_| {
 		let count = fail_counter_clone.fetch_add(1, Ordering::SeqCst);
-		if count % 3 == 0 {
-			Err(io::Error::new(
-				io::ErrorKind::Other,
-				"Simulated validation failure",
-			))
+		// `is_multiple_of` needs Rust 1.87; CI builds tests with 1.83.
+		#[allow(clippy::manual_is_multiple_of)]
+		let fail = count % 3 == 0;
+		if fail {
+			Err(io::Error::other("Simulated validation failure"))
 		} else {
 			Ok(())
 		}
@@ -212,9 +215,9 @@ fn test_file_system_edge_cases() -> Result<()> {
 
 	// Try multiple appends, expecting some to succeed and some to fail
 	for i in 0..10 {
-		match db.append(json!({"index": i})) {
-			Ok(_) => successful_appends += 1,
-			Err(_) => {} // Expected occasional failures
+		// Failures are expected occasionally
+		if db.append(json!({"index": i})).is_ok() {
+			successful_appends += 1;
 		}
 	}
 
