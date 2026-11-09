@@ -42,11 +42,17 @@ pub struct WebConfig {
 	/// Name of the IndexedDB database.
 	/// Different stores should use different database names to avoid collisions.
 	pub database_name: String,
-	/// Maximum number of items to keep in memory.
+	/// Total capacity: the maximum number of items to keep in memory.
 	/// Oldest items are dropped when this limit is exceeded.
+	/// This does not limit how many items a single fetch returns; see `max_fetch_items`.
 	pub max_items: usize,
 	/// Maximum size in bytes for a single fetch operation.
 	pub max_fetch_size: usize,
+	/// Maximum number of items returned by a single fetch (the size of one batch).
+	/// When `fetch` is also given a `count`, the smaller of the two applies.
+	/// This is unrelated to store capacity; see `max_items`.
+	/// `None` means fetches are limited only by `count` and bytes. Must not be `Some(0)`.
+	pub max_fetch_items: Option<usize>,
 }
 
 /// Internal representation of a stored event with its IndexedDB key
@@ -138,12 +144,16 @@ impl WebStore {
 	/// # Panics
 	/// * If max_fetch_size is less than 100 bytes
 	/// * If max_items is 0
+	/// * If max_fetch_items is `Some(0)`
 	pub async fn new(config: WebConfig) -> Self {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
 		}
 		if config.max_items == 0 {
 			panic!("max_items = 0? So... you want a store that stores nothing? That's what /dev/null is for.");
+		}
+		if config.max_fetch_items == Some(0) {
+			panic!("max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold.");
 		}
 
 		let mut store = Self {
@@ -481,6 +491,11 @@ impl DataStore for WebStore {
 		max_bytes: Option<usize>,
 	) -> Result<Option<DataResult<Self::Output>>> {
 		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
+		// The configured item limit caps the caller's count; a larger count is clamped.
+		let count = match (count, self.config.max_fetch_items) {
+			(Some(count), Some(limit)) => Some(count.min(limit)),
+			(count, limit) => count.or(limit),
+		};
 		let mut accumulated_size = 0;
 		let mut num_items = 0;
 
@@ -552,6 +567,7 @@ mod tests {
 			database_name: db_name.to_string(),
 			max_items: 1000,
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		}
 	}
 
@@ -597,6 +613,7 @@ mod tests {
 			database_name: "test-fifo".to_string(),
 			max_items: 3, // Small limit to test FIFO
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		};
 
 		let mut store = WebStore::new(config).await;
@@ -644,6 +661,7 @@ mod tests {
 			database_name: "test-fetch-bytes".to_string(),
 			max_items: 100,
 			max_fetch_size: 1000,
+			max_fetch_items: None,
 		};
 
 		let mut store = WebStore::new(config).await;
@@ -753,6 +771,7 @@ mod tests {
 				database_name: db_name.to_string(),
 				max_items: 1000,
 				max_fetch_size: 1024,
+				max_fetch_items: None,
 			})
 			.await;
 
@@ -778,6 +797,7 @@ mod tests {
 				database_name: db_name.to_string(),
 				max_items: 1000,
 				max_fetch_size: 1024,
+				max_fetch_items: None,
 			})
 			.await;
 
@@ -806,6 +826,7 @@ mod tests {
 			database_name: "test-isolated-a".to_string(),
 			max_items: 1000,
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		})
 		.await;
 
@@ -814,6 +835,7 @@ mod tests {
 			database_name: "test-isolated-b".to_string(),
 			max_items: 1000,
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		})
 		.await;
 
@@ -845,6 +867,7 @@ mod tests {
 			database_name: "test-panic".to_string(),
 			max_items: 1000,
 			max_fetch_size: 50,
+			max_fetch_items: None,
 		};
 
 		let _store = WebStore::new(config).await;
@@ -858,8 +881,162 @@ mod tests {
 			database_name: "test-panic".to_string(),
 			max_items: 0,
 			max_fetch_size: 1024,
+			max_fetch_items: None,
 		};
 
 		let _store = WebStore::new(config).await;
+	}
+
+	async fn item_limit_store(db_name: &str, max_fetch_items: Option<usize>) -> WebStore {
+		let mut store = WebStore::new(WebConfig {
+			write_key: "test-key".to_string(),
+			database_name: db_name.to_string(),
+			max_items: 1000,
+			max_fetch_size: 1024 * 1024,
+			max_fetch_items,
+		})
+		.await;
+		// Discard anything hydrated from a previous run of the same test.
+		store.reset();
+		store
+	}
+
+	fn append_indexed(store: &mut WebStore, range: std::ops::Range<i64>) {
+		for i in range {
+			store.append(json!({"index": i})).unwrap();
+		}
+	}
+
+	/// Fetches and returns the indexes in the batch, asserting removable matches the batch.
+	fn fetch_indexes(
+		store: &mut WebStore,
+		count: Option<usize>,
+		max_bytes: Option<usize>,
+	) -> Vec<i64> {
+		let Some(result) = store.fetch(count, max_bytes).unwrap() else {
+			return Vec::new();
+		};
+		let batch = result.data.unwrap();
+		let items = batch["batch"].as_array().unwrap();
+		assert_eq!(items.len(), result.removable.unwrap().len());
+		items.iter().map(|v| v["index"].as_i64().unwrap()).collect()
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_returns_oldest_n_in_order() {
+		let mut store = item_limit_store("test-item-limit-oldest", Some(4)).await;
+		append_indexed(&mut store, 0..10);
+		assert_eq!(fetch_indexes(&mut store, None, None), vec![0, 1, 2, 3]);
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_fewer_than_n_returns_all() {
+		let mut store = item_limit_store("test-item-limit-fewer", Some(8)).await;
+		append_indexed(&mut store, 0..3);
+		assert_eq!(fetch_indexes(&mut store, None, None), vec![0, 1, 2]);
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_combines_with_count() {
+		let mut store = item_limit_store("test-item-limit-count", Some(5)).await;
+		append_indexed(&mut store, 0..20);
+
+		// count below the limit wins
+		assert_eq!(fetch_indexes(&mut store, Some(2), None), vec![0, 1]);
+		// count equal to the limit
+		assert_eq!(fetch_indexes(&mut store, Some(5), None).len(), 5);
+		// count above the limit is clamped silently
+		assert_eq!(
+			fetch_indexes(&mut store, Some(100), None),
+			vec![0, 1, 2, 3, 4]
+		);
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_byte_limit_wins() {
+		let mut store = item_limit_store("test-item-limit-bytes", Some(8)).await;
+		for i in 0..20 {
+			store
+				.append(json!({"index": i, "padding": "x".repeat(50)}))
+				.unwrap();
+		}
+		let item_size = json!({"index": 0, "padding": "x".repeat(50)})
+			.to_string()
+			.len();
+
+		// Room for exactly 3 items by bytes, fewer than the item limit.
+		let indexes = fetch_indexes(&mut store, None, Some(item_size * 3 + 1));
+		assert_eq!(indexes, vec![0, 1, 2]);
+
+		// Byte limit large enough for all 20: the item limit still caps it.
+		let indexes = fetch_indexes(&mut store, None, Some(item_size * 20));
+		assert_eq!(indexes.len(), 8);
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_walks_store_in_batches() {
+		let mut store = item_limit_store("test-item-limit-walk", Some(8)).await;
+		append_indexed(&mut store, 0..20);
+
+		let mut sizes = Vec::new();
+		let mut seen = Vec::new();
+		while let Some(result) = store.fetch(None, None).unwrap() {
+			let batch = result.data.unwrap();
+			let items = batch["batch"].as_array().unwrap().clone();
+			let removable = result.removable.unwrap();
+			assert_eq!(items.len(), removable.len());
+			sizes.push(items.len());
+			seen.extend(items.iter().map(|v| v["index"].as_i64().unwrap()));
+			store.remove(&removable).unwrap();
+		}
+
+		assert_eq!(sizes, vec![8, 8, 4]);
+		assert_eq!(seen, (0..20).collect::<Vec<_>>());
+		assert!(!store.has_data());
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_no_item_limit_unchanged() {
+		let mut store = item_limit_store("test-item-limit-none", None).await;
+		append_indexed(&mut store, 0..50);
+		assert_eq!(
+			fetch_indexes(&mut store, None, None),
+			(0..50).collect::<Vec<_>>()
+		);
+		assert_eq!(fetch_indexes(&mut store, Some(7), None).len(), 7);
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_of_one() {
+		let mut store = item_limit_store("test-item-limit-one", Some(1)).await;
+		append_indexed(&mut store, 0..3);
+		assert_eq!(fetch_indexes(&mut store, None, None), vec![0]);
+		assert_eq!(fetch_indexes(&mut store, Some(10), None), vec![0]);
+	}
+
+	#[wasm_bindgen_test]
+	async fn test_fetch_item_limit_with_max_items_drop_oldest() {
+		let mut store = WebStore::new(WebConfig {
+			write_key: "test-key".to_string(),
+			database_name: "test-item-limit-max-items".to_string(),
+			max_items: 10,
+			max_fetch_size: 1024 * 1024,
+			max_fetch_items: Some(4),
+		})
+		.await;
+		store.reset();
+		append_indexed(&mut store, 0..15);
+
+		// Capacity dropped 0..5; the fetch limit still applies to what remains.
+		assert_eq!(store.items.len(), 10);
+		assert_eq!(fetch_indexes(&mut store, None, None), vec![5, 6, 7, 8]);
+	}
+
+	#[wasm_bindgen_test]
+	#[should_panic(
+		expected = "max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold."
+	)]
+	async fn test_rejects_zero_max_fetch_items() {
+		let _store = item_limit_store("test-panic", Some(0)).await;
 	}
 }
