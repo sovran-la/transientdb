@@ -7,6 +7,8 @@ use std::io::{self, BufWriter, Result, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod files;
+
 impl Equivalent for PathBuf {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
 		if let Some(other_path) = other.as_any().downcast_ref::<PathBuf>() {
@@ -49,7 +51,14 @@ pub struct DirectoryConfig {
 	pub storage_location: PathBuf,
 	/// Base name for generated files.
 	/// Files will be created with the pattern: "{index}-{base_filename}"
-	/// where index is an auto-incrementing number.
+	/// where index is an auto-incrementing number. A finished file has `.temp` appended
+	/// to that whole name ("5-events.json" becomes "5-events.json.temp"), so
+	/// `base_filename` must not itself end in `.temp`.
+	///
+	/// The store owns exactly the files with those two names and ignores everything else
+	/// in `storage_location`, so stores with different `base_filename`s can share one
+	/// directory without seeing, counting, finishing, fetching or deleting each other's
+	/// files.
 	pub base_filename: String,
 	/// Maximum size in bytes of a finished data file on disk.
 	///
@@ -80,7 +89,9 @@ pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 /// items, the open file is finished and the item starts a new one. So no finished file
 /// is ever larger than `max_file_size`, envelope included. Items too large for any file
 /// are rejected with `ErrorKind::InvalidInput`.
-/// Completed files are marked with a .temp extension to indicate they are ready for processing.
+/// Completed files are marked by appending a .temp extension to their name, to indicate
+/// they are ready for processing. Only files named for this store's `base_filename` are
+/// ever read, finished, fetched or removed; see [`DirectoryConfig::base_filename`].
 ///
 /// Each file contains a JSON object with:
 /// - A `batch` array containing the stored items
@@ -120,12 +131,20 @@ impl DirectoryStore {
 	/// * If max_file_items is `Some(0)`
 	/// * If max_file_size leaves no room for even a 1-byte item once the file's
 	///   envelope (which grows with `write_key`) is counted
+	/// * If base_filename ends in `.temp`: its open files would carry the name another
+	///   store's finished files have, so ownership could not be told from the name
 	pub fn new(config: DirectoryConfig) -> Result<Self> {
 		if config.max_file_size < 100 {
 			panic!("Seriously? max_file_size < 100 bytes? What exactly do you expect to store in there?");
 		}
 		if config.max_file_items == Some(0) {
 			panic!("max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory.");
+		}
+		if config
+			.base_filename
+			.ends_with(&format!(".{}", Self::TEMP_EXTENSION))
+		{
+			panic!("base_filename ends in \".temp\"? That's the mark of a finished file; a name that looks done before it starts can't be told apart from one that is.");
 		}
 
 		let mut store = DirectoryStore {
@@ -256,7 +275,7 @@ impl DirectoryStore {
 			let file_path = self
 				.config
 				.storage_location
-				.join(format!("{}-{}", index, self.config.base_filename));
+				.join(self.unfinished_name(index));
 
 			match OpenOptions::new()
 				.write(true)
@@ -288,37 +307,17 @@ impl DirectoryStore {
 		}
 	}
 
-	/// Scans the directory for existing files, finalizes unfinished ones, and returns the highest index found
+	/// Scans the directory for this store's files, finalizes unfinished ones, and returns
+	/// the highest index found
 	fn initialize_directory(&self) -> Result<u32> {
-		let entries = fs::read_dir(&self.config.storage_location)?;
-		let mut max_index = 0;
-
-		for entry in entries {
-			let entry = entry?;
-			let path = entry.path();
-
-			if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-				// Extract index from filename
-				if let Some(index_str) = file_name.split('-').next() {
-					if let Ok(index) = index_str.parse::<u32>() {
-						max_index = max_index.max(index);
-
-						// If file doesn't have .temp extension, it's unfinished
-						if path.extension().and_then(|ext| ext.to_str())
-							!= Some(Self::TEMP_EXTENSION)
-						{
-							// Attempt to finalize the file
-							if let Err(e) = self.recover_file(&path) {
-								eprintln!("Failed to finalize file {:?}: {}", path, e);
-								// Continue processing other files even if this one fails
-							}
-						}
-					}
-				}
+		let files = self.owned_files()?;
+		for file in files.iter().filter(|f| !f.finished) {
+			if let Err(e) = self.recover_file(&file.path) {
+				eprintln!("Failed to finalize file {:?}: {}", file.path, e);
+				// Continue processing other files even if this one fails
 			}
 		}
-
-		Ok(max_index)
+		Ok(files.iter().map(|f| f.index).max().unwrap_or(0))
 	}
 
 	/// Finalizes a file an earlier session left without the `.temp` extension.
@@ -362,8 +361,7 @@ impl DirectoryStore {
 		}
 
 		// Rename to .temp to mark as complete
-		let new_path = path.with_extension(Self::TEMP_EXTENSION);
-		fs::rename(path, new_path)?;
+		fs::rename(path, Self::finished_path(path))?;
 
 		Ok(())
 	}
@@ -389,29 +387,15 @@ impl DirectoryStore {
 		Ok(())
 	}
 
+	/// This store's files, oldest first: by numeric index, so "10-events" sorts after
+	/// "9-events". Only finished files unless `include_unfinished`.
 	fn sorted_files(&self, include_unfinished: bool) -> Result<Vec<PathBuf>> {
-		let mut files: Vec<PathBuf> = fs::read_dir(&self.config.storage_location)?
-			.filter_map(Result::ok)
-			.map(|e| e.path())
-			.filter(|p| {
-				if include_unfinished {
-					true
-				} else {
-					p.extension().and_then(|ext| ext.to_str()) == Some(Self::TEMP_EXTENSION)
-				}
-			})
-			.collect();
-
-		// Oldest first: by numeric index, so "10-events" sorts after "9-events".
-		files.sort_by_cached_key(|p| {
-			let name = p.file_name().unwrap_or_default().to_owned();
-			let index = name
-				.to_str()
-				.and_then(|n| n.split('-').next())
-				.and_then(|i| i.parse::<u32>().ok());
-			(index, name)
-		});
-		Ok(files)
+		Ok(self
+			.owned_files()?
+			.into_iter()
+			.filter(|f| include_unfinished || f.finished)
+			.map(|f| f.path)
+			.collect())
 	}
 
 	fn up_to_size(&self, max_bytes: usize, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -443,25 +427,8 @@ impl DataStore for DirectoryStore {
 			return true;
 		}
 
-		// Check directory for any files matching our base filename pattern
-		fs::read_dir(&self.config.storage_location)
-			.map(|entries| {
-				entries.filter_map(Result::ok).any(|e| {
-					let path = e.path();
-					if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-						// Check if filename starts with a number and contains our base_filename
-						let is_our_file = file_name
-							.split('-')
-							.next()
-							.and_then(|s| s.parse::<u32>().ok())
-							.is_some() && file_name
-							.contains(&self.config.base_filename);
-						return is_our_file;
-					}
-					false
-				})
-			})
-			.unwrap_or(false)
+		// Any of this store's files, finished or not, is data
+		self.owned_files().is_ok_and(|files| !files.is_empty())
 	}
 
 	fn reset(&mut self) {
@@ -588,6 +555,7 @@ mod tests {
 	mod duplicates;
 	mod lifecycle;
 	mod oversized;
+	mod ownership;
 	mod recovery;
 	mod support;
 	mod write_key;

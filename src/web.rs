@@ -492,6 +492,7 @@ mod tests {
 	mod ceiling;
 	mod duplicates;
 	mod head_drop;
+	mod isolation;
 	mod oversized;
 	mod persistence;
 	mod reopen;
