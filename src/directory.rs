@@ -305,7 +305,7 @@ impl DirectoryStore {
 							!= Some(Self::TEMP_EXTENSION)
 						{
 							// Attempt to finalize the file
-							if let Err(e) = self.finalize_file(&path) {
+							if let Err(e) = self.recover_file(&path) {
 								eprintln!("Failed to finalize file {:?}: {}", path, e);
 								// Continue processing other files even if this one fails
 							}
@@ -318,6 +318,27 @@ impl DirectoryStore {
 		Ok(max_index)
 	}
 
+	/// Finalizes a file an earlier session left without the `.temp` extension.
+	///
+	/// A file that is already a complete envelope, because its validator rejected it
+	/// after the closing was written or the session ended before the rename, is not
+	/// closed a second time. Any other file is closed as usual, even one damaged in
+	/// some other way (such as cut off inside an item); that is not repaired.
+	fn recover_file(&self, path: &Path) -> Result<()> {
+		if Self::is_complete_envelope(&fs::read(path)?) {
+			self.mark_finished(path)
+		} else {
+			self.finalize_file(path)
+		}
+	}
+
+	/// Whether `content` already parses as a finished data file.
+	fn is_complete_envelope(content: &[u8]) -> bool {
+		serde_json::from_slice::<Value>(content).is_ok_and(|json| {
+			json["batch"].is_array() && json["sentAt"].is_string() && json["writeKey"].is_string()
+		})
+	}
+
 	/// Finalizes a file by completing the JSON structure and renaming with .temp extension
 	fn finalize_file(&self, path: &Path) -> Result<()> {
 		{
@@ -327,7 +348,11 @@ impl DirectoryStore {
 			file.write_all(&closing)?;
 			file.flush()?;
 		}
+		self.mark_finished(path)
+	}
 
+	/// Validates a closed file, if a validator is set, and renames it with the .temp extension
+	fn mark_finished(&self, path: &Path) -> Result<()> {
 		// Run validation if configured
 		if let Some(validator) = &self.file_validator {
 			validator(path)?;
@@ -560,6 +585,7 @@ mod tests {
 	mod duplicates;
 	mod lifecycle;
 	mod oversized;
+	mod recovery;
 	mod support;
 
 	#[test]
