@@ -1,5 +1,5 @@
-use crate::{DataResult, DataStore, Equivalent};
-use chrono::Utc;
+use crate::{batch, DataResult, DataStore, Equivalent};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::any::Any;
 use std::fs::{self, File, OpenOptions};
@@ -51,9 +51,16 @@ pub struct DirectoryConfig {
 	/// Files will be created with the pattern: "{index}-{base_filename}"
 	/// where index is an auto-incrementing number.
 	pub base_filename: String,
-	/// Maximum size in bytes for individual data files.
-	/// Once a file reaches this size, a new file will be created.
-	/// Must be at least 100 bytes.
+	/// Maximum size in bytes of a finished data file on disk.
+	///
+	/// This is a hard ceiling: the whole finished file, including the JSON envelope
+	/// (`batch` opening, `sentAt`, `writeKey`) and the commas between items, is never
+	/// larger than this. When the next item would push the finished file past it, the
+	/// open file is finished first and the item starts a new one. An item too large to
+	/// fit even alone in a file is rejected by `append` with `ErrorKind::InvalidInput`.
+	///
+	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once
+	/// the envelope is counted (the envelope grows with `write_key`'s length).
 	pub max_file_size: usize,
 	/// Maximum number of items in an individual data file.
 	/// Once a file holds this many items, the next append starts a new file.
@@ -68,7 +75,11 @@ pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 /// A data store that persists items to files in a directory.
 ///
 /// Files are created with incrementing numerical prefixes and contain batched JSON data.
-/// When a file reaches the configured size limit or item limit, a new file is created.
+/// Before each append the store checks whether the item fits in the open file; if the
+/// finished file would exceed `max_file_size` bytes or hold more than `max_file_items`
+/// items, the open file is finished and the item starts a new one. So no finished file
+/// is ever larger than `max_file_size`, envelope included. Items too large for any file
+/// are rejected with `ErrorKind::InvalidInput`.
 /// Completed files are marked with a .temp extension to indicate they are ready for processing.
 ///
 /// Each file contains a JSON object with:
@@ -81,12 +92,15 @@ pub struct DirectoryStore {
 	current_size: usize,
 	current_items: usize,
 	current_path: Option<PathBuf>,
+	/// Length in bytes of `closing()`, which is the same for every timestamp.
+	closing_len: usize,
 	file_validator: Option<FileValidator>,
 	next_index: AtomicU32,
 }
 
 impl DirectoryStore {
 	const TEMP_EXTENSION: &'static str = "temp";
+	const SEPARATOR: &'static [u8] = b",";
 
 	/// Creates a new DirectoryStore with the specified configuration.
 	///
@@ -104,6 +118,8 @@ impl DirectoryStore {
 	/// # Panics
 	/// * If max_file_size is less than 100 bytes
 	/// * If max_file_items is `Some(0)`
+	/// * If max_file_size leaves no room for even a 1-byte item once the file's
+	///   envelope (which grows with `write_key`) is counted
 	pub fn new(config: DirectoryConfig) -> Result<Self> {
 		if config.max_file_size < 100 {
 			panic!("Seriously? max_file_size < 100 bytes? What exactly do you expect to store in there?");
@@ -112,17 +128,22 @@ impl DirectoryStore {
 			panic!("max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory.");
 		}
 
-		fs::create_dir_all(&config.storage_location)?;
-
-		let store = DirectoryStore {
+		let mut store = DirectoryStore {
 			config,
 			writer: None,
 			current_size: 0,
 			current_items: 0,
 			current_path: None,
+			closing_len: 0,
 			file_validator: None,
 			next_index: AtomicU32::new(0),
 		};
+		store.closing_len = store.closing(Utc::now()).len();
+		if store.opening().len() + store.closing_len + 1 > store.config.max_file_size {
+			panic!("max_file_size is all envelope and no room for an item? That's packaging, not storage.");
+		}
+
+		fs::create_dir_all(&store.config.storage_location)?;
 
 		// Initialize directory and get max index
 		let max_index = store.initialize_directory()?;
@@ -181,9 +202,47 @@ impl DirectoryStore {
 		self.next_index.fetch_add(1, Ordering::SeqCst)
 	}
 
-	fn start_file_if_needed(&mut self) -> Result<bool> {
+	/// Bytes written at the start of every data file.
+	fn opening(&self) -> &'static [u8] {
+		b"{ \"batch\": ["
+	}
+
+	/// Bytes written at the end of every data file when it is finished.
+	///
+	/// Its length does not depend on `sent_at`: the timestamp format is fixed-width.
+	fn closing(&self, sent_at: DateTime<Utc>) -> Vec<u8> {
+		format!(
+			"],\"sentAt\":\"{}\",\"writeKey\":\"{}\"}}",
+			sent_at.format("%Y-%m-%dT%H:%M:%S.%3fZ"),
+			self.config.write_key
+		)
+		.into_bytes()
+	}
+
+	/// The largest serialized item that fits alone in a file.
+	fn max_item_size(&self) -> usize {
+		self.config.max_file_size - self.opening().len() - self.closing_len
+	}
+
+	/// Whether an item of `item_len` bytes can go into the open file without the
+	/// finished file exceeding `max_file_size` or holding more than `max_file_items`.
+	fn fits_in_open_file(&self, item_len: usize) -> bool {
+		let item_limit_reached = self
+			.config
+			.max_file_items
+			.is_some_and(|max| self.current_items >= max);
+		let separator = if self.current_items > 0 {
+			Self::SEPARATOR.len()
+		} else {
+			0
+		};
+		let finished_size = self.current_size + separator + item_len + self.closing_len;
+		!item_limit_reached && finished_size <= self.config.max_file_size
+	}
+
+	fn start_file_if_needed(&mut self) -> Result<()> {
 		if self.writer.is_some() {
-			return Ok(false);
+			return Ok(());
 		}
 
 		let mut index = self.next_index();
@@ -203,17 +262,12 @@ impl DirectoryStore {
 			{
 				Ok(file) => {
 					let mut writer = BufWriter::new(file);
+					writer.write_all(self.opening())?;
 					self.current_path = Some(file_path);
-
-					if self.current_size == 0 {
-						writer.write_all(b"{ \"batch\": [")?;
-						self.current_size = "{ \"batch\": [".len();
-						self.writer = Some(writer);
-						return Ok(true);
-					}
-
+					self.current_size = self.opening().len();
+					self.current_items = 0;
 					self.writer = Some(writer);
-					return Ok(false);
+					return Ok(());
 				}
 				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
 					// File exists, try next index
@@ -268,12 +322,9 @@ impl DirectoryStore {
 	fn finalize_file(&self, path: &Path) -> Result<()> {
 		{
 			let mut file = OpenOptions::new().append(true).open(path)?;
-			write!(
-				file,
-				"],\"sentAt\":\"{}\",\"writeKey\":\"{}\"}}",
-				Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ"),
-				self.config.write_key
-			)?;
+			let closing = self.closing(Utc::now());
+			debug_assert_eq!(closing.len(), self.closing_len);
+			file.write_all(&closing)?;
 			file.flush()?;
 		}
 
@@ -290,24 +341,23 @@ impl DirectoryStore {
 	}
 
 	fn finish_file(&mut self) -> Result<()> {
-		let writer = match self.writer.take() {
-			Some(mut writer) => {
-				writer.flush()?;
-				writer
-			}
-			None => return Ok(()),
+		let Some(mut writer) = self.writer.take() else {
+			return Ok(());
 		};
+		let current_path = self.current_path.take();
 
+		// The file is closed from here on, even if flushing or finalizing it fails,
+		// so the next append must start a fresh file with fresh accounting.
+		self.current_size = 0;
+		self.current_items = 0;
+
+		writer.flush()?;
 		// Drop the writer to close the file
 		drop(writer);
 
-		// Use the stored path
-		if let Some(current_path) = self.current_path.take() {
+		if let Some(current_path) = current_path {
 			self.finalize_file(&current_path)?;
 		}
-
-		self.current_size = 0;
-		self.current_items = 0;
 		Ok(())
 	}
 
@@ -324,10 +374,14 @@ impl DirectoryStore {
 			})
 			.collect();
 
-		files.sort_by(|a, b| {
-			a.file_name()
-				.unwrap_or_default()
-				.cmp(b.file_name().unwrap_or_default())
+		// Oldest first: by numeric index, so "10-events" sorts after "9-events".
+		files.sort_by_cached_key(|p| {
+			let name = p.file_name().unwrap_or_default().to_owned();
+			let index = name
+				.to_str()
+				.and_then(|n| n.split('-').next())
+				.and_then(|i| i.parse::<u32>().ok());
+			(index, name)
 		});
 		Ok(files)
 	}
@@ -400,30 +454,47 @@ impl DataStore for DirectoryStore {
 		}
 	}
 
+	/// Appends an item to the open file, rotating first if the item would not fit.
+	///
+	/// A finished file is never larger than `max_file_size` bytes, envelope and
+	/// separators included, and never holds more than `max_file_items` items.
+	///
+	/// # Errors
+	/// Returns an `InvalidInput` error, without touching any file, if the serialized
+	/// item is too large to fit even alone in a fresh file. Also propagates IO errors
+	/// and file validator errors from finishing the previous file.
 	fn append(&mut self, data: Value) -> Result<()> {
-		let started = self.start_file_if_needed()?;
+		let item = serde_json::to_vec(&data)?;
+
+		// Reject before touching anything: an item that cannot fit in any file must not
+		// rotate the open file or create a new one.
+		let max_item_size = self.max_item_size();
+		if item.len() > max_item_size {
+			return Err(batch::item_too_large(
+				item.len(),
+				max_item_size,
+				"max_file_size",
+				self.config.max_file_size,
+			));
+		}
+
+		if self.writer.is_some() && !self.fits_in_open_file(item.len()) {
+			self.finish_file()?;
+		}
+		self.start_file_if_needed()?;
+
 		let writer = self
 			.writer
 			.as_mut()
 			.ok_or_else(|| io::Error::other("No active writer"))?;
-
-		// The open file is full by size or by item count; rotate before writing.
-		let item_limit_reached = self
-			.config
-			.max_file_items
-			.is_some_and(|max| self.current_items >= max);
-		if self.current_size >= self.config.max_file_size || item_limit_reached {
-			self.finish_file()?;
-			return self.append(data);
+		if self.current_items > 0 {
+			writer.write_all(Self::SEPARATOR)?;
+			self.current_size += Self::SEPARATOR.len();
 		}
-
-		if !started {
-			writer.write_all(b",")?;
-		}
-		serde_json::to_writer(&mut *writer, &data)?;
+		writer.write_all(&item)?;
 		writer.flush()?;
 
-		self.current_size += data.to_string().len();
+		self.current_size += item.len();
 		self.current_items += 1;
 		Ok(())
 	}
@@ -484,6 +555,11 @@ mod tests {
 	use std::io;
 	use std::io::Result;
 	use tempfile::TempDir;
+
+	mod ceiling;
+	mod lifecycle;
+	mod oversized;
+	mod support;
 
 	#[test]
 	fn test_directory_store_basic_operations() -> Result<()> {
@@ -603,7 +679,8 @@ mod tests {
 			write_key: "test-key".to_string(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
-			max_file_size: 100, // Small size to force rotation
+			// Each 79 byte item plus the 72 byte envelope: two items fit per file, not three.
+			max_file_size: 250,
 			max_file_items: None,
 		};
 
@@ -623,9 +700,11 @@ mod tests {
 		if let Some(result) = store.fetch(None, None)? {
 			let files = result.data.unwrap();
 			assert!(files.len() > 1, "Expected multiple files due to size limit");
+			assert_eq!(files.len(), 3);
 
 			// Verify each file is properly formatted
 			for file in &files {
+				assert!(fs::metadata(file)?.len() <= 250, "File over max_file_size");
 				let content = fs::read_to_string(file)?.trim().to_string();
 				assert!(content.starts_with("{ \"batch\": ["));
 				assert!(content.ends_with("}"));
@@ -755,7 +834,9 @@ mod tests {
 			write_key: "test-key".to_string(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
-			max_file_size: 100, // Small size to force multiple files
+			// Small size to force multiple files: one 72 byte item plus the 72 byte
+			// envelope per file.
+			max_file_size: 150,
 			max_file_items: None,
 		};
 
@@ -971,11 +1052,12 @@ mod tests {
 	fn test_size_limit_trips_before_item_limit() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let mut config = item_limit_config(&temp_dir, Some(8));
-		config.max_file_size = 100;
+		config.max_file_size = 200;
 		let mut store = DirectoryStore::new(config)?;
 
-		// Each item is ~60 bytes, so the 100 byte size check rotates after 2 items,
-		// long before the item limit of 8 is reached.
+		// Each item is 53 bytes and the envelope 72, so two items (179 bytes with the
+		// separator) fit under 200 and a third (233) does not, long before the item
+		// limit of 8 is reached.
 		for i in 0..9 {
 			store.append(json!({"index": i, "data": "padding to reach the size limit."}))?;
 		}

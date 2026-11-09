@@ -234,7 +234,7 @@ if let Some(result) = db.fetch(Some(100), None)? {
 
 ### DirectoryStore
 - Stores data in rotating files in a specified directory
-- Automatic file management and rotation
+- Automatic file management and rotation; no finished file exceeds `max_file_size` bytes
 - Returns paths to completed files
 - Supports custom file validation
 - Requires explicit cleanup via remove()
@@ -259,22 +259,62 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 ### MemoryConfig
 - `write_key`: Identifier for the data source
 - `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
-- `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
+- `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
 
 ### DirectoryConfig
 - `write_key`: Identifier for the data source
 - `storage_location`: Directory path for storing files
 - `base_filename`: Base name for generated files
-- `max_file_size`: Maximum size in bytes for individual files (must be ≥ 100)
+- `max_file_size`: Hard ceiling in bytes on each finished file, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_file_items`: Maximum number of items in one file, or `None` for no limit (must not be `Some(0)`)
 
 ### WebConfig
 - `write_key`: Identifier for the data source
 - `database_name`: Name of the IndexedDB database (use unique names per store)
 - `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
-- `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
+- `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
+
+### Byte limits
+
+Some consumers send each batch as one request body to an API that rejects bodies over a
+fixed size. Every store's byte limit is a hard ceiling on what it hands back, measured in
+bytes (not characters) and counting the whole JSON batch: the envelope (`batch`, `sentAt`,
+`writeKey`), every item, and the commas between items. An exact fit is allowed.
+
+- **DirectoryStore**: no finished file is ever larger than `max_file_size` on disk. Before
+  each `append` the store computes the size the open file would have once finished with the
+  item in it; if that exceeds `max_file_size`, it finishes the open file and the item starts
+  a new one. A file also rotates when it holds `max_file_items` items, whichever comes first.
+- **MemoryStore and WebStore**: the batch one `fetch` returns, serialized with
+  `serde_json::to_string`, is never longer than `max_bytes` if given, otherwise
+  `max_fetch_size`. A `max_bytes` too small for the oldest item returns `Ok(None)`; a fetch at
+  the configured `max_fetch_size` always returns it. The fetch also stops at `count` or
+  `max_fetch_items` items.
+
+An item too large to fit by itself under the configured limit (`max_file_size` or
+`max_fetch_size`) can never be delivered, so `append` rejects it with
+`std::io::ErrorKind::InvalidInput` and a message giving the item's size and the largest size
+that fits. The rejected item is not stored, and the store is otherwise unchanged:
+DirectoryStore does not rotate or create a file, and WebStore issues no IndexedDB write.
+
+```rust
+match db.append(event) {
+    Ok(()) => {}
+    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => eprintln!("dropped event: {e}"),
+    Err(e) => return Err(e),
+}
+```
+
+WebStore may hold items persisted before this limit applied, or under a larger
+`max_fetch_size`. Hydration loads them as usual; when one reaches the head of the queue and
+cannot fit under `max_fetch_size`, `fetch` drops it, deletes it from IndexedDB, logs a
+`console.warn`, and continues with the next item.
+
+Because the envelope counts, the limit must leave room for at least a 1-byte item after it;
+the envelope grows with `write_key`'s length. Constructing a store whose envelope alone fills
+the limit panics.
 
 ### Item limits per batch
 
@@ -297,7 +337,7 @@ Each store can enforce one:
 
 - `MemoryConfig::max_fetch_items` and `WebConfig::max_fetch_items` cap the items returned by
   one `fetch`. If `fetch` is also given a `count`, the smaller of the two applies; a larger
-  `count` is clamped silently. The byte limit still applies. This is separate from
+  `count` is clamped silently. The [byte limit](#byte-limits) still applies. This is separate from
   `max_items`, which is the store's total capacity.
 
   ```rust
