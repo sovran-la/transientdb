@@ -19,7 +19,6 @@ pub(super) fn store(max_fetch_size: usize) -> MemoryStore {
 }
 
 /// A unique JSON string item whose compact serialization is exactly `len` bytes.
-/// MemoryStore removes by equality, so test items must not repeat.
 pub(super) fn item_of_len(len: usize, tag: usize) -> Value {
 	let width = len - 2;
 	let item = Value::String(format!("{tag:0>width$}"));
