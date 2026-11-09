@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod files;
+mod recovery;
 
 impl Equivalent for PathBuf {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
@@ -107,6 +108,9 @@ pub struct DirectoryStore {
 	closing_len: usize,
 	file_validator: Option<FileValidator>,
 	next_index: AtomicU32,
+	/// This store's unfinished files that an earlier session left behind, listed by
+	/// `new` and recovered by the next `fetch`.
+	leftovers: Vec<PathBuf>,
 }
 
 impl DirectoryStore {
@@ -116,7 +120,13 @@ impl DirectoryStore {
 	/// Creates a new DirectoryStore with the specified configuration.
 	///
 	/// Creates the storage directory if it doesn't exist. The store will initialize
-	/// its file index by scanning existing files in the directory.
+	/// its file index by scanning its existing files in the directory.
+	///
+	/// `new` modifies no file. It notes which of this store's files an earlier session
+	/// left unfinished (without `.temp`); the first [`fetch`](DataStore::fetch) recovers
+	/// them, so a validator set with [`set_file_validator`](Self::set_file_validator)
+	/// after `new` runs on each of them. Until then they still count for
+	/// [`has_data`](DataStore::has_data).
 	///
 	/// # Arguments
 	/// * `config` - Configuration options for the store
@@ -156,6 +166,7 @@ impl DirectoryStore {
 			closing_len: 0,
 			file_validator: None,
 			next_index: AtomicU32::new(0),
+			leftovers: Vec::new(),
 		};
 		store.closing_len = store.closing(Utc::now()).len();
 		if store.opening().len() + store.closing_len + 1 > store.config.max_file_size {
@@ -164,9 +175,10 @@ impl DirectoryStore {
 
 		fs::create_dir_all(&store.config.storage_location)?;
 
-		// Initialize directory and get max index
-		let max_index = store.initialize_directory()?;
+		// Get the max index and the leftovers to recover at the first fetch
+		let (max_index, leftovers) = store.initialize_directory()?;
 		store.next_index.store(max_index + 1, Ordering::SeqCst);
+		store.leftovers = leftovers;
 
 		Ok(store)
 	}
@@ -175,6 +187,11 @@ impl DirectoryStore {
 	///
 	/// The validator is called just before a file is marked as complete (renamed with .temp extension).
 	/// If the validator returns an error, the file will not be finalized and the error will be propagated.
+	///
+	/// It also runs on every file an earlier session left unfinished: those are recovered
+	/// by the first `fetch`, not by `new`, so a validator set before that fetch sees them.
+	/// A recovered file it rejects is logged, left without `.temp`, and not retried until
+	/// a later session; the fetch still succeeds.
 	///
 	/// # Arguments
 	/// * `validator` - Function that takes a file path and returns Ok(()) if the file is valid
@@ -307,38 +324,17 @@ impl DirectoryStore {
 		}
 	}
 
-	/// Scans the directory for this store's files, finalizes unfinished ones, and returns
-	/// the highest index found
-	fn initialize_directory(&self) -> Result<u32> {
+	/// Scans the directory for this store's files without modifying any. Returns the
+	/// highest index found and the unfinished files, lowest index first.
+	fn initialize_directory(&self) -> Result<(u32, Vec<PathBuf>)> {
 		let files = self.owned_files()?;
-		for file in files.iter().filter(|f| !f.finished) {
-			if let Err(e) = self.recover_file(&file.path) {
-				eprintln!("Failed to finalize file {:?}: {}", file.path, e);
-				// Continue processing other files even if this one fails
-			}
-		}
-		Ok(files.iter().map(|f| f.index).max().unwrap_or(0))
-	}
-
-	/// Finalizes a file an earlier session left without the `.temp` extension.
-	///
-	/// A file that is already a complete envelope, because its validator rejected it
-	/// after the closing was written or the session ended before the rename, is not
-	/// closed a second time. Any other file is closed as usual, even one damaged in
-	/// some other way (such as cut off inside an item); that is not repaired.
-	fn recover_file(&self, path: &Path) -> Result<()> {
-		if Self::is_complete_envelope(&fs::read(path)?) {
-			self.mark_finished(path)
-		} else {
-			self.finalize_file(path)
-		}
-	}
-
-	/// Whether `content` already parses as a finished data file.
-	fn is_complete_envelope(content: &[u8]) -> bool {
-		serde_json::from_slice::<Value>(content).is_ok_and(|json| {
-			json["batch"].is_array() && json["sentAt"].is_string() && json["writeKey"].is_string()
-		})
+		let max_index = files.iter().map(|f| f.index).max().unwrap_or(0);
+		let unfinished = files
+			.into_iter()
+			.filter(|f| !f.finished)
+			.map(|f| f.path)
+			.collect();
+		Ok((max_index, unfinished))
 	}
 
 	/// Finalizes a file by completing the JSON structure and renaming with .temp extension
@@ -435,6 +431,8 @@ impl DataStore for DirectoryStore {
 		// The open file is about to be deleted, so discard it rather than finalizing it.
 		// Otherwise later appends land in an unlinked file and the next fetch fails.
 		self.writer = None;
+		// Leftovers are deleted with everything else; there is nothing left to recover.
+		self.leftovers.clear();
 		self.current_path = None;
 		self.current_size = 0;
 		self.current_items = 0;
@@ -494,6 +492,18 @@ impl DataStore for DirectoryStore {
 		Ok(())
 	}
 
+	/// Finishes the open file, then returns the oldest finished files.
+	///
+	/// The first fetch of a session also recovers the files an earlier session left
+	/// unfinished, after finishing the open file and before choosing what to return, so
+	/// they come back from that same fetch in index order. The validator runs on each;
+	/// a recovered file that fails, whether rejected or for any other reason, is logged
+	/// with `eprintln!`, is not returned, and does not fail the fetch or stop the other
+	/// files from being recovered. Recovery happens once per session.
+	///
+	/// # Errors
+	/// Propagates IO errors and validator errors from finishing the open file, and IO
+	/// errors listing the directory.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
@@ -502,6 +512,9 @@ impl DataStore for DirectoryStore {
 		if self.writer.is_some() {
 			self.finish_file()?;
 		}
+		// After finishing the open file and before listing, so recovered files can be
+		// returned by this fetch, in index order with everything else.
+		self.recover_leftovers();
 
 		let mut files = self.sorted_files(false)?;
 
@@ -552,6 +565,7 @@ mod tests {
 	use tempfile::TempDir;
 
 	mod ceiling;
+	mod deferred;
 	mod duplicates;
 	mod lifecycle;
 	mod oversized;
