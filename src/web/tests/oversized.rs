@@ -12,20 +12,20 @@ async fn test_oversized_append_leaves_store_unchanged() {
 
 	store.append(json!("a")).unwrap();
 	store.append(json!("b")).unwrap();
-	let before: Vec<(Option<u32>, Value)> = store
+	let before: Vec<(u32, Value)> = store
 		.items
 		.iter()
-		.map(|e| (e.idb_key, e.value.clone()))
+		.map(|e| (e.key, e.value.clone()))
 		.collect();
-	let next_key = store.temp_key_counter;
+	let next_key = store.next_key;
 	assert_invalid_input(&store.append(item_of_len(500, 1)).unwrap_err());
-	let after: Vec<(Option<u32>, Value)> = store
+	let after: Vec<(u32, Value)> = store
 		.items
 		.iter()
-		.map(|e| (e.idb_key, e.value.clone()))
+		.map(|e| (e.key, e.value.clone()))
 		.collect();
 	assert_eq!(after, before);
-	assert_eq!(store.temp_key_counter, next_key);
+	assert_eq!(store.next_key, next_key);
 	assert!(store.has_data());
 }
 

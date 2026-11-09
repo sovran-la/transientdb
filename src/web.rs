@@ -18,26 +18,27 @@
 //! │  On init: IndexedDB ──► hydrate ──► VecDeque        │
 //! └─────────────────────────────────────────────────────┘
 //! ```
+//!
+//! The store assigns every item's key itself, so an item has the same key in memory and
+//! in IndexedDB from the moment it is appended. Each write is issued to IndexedDB during
+//! the call that causes it, so writes take effect in call order; see [`idb`].
+
+mod idb;
 
 use crate::{batch, DataResult, DataStore, Equivalent};
 use serde_json::{json, Value};
 use std::any::Any;
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Error, Result};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::{IdbDatabase, IdbRequest};
-
-const DB_VERSION: u32 = 1;
-const STORE_NAME: &str = "events";
+use web_sys::IdbDatabase;
 
 /// Configuration for the web-based data store.
 #[derive(Clone)]
 pub struct WebConfig {
 	/// Key used to identify writes to this store.
-	/// Included in batch metadata and used as IndexedDB key prefix.
+	/// Included in batch metadata.
 	pub write_key: String,
 	/// Name of the IndexedDB database.
 	/// Different stores should use different database names to avoid collisions.
@@ -53,8 +54,7 @@ pub struct WebConfig {
 	/// `serde_json::to_string`: envelope (`sentAt`, `writeKey`), every item, and every
 	/// separator count. An item too large to fit in a batch by itself under this limit is
 	/// rejected by `append` with `ErrorKind::InvalidInput`. Such an item persisted earlier
-	/// (by an older version, or under a larger limit) is dropped by `fetch` when it reaches
-	/// the head of the queue.
+	/// (under a larger limit) is dropped by `fetch` when it reaches the head of the queue.
 	///
 	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once the
 	/// envelope is counted (the envelope grows with `write_key`'s length).
@@ -66,26 +66,22 @@ pub struct WebConfig {
 	pub max_fetch_items: Option<usize>,
 }
 
-/// Internal representation of a stored event with its IndexedDB key
+/// A queued item and the key it is stored under in IndexedDB.
 #[derive(Clone, Debug)]
 struct StoredEvent {
-	/// Auto-generated IndexedDB key
-	idb_key: Option<u32>,
-	/// The actual event data
+	/// The item's key, assigned by the store at append; the same in IndexedDB.
+	key: u32,
+	/// The item, exactly as appended
 	value: Value,
 }
 
-impl Equivalent for StoredEvent {
+/// A removable from `WebStore::fetch`: the key of one fetched item.
+#[derive(Debug, PartialEq)]
+struct WebKey(u32);
+
+impl Equivalent for WebKey {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
-		if let Some(other_event) = other.as_any().downcast_ref::<StoredEvent>() {
-			// Compare by idb_key if both have one, otherwise by value
-			match (&self.idb_key, &other_event.idb_key) {
-				(Some(a), Some(b)) => a == b,
-				_ => self.value == other_event.value,
-			}
-		} else {
-			false
-		}
+		other.as_any().downcast_ref::<WebKey>() == Some(self)
 	}
 
 	fn as_any(&self) -> &dyn Any {
@@ -111,7 +107,8 @@ pub enum PersistenceState {
 ///
 /// Events are stored in an in-memory queue for fast synchronous access,
 /// with asynchronous fire-and-forget writes to IndexedDB for persistence
-/// across page refreshes.
+/// across page refreshes. Any JSON value can be stored; it is persisted and
+/// restored unmodified.
 ///
 /// # Persistence Behavior
 ///
@@ -122,6 +119,9 @@ pub enum PersistenceState {
 /// Use [`persistence_state()`](Self::persistence_state) to check the current
 /// mode and adjust behavior accordingly (e.g., flush more aggressively when
 /// in memory-only mode to minimize the data loss window).
+///
+/// A database written by an earlier version of this store, in the old record
+/// format, is emptied when first opened: its records are discarded.
 ///
 /// # Third-Party Context Warning
 ///
@@ -135,8 +135,8 @@ pub struct WebStore {
 	items: VecDeque<StoredEvent>,
 	/// IndexedDB database handle (None if unavailable/blocked)
 	db: Option<Rc<IdbDatabase>>,
-	/// Counter for generating temporary keys before IndexedDB assigns real ones
-	temp_key_counter: u32,
+	/// The key the next appended item gets; above every key in the queue and in IndexedDB
+	next_key: u32,
 	/// Current persistence state
 	persistence_state: PersistenceState,
 	/// The largest serialized item that fits alone in a batch under `max_fetch_size`
@@ -150,9 +150,9 @@ impl WebStore {
 	/// in-memory state from any previously persisted events.
 	///
 	/// If IndexedDB is unavailable (private browsing, third-party context,
-	/// storage blocked, etc), the store falls back to memory-only mode
-	/// and logs a warning to the console. Check [`persistence_state()`](Self::persistence_state)
-	/// to detect this condition.
+	/// storage blocked, etc), or its contents cannot be read, the store falls
+	/// back to memory-only mode and logs a warning to the console. Check
+	/// [`persistence_state()`](Self::persistence_state) to detect this condition.
 	///
 	/// # Panics
 	/// * If max_fetch_size is less than 100 bytes
@@ -180,24 +180,32 @@ impl WebStore {
 			config,
 			items: VecDeque::new(),
 			db: None,
-			temp_key_counter: 0,
+			next_key: 0,
 			persistence_state: PersistenceState::MemoryOnly,
 		};
 
 		// Attempt to open IndexedDB - fall back to memory-only if it fails
-		match store.open_database().await {
-			Ok(db) => {
-				store.db = Some(Rc::new(db));
-				store.persistence_state = PersistenceState::Persisted;
-
-				// Hydrate from IndexedDB
-				if let Err(e) = store.hydrate().await {
+		match idb::open(&store.config.database_name).await {
+			Ok(db) => match store.hydrate(&db).await {
+				Ok(()) => {
+					store.db = Some(Rc::new(db));
+					store.persistence_state = PersistenceState::Persisted;
+				}
+				Err(e) => {
+					// Without the stored keys, new keys could collide with them, so
+					// writing to this database is not safe. Leave it untouched.
+					store.items.clear();
+					store.next_key = 0;
 					web_sys::console::warn_1(
-						&format!("Failed to hydrate from IndexedDB, starting fresh: {:?}", e)
-							.into(),
+						&format!(
+							"Failed to hydrate from IndexedDB ({:?}), falling back to \
+							 memory-only storage.",
+							e
+						)
+						.into(),
 					);
 				}
-			}
+			},
 			Err(e) => {
 				web_sys::console::warn_1(
 					&format!(
@@ -242,208 +250,48 @@ impl WebStore {
 		self.persistence_state == PersistenceState::Persisted
 	}
 
-	/// Opens or creates the IndexedDB database
-	async fn open_database(&self) -> Result<IdbDatabase> {
-		let window = web_sys::window().ok_or_else(|| Error::other("No window object"))?;
-
-		let idb_factory = window
-			.indexed_db()
-			.map_err(|e| Error::other(format!("IndexedDB error: {:?}", e)))?
-			.ok_or_else(|| Error::other("IndexedDB not available"))?;
-
-		// Create open request
-		let open_request = idb_factory
-			.open_with_f64(&self.config.database_name, DB_VERSION as f64)
-			.map_err(|e| Error::other(format!("Failed to open DB: {:?}", e)))?;
-
-		// Set up upgrade handler for first-time creation
-		let on_upgrade = Closure::once(move |event: web_sys::IdbVersionChangeEvent| {
-			let target = event.target().unwrap();
-			let request: IdbRequest = target.unchecked_into();
-			let db: IdbDatabase = request.result().unwrap().unchecked_into();
-
-			// Create object store if it doesn't exist
-			if !db.object_store_names().contains(STORE_NAME) {
-				let params = web_sys::IdbObjectStoreParameters::new();
-				params.set_auto_increment(true);
-				params.set_key_path(&JsValue::from_str("_idb_key"));
-
-				db.create_object_store_with_optional_parameters(STORE_NAME, &params)
-					.expect("Failed to create object store");
+	/// Loads every stored item from IndexedDB into memory, in key (append) order, and
+	/// sets the next key above every key seen.
+	///
+	/// A record without the wrapper shape is skipped with a warning; its key, if it has
+	/// one, still counts, so no new item is given it.
+	async fn hydrate(&mut self, db: &IdbDatabase) -> Result<()> {
+		for record in idb::read_all(db).await? {
+			if let Some(key) = idb::record_key(&record) {
+				self.next_key = self.next_key.max(key.saturating_add(1));
 			}
-		});
-		open_request.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
-		on_upgrade.forget(); // Prevent closure from being dropped
-
-		// Wait for success/error
-		let db = Self::await_request::<IdbDatabase>(&open_request).await?;
-
-		Ok(db)
-	}
-
-	/// Loads all existing events from IndexedDB into memory
-	async fn hydrate(&mut self) -> Result<()> {
-		let db = match &self.db {
-			Some(db) => db.clone(),
-			None => return Ok(()), // No db, nothing to hydrate
-		};
-
-		let transaction = db
-			.transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readonly)
-			.map_err(|e| Error::other(format!("Transaction error: {:?}", e)))?;
-
-		let store = transaction
-			.object_store(STORE_NAME)
-			.map_err(|e| Error::other(format!("Object store error: {:?}", e)))?;
-
-		let request = store
-			.get_all()
-			.map_err(|e| Error::other(format!("GetAll error: {:?}", e)))?;
-
-		let result = Self::await_request::<JsValue>(&request).await?;
-
-		// Parse results into our items queue
-		if let Ok(array) = result.dyn_into::<js_sys::Array>() {
-			for item in array.iter() {
-				if let Ok(obj) = js_sys::JSON::stringify(&item) {
-					if let Ok(s) = obj.as_string().ok_or(()) {
-						if let Ok(mut value) = serde_json::from_str::<Value>(&s) {
-							// Extract the idb_key and remove it from the value
-							let idb_key = value
-								.get("_idb_key")
-								.and_then(|k| k.as_u64())
-								.map(|k| k as u32);
-
-							if let Some(obj) = value.as_object_mut() {
-								obj.remove("_idb_key");
-							}
-
-							self.items.push_back(StoredEvent { idb_key, value });
-						}
-					}
-				}
+			match (idb::record_key(&record), idb::record_value(&record)) {
+				(Some(key), Some(value)) => self.items.push_back(StoredEvent {
+					key,
+					value: value.clone(),
+				}),
+				_ => web_sys::console::warn_1(
+					&"Skipping an IndexedDB record that is not a stored item".into(),
+				),
 			}
 		}
+		Ok(())
+	}
 
-		// Update temp_key_counter to be higher than any existing key
-		if let Some(max_key) = self.items.iter().filter_map(|e| e.idb_key).max() {
-			self.temp_key_counter = max_key + 1;
+	/// Fire-and-forget add of `event` to IndexedDB
+	fn persist_event(&self, event: &StoredEvent) {
+		let Some(db) = &self.db else { return };
+		idb::fire_and_forget("write", idb::add(db, event.key, &event.value));
+	}
+
+	/// Fire-and-forget delete of `keys` from IndexedDB
+	fn remove_from_idb(&self, keys: &[u32]) {
+		let Some(db) = &self.db else { return };
+		if keys.is_empty() {
+			return;
 		}
-
-		Ok(())
-	}
-
-	/// Fire-and-forget write to IndexedDB
-	fn persist_event(&self, event: StoredEvent) {
-		let Some(db) = &self.db else { return };
-		let db = db.clone();
-		let write_key = self.config.write_key.clone();
-
-		spawn_local(async move {
-			if let Err(e) = Self::write_to_idb(&db, &write_key, &event).await {
-				// Log but don't fail - we still have it in memory
-				web_sys::console::warn_1(&format!("IndexedDB write failed: {:?}", e).into());
-			}
-		});
-	}
-
-	/// Actual IndexedDB write operation
-	async fn write_to_idb(db: &IdbDatabase, _write_key: &str, event: &StoredEvent) -> Result<()> {
-		let transaction = db
-			.transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-			.map_err(|e| Error::other(format!("Transaction error: {:?}", e)))?;
-
-		let store = transaction
-			.object_store(STORE_NAME)
-			.map_err(|e| Error::other(format!("Object store error: {:?}", e)))?;
-
-		// Convert to JsValue
-		let json_str = serde_json::to_string(&event.value)
-			.map_err(|e| Error::other(format!("JSON error: {:?}", e)))?;
-
-		let js_value = js_sys::JSON::parse(&json_str)
-			.map_err(|e| Error::other(format!("JS JSON parse error: {:?}", e)))?;
-
-		let request = store
-			.add(&js_value)
-			.map_err(|e| Error::other(format!("Add error: {:?}", e)))?;
-
-		Self::await_request::<JsValue>(&request).await?;
-
-		Ok(())
-	}
-
-	/// Fire-and-forget delete from IndexedDB
-	fn remove_from_idb(&self, idb_key: u32) {
-		let Some(db) = &self.db else { return };
-		let db = db.clone();
-
-		spawn_local(async move {
-			if let Err(e) = Self::delete_from_idb(&db, idb_key).await {
-				web_sys::console::warn_1(&format!("IndexedDB delete failed: {:?}", e).into());
-			}
-		});
-	}
-
-	/// Actual IndexedDB delete operation
-	async fn delete_from_idb(db: &IdbDatabase, idb_key: u32) -> Result<()> {
-		let transaction = db
-			.transaction_with_str_and_mode(STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
-			.map_err(|e| Error::other(format!("Transaction error: {:?}", e)))?;
-
-		let store = transaction
-			.object_store(STORE_NAME)
-			.map_err(|e| Error::other(format!("Object store error: {:?}", e)))?;
-
-		let request = store
-			.delete(&JsValue::from(idb_key))
-			.map_err(|e| Error::other(format!("Delete error: {:?}", e)))?;
-
-		Self::await_request::<JsValue>(&request).await?;
-
-		Ok(())
-	}
-
-	/// Helper to await an IdbRequest and extract the result
-	async fn await_request<T: JsCast>(request: &IdbRequest) -> Result<T> {
-		let (sender, receiver) = futures_channel::oneshot::channel();
-		let sender = Rc::new(RefCell::new(Some(sender)));
-
-		let success_sender = sender.clone();
-		let onsuccess = Closure::once(move |_event: web_sys::Event| {
-			if let Some(sender) = success_sender.borrow_mut().take() {
-				let _ = sender.send(Ok(()));
-			}
-		});
-
-		let error_sender = sender.clone();
-		let onerror = Closure::once(move |_event: web_sys::Event| {
-			if let Some(sender) = error_sender.borrow_mut().take() {
-				let _ = sender.send(Err(Error::other("IndexedDB request failed")));
-			}
-		});
-
-		request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-		request.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-
-		onsuccess.forget();
-		onerror.forget();
-
-		receiver
-			.await
-			.map_err(|_| Error::other("Channel closed"))??;
-
-		request
-			.result()
-			.map_err(|e| Error::other(format!("Result error: {:?}", e)))?
-			.dyn_into::<T>()
-			.map_err(|_| Error::other("Type cast failed"))
+		idb::fire_and_forget("delete", idb::delete(db, keys));
 	}
 
 	/// Creates a JSON batch object containing the provided items and metadata.
 	///
 	/// `sent_at` is the batch's `sentAt` value, the same one its size was measured with.
-	fn create_batch(&self, items: &[StoredEvent], sent_at: &str) -> Value {
+	fn create_batch(&self, items: &[&StoredEvent], sent_at: &str) -> Value {
 		let values: Vec<&Value> = items.iter().map(|e| &e.value).collect();
 		json!({
 			"batch": values,
@@ -472,30 +320,29 @@ impl WebStore {
 	/// Drops items at the head of the queue that cannot fit in a batch by themselves
 	/// under `max_fetch_size`, deleting them from IndexedDB.
 	///
-	/// `append` rejects such items, but IndexedDB may still hold some persisted by an
-	/// older version or under a larger `max_fetch_size`; left at the head they would
-	/// block every fetch. Only the head is examined, when a fetch reaches it.
+	/// `append` rejects such items, but IndexedDB may still hold some persisted under a
+	/// larger `max_fetch_size`; left at the head they would block every fetch. Only the
+	/// head is examined, when a fetch reaches it.
 	fn drop_oversized_head(&mut self) {
 		let oversized = batch::leading_oversized(
 			self.items.iter().map(Self::get_item_size),
 			self.max_item_size,
 		);
 		let dropped: Vec<StoredEvent> = self.items.drain(..oversized).collect();
-		for event in dropped {
+		for event in &dropped {
 			web_sys::console::warn_1(
 				&format!(
 					"Dropping a stored item of {} bytes: the largest item that fits under \
 					 max_fetch_size = {} bytes is {} bytes.",
-					Self::get_item_size(&event),
+					Self::get_item_size(event),
 					self.config.max_fetch_size,
 					self.max_item_size
 				)
 				.into(),
 			);
-			if let Some(key) = event.idb_key {
-				self.remove_from_idb(key);
-			}
 		}
+		let keys: Vec<u32> = dropped.iter().map(|e| e.key).collect();
+		self.remove_from_idb(&keys);
 	}
 
 	/// `fetch` with the batch's `sentAt` supplied, so its envelope length is known.
@@ -506,7 +353,7 @@ impl WebStore {
 		sent_at: &str,
 	) -> Option<DataResult<Value>> {
 		// Unlike MemoryStore, the queue can hold items too large for max_fetch_size:
-		// IndexedDB may hydrate them from an earlier version or configuration.
+		// IndexedDB may hydrate them from an earlier configuration.
 		self.drop_oversized_head();
 
 		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
@@ -523,11 +370,11 @@ impl WebStore {
 			return None;
 		}
 
-		let items: Vec<StoredEvent> = self.items.iter().take(num_items).cloned().collect();
+		let items: Vec<&StoredEvent> = self.items.iter().take(num_items).collect();
 
 		let removable: Vec<Box<dyn Equivalent>> = items
 			.iter()
-			.map(|item| Box::new(item.clone()) as Box<dyn Equivalent>)
+			.map(|item| Box::new(WebKey(item.key)) as Box<dyn Equivalent>)
 			.collect();
 
 		Some(DataResult {
@@ -544,15 +391,11 @@ impl DataStore for WebStore {
 		!self.items.is_empty()
 	}
 
+	/// Removes every item, in memory and in IndexedDB.
 	fn reset(&mut self) {
-		// Clear memory
-		let items: Vec<StoredEvent> = self.items.drain(..).collect();
-
-		// Fire-and-forget clear from IndexedDB
-		for item in items {
-			if let Some(key) = item.idb_key {
-				self.remove_from_idb(key);
-			}
+		self.items.clear();
+		if let Some(db) = &self.db {
+			idb::fire_and_forget("clear", idb::clear(db));
 		}
 	}
 
@@ -571,27 +414,25 @@ impl DataStore for WebStore {
 				self.config.max_fetch_size,
 			));
 		}
+		let next_key = self
+			.next_key
+			.checked_add(1)
+			.ok_or_else(|| Error::other("WebStore item keys exhausted"))?;
 
 		let event = StoredEvent {
-			idb_key: Some(self.temp_key_counter),
+			key: self.next_key,
 			value: data,
 		};
-		self.temp_key_counter += 1;
-
-		// Add to memory (sync)
-		self.items.push_back(event.clone());
-
-		// Enforce max_items
-		while self.items.len() > self.config.max_items {
-			if let Some(removed) = self.items.pop_front() {
-				if let Some(key) = removed.idb_key {
-					self.remove_from_idb(key);
-				}
-			}
-		}
+		self.next_key = next_key;
 
 		// Fire-and-forget persist to IndexedDB
-		self.persist_event(event);
+		self.persist_event(&event);
+		self.items.push_back(event);
+
+		// Enforce max_items
+		let excess = self.items.len().saturating_sub(self.config.max_items);
+		let evicted: Vec<u32> = self.items.drain(..excess).map(|e| e.key).collect();
+		self.remove_from_idb(&evicted);
 
 		Ok(())
 	}
@@ -604,7 +445,7 @@ impl DataStore for WebStore {
 	/// the store has data; a fetch at the configured `max_fetch_size` always returns it.
 	///
 	/// Items at the head of the queue too large for any batch under `max_fetch_size`
-	/// (persisted before this limit applied) are dropped, deleted from IndexedDB, and
+	/// (persisted under a larger `max_fetch_size`) are dropped, deleted from IndexedDB, and
 	/// logged with `console.warn`; if that empties the queue, this returns `Ok(None)`.
 	fn fetch(
 		&mut self,
@@ -615,23 +456,27 @@ impl DataStore for WebStore {
 		Ok(self.fetch_with_sent_at(count, max_bytes, &sent_at))
 	}
 
+	/// Removes exactly the items a previous `fetch` returned, in memory and in IndexedDB.
+	///
+	/// Items already gone (removed before, or dropped since the fetch) are skipped.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
-		// First, collect keys to remove from IndexedDB
-		let keys_to_remove: Vec<u32> = self
-			.items
+		let keys: HashSet<u32> = data
 			.iter()
-			.filter(|item| data.iter().any(|removable| removable.equals(*item)))
-			.filter_map(|item| item.idb_key)
+			.filter_map(|removable| removable.as_any().downcast_ref::<WebKey>())
+			.map(|key| key.0)
 			.collect();
 
-		// Remove from memory
-		self.items
-			.retain(|item| !data.iter().any(|removable| removable.equals(item)));
+		let mut removed = Vec::new();
+		self.items.retain(|item| {
+			let fetched = keys.contains(&item.key);
+			if fetched {
+				removed.push(item.key);
+			}
+			!fetched
+		});
 
 		// Fire-and-forget delete from IndexedDB
-		for key in keys_to_remove {
-			self.remove_from_idb(key);
-		}
+		self.remove_from_idb(&removed);
 
 		Ok(())
 	}
@@ -647,6 +492,8 @@ mod tests {
 	mod ceiling;
 	mod head_drop;
 	mod oversized;
+	mod persistence;
+	mod schema;
 	mod support;
 
 	fn test_config(db_name: &str) -> WebConfig {

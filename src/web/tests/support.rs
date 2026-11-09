@@ -88,6 +88,11 @@ pub(super) async fn settle() {
 	gloo_timers::future::TimeoutFuture::new(100).await;
 }
 
+/// The values in `store`'s queue, in order.
+pub(super) fn queued(store: &WebStore) -> Vec<Value> {
+	store.items.iter().map(|e| e.value.clone()).collect()
+}
+
 /// The values a freshly opened store hydrates from `db_name`, in queue order.
 pub(super) async fn hydrated(db_name: &str, max_fetch_size: usize) -> Vec<Value> {
 	let store = WebStore::new(config(db_name, max_fetch_size, KEY)).await;

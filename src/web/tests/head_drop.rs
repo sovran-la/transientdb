@@ -20,7 +20,7 @@ fn values(store: &WebStore) -> Vec<Value> {
 fn inject(store: &mut WebStore, items: &[Value]) {
 	for (i, value) in items.iter().enumerate() {
 		store.items.push_back(StoredEvent {
-			idb_key: Some(1_000_000 + i as u32),
+			key: 1_000_000 + i as u32,
 			value: value.clone(),
 		});
 	}

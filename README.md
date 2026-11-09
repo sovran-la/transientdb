@@ -244,7 +244,12 @@ if let Some(result) = db.fetch(Some(100), None)? {
 - Browser-based storage using IndexedDB
 - Async construction, sync operations (fire-and-forget persistence)
 - Graceful fallback to memory-only if IndexedDB unavailable
-- Automatic hydration from IndexedDB on startup
+- Automatic hydration from IndexedDB on startup, in append order
+- Stores any JSON value (objects, arrays, strings, numbers, booleans, null) unmodified
+- IndexedDB writes are issued in call order, so a `remove()` or `reset()` right after an
+  `append()` is never undone by the append landing late
+- A database written by transientdb 0.2.x uses an older record format; it is emptied the
+  first time this version opens it (old records are discarded, not migrated)
 - Ideal for web applications and browser-based analytics
 - Requires the `web` feature flag
 
@@ -307,8 +312,7 @@ match db.append(event) {
 }
 ```
 
-WebStore may hold items persisted before this limit applied, or under a larger
-`max_fetch_size`. Hydration loads them as usual; when one reaches the head of the queue and
+WebStore may hold items persisted under a larger `max_fetch_size`. Hydration loads them as usual; when one reaches the head of the queue and
 cannot fit under `max_fetch_size`, `fetch` drops it, deletes it from IndexedDB, logs a
 `console.warn`, and continues with the next item.
 
