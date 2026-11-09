@@ -109,3 +109,58 @@ pub(super) fn files_on_disk(dir: &TempDir) -> Result<Vec<PathBuf>> {
 pub(super) fn assert_invalid_input(err: &io::Error) {
 	assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
 }
+
+/// Every file under `root`, recursively, with its bytes, keyed by path relative to it.
+pub(super) fn snapshot(
+	root: &std::path::Path,
+) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+	let mut files = std::collections::BTreeMap::new();
+	let mut dirs = vec![root.to_path_buf()];
+	while let Some(dir) = dirs.pop() {
+		for entry in fs::read_dir(&dir)? {
+			let path = entry?.path();
+			if path.is_dir() {
+				dirs.push(path);
+			} else {
+				let relative = path.strip_prefix(root).unwrap().to_path_buf();
+				files.insert(relative, fs::read(&path)?);
+			}
+		}
+	}
+	Ok(files)
+}
+
+/// The bytes the store writes for `items` in an open file: the opening, then the items
+/// separated by commas, without a closing.
+pub(super) fn unclosed(items: &[Value]) -> Vec<u8> {
+	let mut bytes = b"{ \"batch\": [".to_vec();
+	for (i, item) in items.iter().enumerate() {
+		if i > 0 {
+			bytes.push(b',');
+		}
+		bytes.extend(serde_json::to_vec(item).unwrap());
+	}
+	bytes
+}
+
+/// `unclosed(items)` followed by a closing, as a file finished but not yet renamed.
+pub(super) fn closed(items: &[Value]) -> Vec<u8> {
+	let mut bytes = unclosed(items);
+	bytes.extend_from_slice(
+		format!("],\"sentAt\":\"2026-11-09T12:34:56.789Z\",\"writeKey\":\"{KEY}\"}}").as_bytes(),
+	);
+	bytes
+}
+
+/// Writes `bytes` as the "events" store's unfinished file `index`, as an earlier session
+/// would have left it. Returns its path.
+pub(super) fn write_leftover(dir: &TempDir, index: u32, bytes: &[u8]) -> Result<PathBuf> {
+	let path = dir.path().join(format!("{index}-events"));
+	fs::write(&path, bytes)?;
+	Ok(path)
+}
+
+/// The path `path` is renamed to once finished.
+pub(super) fn finished(path: &std::path::Path) -> PathBuf {
+	DirectoryStore::finished_path(path)
+}

@@ -3,31 +3,12 @@
 
 use super::support::*;
 use super::*;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn named(dir: &TempDir, base_filename: &str) -> DirectoryConfig {
 	let mut config = config(dir, 1024, KEY);
 	config.base_filename = base_filename.to_string();
 	config
-}
-
-/// Every file under `root`, recursively, with its bytes, keyed by path relative to it.
-fn snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
-	let mut files = BTreeMap::new();
-	let mut dirs = vec![root.to_path_buf()];
-	while let Some(dir) = dirs.pop() {
-		for entry in fs::read_dir(&dir)? {
-			let path = entry?.path();
-			if path.is_dir() {
-				dirs.push(path);
-			} else {
-				let relative = path.strip_prefix(root).unwrap().to_path_buf();
-				files.insert(relative, fs::read(&path)?);
-			}
-		}
-	}
-	Ok(files)
 }
 
 /// Files that are not the "events" store's, including near misses of its names.

@@ -55,10 +55,10 @@ fn test_rejected_file_is_finalized_once_on_restart() -> Result<()> {
 	rejected_file(&temp_dir, 1024, &items)?;
 
 	let mut store = store(&temp_dir, 1024)?;
+	let files = finished_files(&mut store)?;
 	let path = only_file(&temp_dir)?;
 	assert!(is_finished(&path));
 	assert_eq!(closings(&path)?, 1);
-	let files = finished_files(&mut store)?;
 	assert_eq!(files.len(), 1);
 	assert_eq!(assert_ceiling(&files, 1024), items);
 	Ok(())
@@ -70,15 +70,21 @@ fn test_repeated_restarts_never_add_a_second_closing() -> Result<()> {
 	let items = tagged(0..2);
 	rejected_file(&temp_dir, 1024, &items)?;
 
+	// Sessions that never fetch leave the file as it was.
 	for _ in 0..4 {
-		let store = store(&temp_dir, 1024)?;
-		drop(store);
+		drop(store(&temp_dir, 1024)?);
+		let path = only_file(&temp_dir)?;
+		assert!(!is_finished(&path));
+		assert_eq!(closings(&path)?, 1);
+	}
+	// Sessions that fetch recover it once and never close it again.
+	for _ in 0..4 {
+		let mut store = store(&temp_dir, 1024)?;
+		assert_eq!(assert_ceiling(&finished_files(&mut store)?, 1024), items);
 		let path = only_file(&temp_dir)?;
 		assert!(is_finished(&path));
 		assert_eq!(closings(&path)?, 1);
 	}
-	let mut store = store(&temp_dir, 1024)?;
-	assert_eq!(assert_ceiling(&finished_files(&mut store)?, 1024), items);
 	Ok(())
 }
 
@@ -88,38 +94,44 @@ fn test_recovery_with_rejecting_validator_never_adds_a_second_closing() -> Resul
 	let items = tagged(0..2);
 	let path = rejected_file(&temp_dir, 1024, &items)?;
 
-	// `new` recovers before a validator can be set, so run recovery directly with one,
-	// as a startup that validates would.
-	let mut store = store(&temp_dir, 1024)?;
-	// `new` already recovered the file; put it back to its rejected state.
-	fs::rename(only_file(&temp_dir)?, &path)?;
 	let validated = Arc::new(AtomicUsize::new(0));
 	let accept = Arc::new(AtomicBool::new(false));
-	let (count, flag) = (validated.clone(), accept.clone());
-	store.set_file_validator(move |path| {
-		count.fetch_add(1, Ordering::SeqCst);
-		serde_json::from_str::<Value>(&fs::read_to_string(path)?)?;
-		if flag.load(Ordering::SeqCst) {
-			Ok(())
-		} else {
-			Err(io::Error::other("rejected"))
-		}
-	});
+	let session = |validated: &Arc<AtomicUsize>, accept: &Arc<AtomicBool>| {
+		let mut store = store(&temp_dir, 1024)?;
+		let (count, flag) = (validated.clone(), accept.clone());
+		// Set after `new`, as a caller would; recovery waits for the first fetch.
+		store.set_file_validator(move |path| {
+			count.fetch_add(1, Ordering::SeqCst);
+			serde_json::from_str::<Value>(&fs::read_to_string(path)?)?;
+			if flag.load(Ordering::SeqCst) {
+				Ok(())
+			} else {
+				Err(io::Error::other("rejected"))
+			}
+		});
+		Ok::<_, io::Error>(store)
+	};
 
 	for attempt in 1..=3 {
-		store.initialize_directory()?;
+		let mut store = session(&validated, &accept)?;
+		assert_eq!(validated.load(Ordering::SeqCst), attempt - 1);
+		assert!(store.fetch(None, None)?.is_none());
 		assert_eq!(validated.load(Ordering::SeqCst), attempt);
 		assert!(!is_finished(&only_file(&temp_dir)?));
 		assert_eq!(closings(&path)?, 1);
+		// Not retried again in the same session.
+		assert!(store.fetch(None, None)?.is_none());
+		assert_eq!(validated.load(Ordering::SeqCst), attempt);
 	}
 
 	accept.store(true, Ordering::SeqCst);
-	store.initialize_directory()?;
+	let mut store = session(&validated, &accept)?;
+	let files = finished_files(&mut store)?;
 	assert_eq!(validated.load(Ordering::SeqCst), 4);
 	let finished = only_file(&temp_dir)?;
 	assert!(is_finished(&finished));
 	assert_eq!(closings(&finished)?, 1);
-	assert_eq!(assert_ceiling(&finished_files(&mut store)?, 1024), items);
+	assert_eq!(assert_ceiling(&files, 1024), items);
 	Ok(())
 }
 
@@ -140,10 +152,11 @@ fn test_unfinished_file_still_gets_its_closing() -> Result<()> {
 	assert!(fs::read_to_string(&path)?.ends_with('}'));
 
 	let mut store = store(&temp_dir, 1024)?;
+	let files = finished_files(&mut store)?;
 	let finished = only_file(&temp_dir)?;
 	assert!(is_finished(&finished));
 	assert_eq!(closings(&finished)?, 1);
-	assert_eq!(assert_ceiling(&finished_files(&mut store)?, 1024), items);
+	assert_eq!(assert_ceiling(&files, 1024), items);
 	Ok(())
 }
 
