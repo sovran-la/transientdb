@@ -106,19 +106,19 @@ jobs:
           - target: aarch64-apple-ios-sim
             sdk: iphonesimulator
             platform: iOS
-            runtime: com.apple.CoreSimulator.SimRuntime.iOS-26-0
+            runtime_prefix: com.apple.CoreSimulator.SimRuntime.iOS-
             device: iPhone 17
             use_simulator: true
           - target: aarch64-apple-tvos-sim
             sdk: appletvsimulator
             platform: tvOS
-            runtime: com.apple.CoreSimulator.SimRuntime.tvOS-26-0
+            runtime_prefix: com.apple.CoreSimulator.SimRuntime.tvOS-
             device: Apple TV
             use_simulator: true
           - target: aarch64-apple-visionos-sim
             sdk: xrsimulator
             platform: visionOS
-            runtime: com.apple.CoreSimulator.SimRuntime.xrOS-26-0
+            runtime_prefix: com.apple.CoreSimulator.SimRuntime.xrOS-
             device: Apple Vision Pro
             use_simulator: true
           - target: aarch64-apple-ios-macabi
@@ -128,7 +128,7 @@ jobs:
           - target: aarch64-apple-watchos-sim
             sdk: watchsimulator
             platform: watchOS
-            runtime: com.apple.CoreSimulator.SimRuntime.watchOS-26-0
+            runtime_prefix: com.apple.CoreSimulator.SimRuntime.watchOS-
             device: Apple Watch Ultra 3 (49mm)
             use_simulator: true
     steps:
@@ -176,9 +176,23 @@ jobs:
           ls -l "${TEST_BINARY}"
           
           if [[ "${{ matrix.use_simulator }}" == "true" ]]; then
+            # Use the newest runtime the selected Xcode ships for this platform.
+            # A pinned point release (26-0) disappears when the runner image moves to the next one.
+            echo "=== Resolving simulator runtime ==="
+            RUNTIME=$(xcrun simctl list runtimes -j | jq -r --arg prefix "${{ matrix.runtime_prefix }}" '
+              [.runtimes[] | select(.isAvailable and (.identifier | startswith($prefix)))]
+              | sort_by(.version | split(".") | map(tonumber))
+              | last | .identifier // empty')
+            if [[ -z "${RUNTIME}" ]]; then
+              echo "No available simulator runtime matches ${{ matrix.runtime_prefix }}*. Installed runtimes:"
+              xcrun simctl list runtimes
+              exit 1
+            fi
+            echo "Runtime: ${RUNTIME}"
+
             # Create and boot simulator
             echo "=== Creating simulator ==="
-            DEVICE_ID=$(xcrun simctl create test-device "${{ matrix.device }}" "${{ matrix.runtime }}")
+            DEVICE_ID=$(xcrun simctl create test-device "${{ matrix.device }}" "${RUNTIME}")
             echo "Device ID: ${DEVICE_ID}"
           
             echo "=== Booting simulator ==="
