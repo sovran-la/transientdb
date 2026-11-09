@@ -305,6 +305,7 @@ mod tests {
 	mod oversized;
 	mod repeat;
 	mod support;
+	mod write_key;
 
 	#[test]
 	fn test_basic_operations() -> Result<()> {

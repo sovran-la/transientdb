@@ -7,6 +7,18 @@
 use serde_json::json;
 use std::io;
 
+/// Write keys that need escaping in JSON, or are multi-byte in UTF-8, for tests of every
+/// store's envelope.
+#[cfg(test)]
+pub(crate) const AWKWARD_WRITE_KEYS: [&str; 6] = [
+	"quote\"inside",
+	"back\\slash",
+	"new\nline",
+	"tab\there",
+	"ключ-🦀-鍵",
+	"control\u{1}char",
+];
+
 /// Bytes between two items in a serialized `batch` array.
 pub(crate) const SEPARATOR_LEN: usize = 1;
 
