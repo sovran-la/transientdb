@@ -107,19 +107,19 @@ jobs:
             sdk: iphonesimulator
             platform: iOS
             runtime_prefix: com.apple.CoreSimulator.SimRuntime.iOS-
-            device: iPhone 17
+            device_family: iPhone
             use_simulator: true
           - target: aarch64-apple-tvos-sim
             sdk: appletvsimulator
             platform: tvOS
             runtime_prefix: com.apple.CoreSimulator.SimRuntime.tvOS-
-            device: Apple TV
+            device_family: Apple TV
             use_simulator: true
           - target: aarch64-apple-visionos-sim
             sdk: xrsimulator
             platform: visionOS
             runtime_prefix: com.apple.CoreSimulator.SimRuntime.xrOS-
-            device: Apple Vision Pro
+            device_family: Apple Vision
             use_simulator: true
           - target: aarch64-apple-ios-macabi
             sdk: macosxsim
@@ -129,7 +129,7 @@ jobs:
             sdk: watchsimulator
             platform: watchOS
             runtime_prefix: com.apple.CoreSimulator.SimRuntime.watchOS-
-            device: Apple Watch Ultra 3 (49mm)
+            device_family: Apple Watch
             use_simulator: true
     steps:
       - uses: actions/checkout@v4
@@ -190,9 +190,23 @@ jobs:
             fi
             echo "Runtime: ${RUNTIME}"
 
+            # Use the first device type that runtime supports in the wanted family
+            # (simctl lists the newest first), so a renamed or retired model can't break the job.
+            echo "=== Resolving simulator device type ==="
+            DEVICE_TYPE=$(xcrun simctl list runtimes -j | jq -r --arg runtime "${RUNTIME}" --arg family "${{ matrix.device_family }}" '
+              [.runtimes[] | select(.identifier == $runtime) | .supportedDeviceTypes[]
+                | select(.productFamily == $family)]
+              | first | .identifier // empty')
+            if [[ -z "${DEVICE_TYPE}" ]]; then
+              echo "${RUNTIME} supports no '${{ matrix.device_family }}' device type. Available device types:"
+              xcrun simctl list devicetypes
+              exit 1
+            fi
+            echo "Device type: ${DEVICE_TYPE}"
+
             # Create and boot simulator
             echo "=== Creating simulator ==="
-            DEVICE_ID=$(xcrun simctl create test-device "${{ matrix.device }}" "${RUNTIME}")
+            DEVICE_ID=$(xcrun simctl create test-device "${DEVICE_TYPE}" "${RUNTIME}")
             echo "Device ID: ${DEVICE_ID}"
           
             echo "=== Booting simulator ==="
