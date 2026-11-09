@@ -129,7 +129,7 @@ async fn test_transientdb_fetch_with_byte_limit() {
 		let batch: Value = result.data.unwrap();
 		let items = batch["batch"].as_array().unwrap();
 		assert!(items.len() < 20, "Byte limit should restrict item count");
-		assert!(items.len() > 0, "Should get at least one item");
+		assert!(!items.is_empty(), "Should get at least one item");
 	} else {
 		panic!("Expected data");
 	}
@@ -251,7 +251,7 @@ async fn test_transientdb_json_types() {
 	db.append(json!(true)).unwrap();
 	db.append(json!(false)).unwrap();
 	db.append(json!(42)).unwrap();
-	db.append(json!(3.14159)).unwrap();
+	db.append(json!(42.5)).unwrap();
 	db.append(json!("string")).unwrap();
 	db.append(json!(["array", "of", "values"])).unwrap();
 	db.append(json!({"object": "value"})).unwrap();
@@ -541,7 +541,7 @@ async fn test_transientdb_numeric_edge_cases() {
 	db.append(json!({
 		"zero": 0,
 		"negative": -42,
-		"float": 3.14159265358979,
+		"float": 1.23456789012345,
 		"large": 9007199254740991_i64,  // Max safe JS integer
 		"small_float": 0.0000001
 	}))
