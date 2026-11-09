@@ -89,9 +89,10 @@ pub struct MemoryConfig {
 
 /// A FIFO data store that keeps items in memory.
 ///
-/// Items are stored until fetched or until max_items is reached, at which point
-/// older items are removed to make space for new ones. The store maintains data in a
-/// queue structure and supports concurrent access.
+/// Items are stored until a fetched batch is passed to `remove`, or until max_items is
+/// reached, at which point older items are removed to make space for new ones. `fetch`
+/// itself removes nothing. The store maintains data in a queue structure and supports
+/// concurrent access.
 ///
 /// When items are fetched, they are packaged into a JSON batch with metadata including:
 /// - A batch array containing the items
