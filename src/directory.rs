@@ -700,7 +700,7 @@ mod tests {
 		store.set_file_validator(|path| {
 			let metadata = fs::metadata(path)?;
 			if metadata.len() < 10 {
-				return Err(io::Error::new(io::ErrorKind::Other, "File too small"));
+				return Err(io::Error::other("File too small"));
 			}
 			Ok(())
 		});

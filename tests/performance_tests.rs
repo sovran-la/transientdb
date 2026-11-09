@@ -1,8 +1,6 @@
 //! Performance benchmarks - native only (uses filesystem APIs)
 #![cfg(not(target_arch = "wasm32"))]
 
-use transientdb;
-
 use serde_json::json;
 use std::io::Result;
 use std::time::{Duration, Instant};

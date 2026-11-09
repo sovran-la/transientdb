@@ -1,8 +1,6 @@
 //! Stress tests - native only (uses filesystem APIs and threads)
 #![cfg(not(target_arch = "wasm32"))]
 
-use transientdb;
-
 use rand::Rng;
 use serde_json::json;
 use std::fs;
