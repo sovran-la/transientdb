@@ -1,6 +1,6 @@
 //! A leftover that is not a complete envelope is salvaged: cut back to its last complete
 //! item and closed, so every delivered file is valid JSON holding only whole original
-//! items. A file that does not start like a data file is left untouched.
+//! items. One of the store's files that does not start like a data file is deleted.
 
 use super::support::*;
 use super::*;
@@ -182,7 +182,7 @@ fn test_no_complete_item_deletes_the_file() -> Result<()> {
 }
 
 #[test]
-fn test_unrecognized_opening_is_left_untouched() -> Result<()> {
+fn test_unreadable_opening_is_deleted() -> Result<()> {
 	let cases: Vec<Vec<u8>> = vec![
 		Vec::new(),
 		b"{".to_vec(),
@@ -199,18 +199,22 @@ fn test_unrecognized_opening_is_left_untouched() -> Result<()> {
 	for bytes in cases {
 		let temp_dir = TempDir::new()?;
 		let path = write_leftover(&temp_dir, 1, &bytes)?;
-		for _ in 0..2 {
+		let case = String::from_utf8_lossy(&bytes).into_owned();
+		for session in 0..2 {
 			let mut store = store(&temp_dir, 1024)?;
+			assert_eq!(store.has_data(), session == 0, "{case:?}");
 			let validated = Arc::new(Mutex::new(0));
 			let count = validated.clone();
 			store.set_file_validator(move |_| {
 				*count.lock().unwrap() += 1;
 				Ok(())
 			});
-			assert!(store.fetch(None, None)?.is_none());
-			assert_eq!(*validated.lock().unwrap(), 0);
-			assert_eq!(fs::read(&path)?, bytes);
-			assert_eq!(files_on_disk(&temp_dir)?, vec![path.clone()]);
+			assert!(store.fetch(None, None)?.is_none(), "{case:?}");
+			// Deleted without reaching the validator, and never renamed.
+			assert_eq!(*validated.lock().unwrap(), 0, "{case:?}");
+			assert!(!path.exists() && !finished(&path).exists(), "{case:?}");
+			assert!(files_on_disk(&temp_dir)?.is_empty(), "{case:?}");
+			assert!(!store.has_data(), "{case:?}");
 		}
 	}
 	Ok(())
@@ -279,7 +283,12 @@ fn test_salvage_rule_directly() {
 	let max = usize::MAX;
 	assert_eq!(
 		salvage(OPENING_BYTES, b"{ \"batch", max),
-		Salvage::Unrecognized
+		Salvage::Unreadable
+	);
+	assert_eq!(salvage(OPENING_BYTES, b"", max), Salvage::Unreadable);
+	assert_eq!(
+		salvage(OPENING_BYTES, b"{\"batch\":[1,", max),
+		Salvage::Unreadable
 	);
 	assert_eq!(
 		salvage(OPENING_BYTES, b"{ \"batch\": [", max),

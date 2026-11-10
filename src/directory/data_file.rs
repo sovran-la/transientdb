@@ -2,7 +2,8 @@
 //!
 //! A thin wrapper around [`File`] that can roll the file back to a known length. Under
 //! `cfg(test)` it also carries [`Faults`], shared with the store, so tests can make a
-//! write fail after a given number of bytes, a flush fail, or a rollback fail.
+//! write fail after a given number of bytes, a flush fail, or a rollback fail. Recovery
+//! reads the same `Faults` to make deleting a leftover fail.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
@@ -20,6 +21,8 @@ pub(super) struct Faults {
 	pub(super) fail_flush: bool,
 	/// Whether rolling the file back fails.
 	pub(super) fail_truncate: bool,
+	/// Whether recovery fails to delete a leftover it found nothing deliverable in.
+	pub(super) fail_remove: bool,
 }
 
 #[cfg(test)]
