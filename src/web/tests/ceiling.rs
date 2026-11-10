@@ -60,17 +60,22 @@ async fn test_envelope_is_counted() {
 
 #[wasm_bindgen_test]
 async fn test_envelope_length_matches_real_timestamps() {
-	let now = WebStore::sent_at(&js_sys::Date::new_0());
-	assert_eq!(batch::envelope_len(&now, KEY), envelope(KEY));
+	let store = fresh_store("test-ceiling-real-timestamps", 4096).await;
+	for _ in 0..3 {
+		let batch = store.config.envelope.batch(Vec::new(), chrono::Utc::now());
+		let len = serde_json::to_string(&batch).unwrap().len();
+		assert_eq!(len, envelope(KEY));
+		assert_eq!(len, store.envelope_len);
+	}
 }
 
 #[wasm_bindgen_test]
-async fn test_longer_write_key_fits_fewer_items() {
-	let long_key = "k".repeat(60);
+async fn test_longer_field_value_fits_fewer_items() {
+	let long_source = "k".repeat(60);
 	let mut sizes = Vec::new();
-	for (i, key) in [KEY, long_key.as_str()].into_iter().enumerate() {
-		let db_name = format!("test-ceiling-write-key-{i}");
-		let mut store = fresh_store_with(config(&db_name, 400, key)).await;
+	for (i, source) in [KEY, long_source.as_str()].into_iter().enumerate() {
+		let db_name = format!("test-ceiling-long-field-{i}");
+		let mut store = fresh_store_with(config(&db_name, 400, with_source(source))).await;
 		let appended: Vec<Value> = (0..30).map(|tag| item_of_len(40, tag)).collect();
 		for item in &appended {
 			store.append(item.clone()).unwrap();
@@ -116,7 +121,7 @@ async fn test_per_call_max_bytes_is_the_ceiling() {
 
 #[wasm_bindgen_test]
 async fn test_count_item_limit_and_bytes_each_win() {
-	let mut config = config("test-ceiling-limits", 1000, KEY);
+	let mut config = config("test-ceiling-limits", 1000, with_source(KEY));
 	config.max_fetch_items = Some(6);
 	let mut store = fresh_store_with(config).await;
 	for tag in 0..100 {
@@ -143,7 +148,7 @@ async fn test_count_item_limit_and_bytes_each_win() {
 
 #[wasm_bindgen_test]
 async fn test_max_items_drop_oldest_with_ceiling() {
-	let mut config = config("test-ceiling-max-items", 200, KEY);
+	let mut config = config("test-ceiling-max-items", 200, with_source(KEY));
 	config.max_items = Some(10);
 	let mut store = fresh_store_with(config).await;
 	let appended: Vec<Value> = (0..15).map(|tag| item_of_len(30, tag)).collect();

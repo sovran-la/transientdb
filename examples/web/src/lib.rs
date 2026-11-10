@@ -4,7 +4,7 @@
 //! It shows basic operations: append, fetch, remove, and persistence state checking.
 
 use serde_json::json;
-use transientdb::{PersistenceState, TransientDB, WebConfig, WebStore};
+use transientdb::{Envelope, PersistenceState, TransientDB, WebConfig, WebStore};
 use wasm_bindgen::prelude::*;
 
 /// Log a message to the browser console and the page
@@ -65,8 +65,11 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     log("📦 Creating WebStore...");
 
+    // Each batch is {"events":[...],"source":"demo-app","sentAt":"<fetch time>"}
     let config = WebConfig {
-        write_key: "demo-app".to_string(),
+        envelope: Envelope::new("events")
+            .field("source", "demo-app")
+            .timestamp("sentAt"),
         database_name: "transientdb-demo".to_string(),
         max_items: Some(100),
         max_fetch_size: 1024 * 1024,
@@ -140,10 +143,10 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(result) = db.fetch(Some(2), None)? {
         if let Some(batch) = &result.data {
-            log(&format!("   writeKey: {}", batch["writeKey"]));
+            log(&format!("   source: {}", batch["source"]));
             log(&format!("   sentAt: {}", batch["sentAt"]));
 
-            if let Some(items) = batch["batch"].as_array() {
+            if let Some(items) = batch["events"].as_array() {
                 log(&format!("   items: {}", items.len()));
                 for item in items {
                     log(&format!("     - {}", item["event"].as_str().unwrap_or("?")));
@@ -166,7 +169,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(result) = db.fetch(None, None)? {
         if let Some(batch) = &result.data {
-            if let Some(items) = batch["batch"].as_array() {
+            if let Some(items) = batch["events"].as_array() {
                 log(&format!("   Remaining items: {}", items.len()));
                 for item in items {
                     log(&format!("     - {}", item["event"].as_str().unwrap_or("?")));

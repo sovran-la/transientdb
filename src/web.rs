@@ -25,21 +25,22 @@
 
 mod idb;
 
-use crate::{batch, DataResult, DataStore, Equivalent};
-use serde_json::{json, Value};
+use crate::{batch, DataResult, DataStore, Envelope, Equivalent};
+use chrono::Utc;
+use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
 use std::io::{Error, Result};
 use std::rc::Rc;
-use wasm_bindgen::prelude::*;
 use web_sys::IdbDatabase;
 
 /// Configuration for the web-based data store.
 #[derive(Clone)]
 pub struct WebConfig {
-	/// Key used to identify writes to this store.
-	/// Included in batch metadata.
-	pub write_key: String,
+	/// The JSON object each fetched batch wraps its items in; see [`Envelope`]. IndexedDB
+	/// holds bare items, so a store fetches whatever was persisted under the envelope it is
+	/// configured with now.
+	pub envelope: Envelope,
 	/// Name of the IndexedDB database.
 	/// Different stores should use different database names to avoid collisions.
 	pub database_name: String,
@@ -61,13 +62,13 @@ pub struct WebConfig {
 	/// its own `max_bytes`.
 	///
 	/// This is a hard ceiling on the whole batch serialized compactly with
-	/// `serde_json::to_string`: envelope (`sentAt`, `writeKey`), every item, and every
-	/// separator count. An item too large to fit in a batch by itself under this limit is
-	/// rejected by `append` with `ErrorKind::InvalidInput`. Such an item persisted earlier
-	/// (under a larger limit) is dropped by `fetch` when it reaches the head of the queue.
+	/// `serde_json::to_string`: the envelope, every item, and every separator count. An
+	/// item too large to fit in a batch by itself under this limit is rejected by `append`
+	/// with `ErrorKind::InvalidInput`. Such an item persisted earlier (under a larger limit)
+	/// is dropped by `fetch` when it reaches the head of the queue.
 	///
 	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once the
-	/// envelope is counted (the envelope grows with `write_key`'s length).
+	/// envelope is counted.
 	pub max_fetch_size: usize,
 	/// Maximum number of items returned by a single fetch (the size of one batch).
 	/// When `fetch` is also given a `count`, the smaller of the two applies.
@@ -124,6 +125,10 @@ pub enum PersistenceState {
 /// across page refreshes. Any JSON value can be stored; it is persisted and
 /// restored unmodified.
 ///
+/// When items are fetched, they are packaged into one JSON object shaped by
+/// [`WebConfig::envelope`]: the items in an array under its items key, its fields, and its
+/// timestamp if it has one. The batch is a `Value`, whose key order is not meaningful.
+///
 /// Items are stored until a fetched batch is passed to `remove`. If `max_items` sets a
 /// cap, appending past it also drops the oldest items, in memory and in IndexedDB; with
 /// no cap, nothing is dropped for capacity.
@@ -159,6 +164,8 @@ pub struct WebStore {
 	next_key: u32,
 	/// Current persistence state
 	persistence_state: PersistenceState,
+	/// Length of the configured envelope with no items, the same for every batch
+	envelope_len: usize,
 	/// The largest serialized item that fits alone in a batch under `max_fetch_size`
 	max_item_size: usize,
 }
@@ -179,7 +186,9 @@ impl WebStore {
 	/// * If max_items is `Some(0)`
 	/// * If max_fetch_items is `Some(0)`
 	/// * If max_fetch_size leaves no room for even a 1-byte item once the batch
-	///   envelope (which grows with `write_key`) is counted
+	///   envelope is counted
+	/// * If the envelope has an empty key, uses a key twice, or does not read back as
+	///   JSON (see [`Envelope`])
 	pub async fn new(config: WebConfig) -> Self {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
@@ -190,12 +199,14 @@ impl WebStore {
 		if config.max_fetch_items == Some(0) {
 			panic!("max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold.");
 		}
-		let envelope_len = Self::widest_envelope_len(&config.write_key);
+		config.envelope.validate();
+		let envelope_len = config.envelope.byte_len();
 		if envelope_len + 1 > config.max_fetch_size {
 			panic!("max_fetch_size is all envelope and no room for an item? That's packaging, not a batch.");
 		}
 
 		let mut store = Self {
+			envelope_len,
 			max_item_size: config.max_fetch_size - envelope_len,
 			config,
 			id: crate::next_store_id(),
@@ -309,31 +320,6 @@ impl WebStore {
 		idb::fire_and_forget("delete", idb::delete(db, keys));
 	}
 
-	/// Creates a JSON batch object containing the provided items and metadata.
-	///
-	/// `sent_at` is the batch's `sentAt` value, the same one its size was measured with.
-	fn create_batch(&self, items: &[&StoredEvent], sent_at: &str) -> Value {
-		let values: Vec<&Value> = items.iter().map(|e| &e.value).collect();
-		json!({
-			"batch": values,
-			"sentAt": sent_at,
-			"writeKey": self.config.write_key
-		})
-	}
-
-	/// The `sentAt` value for a batch created at `date`, in RFC3339 format
-	fn sent_at(date: &js_sys::Date) -> String {
-		date.to_iso_string().into()
-	}
-
-	/// The envelope length with the widest `sentAt` this store can produce.
-	///
-	/// ISO strings are fixed-width for years 0 to 9999, so any such date measures it.
-	fn widest_envelope_len(write_key: &str) -> usize {
-		let epoch = js_sys::Date::new(&JsValue::from_f64(0.0));
-		batch::envelope_len(&Self::sent_at(&epoch), write_key)
-	}
-
 	fn get_item_size(item: &StoredEvent) -> usize {
 		item.value.to_string().len()
 	}
@@ -366,12 +352,11 @@ impl WebStore {
 		self.remove_from_idb(&keys);
 	}
 
-	/// `fetch` with the batch's `sentAt` supplied, so its envelope length is known.
-	fn fetch_with_sent_at(
+	/// The oldest items that fit as one batch, wrapped in the configured envelope.
+	fn fetch_batch(
 		&mut self,
 		count: Option<usize>,
 		max_bytes: Option<usize>,
-		sent_at: &str,
 	) -> Option<DataResult<Value>> {
 		// Unlike MemoryStore, the queue can hold items too large for max_fetch_size:
 		// IndexedDB may hydrate them from an earlier configuration.
@@ -379,10 +364,9 @@ impl WebStore {
 
 		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
 		let count = batch::effective_count(count, self.config.max_fetch_items);
-		let envelope_len = batch::envelope_len(sent_at, &self.config.write_key);
 		let num_items = batch::leading_items_that_fit(
 			self.items.iter().map(Self::get_item_size),
-			envelope_len,
+			self.envelope_len,
 			max_bytes,
 			count,
 		);
@@ -403,8 +387,9 @@ impl WebStore {
 			})
 			.collect();
 
+		let values: Vec<Value> = items.iter().map(|e| e.value.clone()).collect();
 		Some(DataResult {
-			data: Some(self.create_batch(&items, sent_at)),
+			data: Some(self.config.envelope.batch(values, Utc::now())),
 			removable: Some(removable),
 		})
 	}
@@ -485,8 +470,7 @@ impl DataStore for WebStore {
 		count: Option<usize>,
 		max_bytes: Option<usize>,
 	) -> Result<Option<DataResult<Self::Output>>> {
-		let sent_at = Self::sent_at(&js_sys::Date::new_0());
-		Ok(self.fetch_with_sent_at(count, max_bytes, &sent_at))
+		Ok(self.fetch_batch(count, max_bytes))
 	}
 
 	/// Removes exactly the items a previous `fetch` returned, in memory and in IndexedDB.
@@ -524,14 +508,18 @@ impl DataStore for WebStore {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
 	use super::*;
+	use serde_json::json;
+	use wasm_bindgen::prelude::*;
 	use wasm_bindgen_test::*;
 
 	wasm_bindgen_test_configure!(run_in_browser);
 
+	mod awkward_envelope;
 	mod capacity;
 	mod ceiling;
 	mod depth;
 	mod duplicates;
+	mod envelope;
 	mod foreign_removables;
 	mod head_drop;
 	mod isolation;
@@ -541,11 +529,10 @@ mod tests {
 	mod schema;
 	mod support;
 	mod write_failure;
-	mod write_key;
 
 	fn test_config(db_name: &str) -> WebConfig {
 		WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: db_name.to_string(),
 			max_items: Some(1000),
 			max_fetch_size: 1024,
@@ -568,7 +555,7 @@ mod tests {
 		// Test fetch - data should still be there after fetch
 		if let Some(result) = store.fetch(None, None).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 1);
 			assert_eq!(items[0]["value"], 123);
 
@@ -591,7 +578,7 @@ mod tests {
 	#[wasm_bindgen_test]
 	async fn test_fifo_behavior() {
 		let config = WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-fifo".to_string(),
 			max_items: Some(3), // Small limit to test FIFO
 			max_fetch_size: 1024,
@@ -611,7 +598,7 @@ mod tests {
 		// Verify they're the right items (2,3,4)
 		if let Some(result) = store.fetch(None, None).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 3);
 			assert_eq!(items[0]["index"], 2);
 			assert_eq!(items[1]["index"], 3);
@@ -631,7 +618,7 @@ mod tests {
 		// Test count limit
 		if let Some(result) = store.fetch(Some(3), None).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 3, "Count limit not respected");
 		}
 	}
@@ -639,7 +626,7 @@ mod tests {
 	#[wasm_bindgen_test]
 	async fn test_fetch_byte_limit() {
 		let config = WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-fetch-bytes".to_string(),
 			max_items: Some(100),
 			max_fetch_size: 1000,
@@ -662,7 +649,7 @@ mod tests {
 		// Test byte limit (200 bytes should get us about 2-3 items)
 		if let Some(result) = store.fetch(None, Some(200)).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert!(items.len() <= 3, "Too many items for byte limit");
 		}
 	}
@@ -697,7 +684,7 @@ mod tests {
 
 		if let Some(result) = store.fetch(None, None).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(
 				items.len(),
 				7,
@@ -708,7 +695,11 @@ mod tests {
 
 	#[wasm_bindgen_test]
 	async fn test_batch_metadata() {
-		let mut store = WebStore::new(test_config("test-batch-metadata")).await;
+		let mut store = WebStore::new(WebConfig {
+			envelope: support::with_source("test-key"),
+			..test_config("test-batch-metadata")
+		})
+		.await;
 
 		store.append(json!({"event": "test"})).unwrap();
 
@@ -716,12 +707,12 @@ mod tests {
 			let batch: Value = result.data.unwrap();
 
 			// Verify batch structure
-			assert!(batch.get("batch").is_some(), "Missing 'batch' field");
+			assert!(batch.get("items").is_some(), "Missing 'items' field");
 			assert!(batch.get("sentAt").is_some(), "Missing 'sentAt' field");
 			assert_eq!(
-				batch.get("writeKey").and_then(Value::as_str),
+				batch.get("source").and_then(Value::as_str),
 				Some("test-key"),
-				"Wrong writeKey"
+				"Wrong source"
 			);
 		}
 	}
@@ -749,7 +740,7 @@ mod tests {
 		// First instance - add some data
 		{
 			let mut store = WebStore::new(WebConfig {
-				write_key: "test-key".to_string(),
+				envelope: Envelope::default(),
 				database_name: db_name.to_string(),
 				max_items: Some(1000),
 				max_fetch_size: 1024,
@@ -775,7 +766,7 @@ mod tests {
 		// Second instance - should hydrate the data
 		{
 			let mut store = WebStore::new(WebConfig {
-				write_key: "test-key".to_string(),
+				envelope: Envelope::default(),
 				database_name: db_name.to_string(),
 				max_items: Some(1000),
 				max_fetch_size: 1024,
@@ -787,7 +778,7 @@ mod tests {
 
 			if let Some(result) = store.fetch(None, None).unwrap() {
 				let batch: Value = result.data.unwrap();
-				let items = batch["batch"].as_array().unwrap();
+				let items = batch["items"].as_array().unwrap();
 				assert_eq!(items.len(), 1);
 				assert_eq!(items[0]["event"], "persisted_event");
 				assert_eq!(items[0]["value"], 42);
@@ -804,7 +795,7 @@ mod tests {
 	async fn test_multiple_stores_isolated() {
 		// Create two stores with different database names
 		let mut store_a = WebStore::new(WebConfig {
-			write_key: "key-a".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-isolated-a".to_string(),
 			max_items: Some(1000),
 			max_fetch_size: 1024,
@@ -813,7 +804,7 @@ mod tests {
 		.await;
 
 		let mut store_b = WebStore::new(WebConfig {
-			write_key: "key-b".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-isolated-b".to_string(),
 			max_items: Some(1000),
 			max_fetch_size: 1024,
@@ -828,14 +819,14 @@ mod tests {
 		// Verify isolation
 		if let Some(result) = store_a.fetch(None, None).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 1);
 			assert_eq!(items[0]["store"], "a");
 		}
 
 		if let Some(result) = store_b.fetch(None, None).unwrap() {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 1);
 			assert_eq!(items[0]["store"], "b");
 		}
@@ -845,7 +836,7 @@ mod tests {
 	#[should_panic(expected = "max_fetch_size < 100 bytes?")]
 	async fn test_rejects_tiny_max_fetch_size() {
 		let config = WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-panic".to_string(),
 			max_items: Some(1000),
 			max_fetch_size: 50,
@@ -859,7 +850,7 @@ mod tests {
 	#[should_panic(expected = "max_items = 0?")]
 	async fn test_rejects_zero_max_items() {
 		let config = WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-panic".to_string(),
 			max_items: Some(0),
 			max_fetch_size: 1024,
@@ -871,7 +862,7 @@ mod tests {
 
 	async fn item_limit_store(db_name: &str, max_fetch_items: Option<usize>) -> WebStore {
 		let mut store = WebStore::new(WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: db_name.to_string(),
 			max_items: Some(1000),
 			max_fetch_size: 1024 * 1024,
@@ -899,7 +890,7 @@ mod tests {
 			return Vec::new();
 		};
 		let batch = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), result.removable.unwrap().len());
 		items.iter().map(|v| v["index"].as_i64().unwrap()).collect()
 	}
@@ -948,7 +939,7 @@ mod tests {
 
 		// Room for exactly 3 items and their 2 separators by bytes, envelope included,
 		// fewer than the item limit.
-		let envelope = WebStore::widest_envelope_len("test-key");
+		let envelope = crate::envelope::samples::expected_len(&Envelope::default());
 		let indexes = fetch_indexes(&mut store, None, Some(envelope + item_size * 3 + 2));
 		assert_eq!(indexes, vec![0, 1, 2]);
 
@@ -966,7 +957,7 @@ mod tests {
 		let mut seen = Vec::new();
 		while let Some(result) = store.fetch(None, None).unwrap() {
 			let batch = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap().clone();
+			let items = batch["items"].as_array().unwrap().clone();
 			let removable = result.removable.unwrap();
 			assert_eq!(items.len(), removable.len());
 			sizes.push(items.len());
@@ -1001,7 +992,7 @@ mod tests {
 	#[wasm_bindgen_test]
 	async fn test_fetch_item_limit_with_max_items_drop_oldest() {
 		let mut store = WebStore::new(WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: "test-item-limit-max-items".to_string(),
 			max_items: Some(10),
 			max_fetch_size: 1024 * 1024,

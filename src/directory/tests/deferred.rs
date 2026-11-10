@@ -79,7 +79,7 @@ fn test_validator_set_after_new_sees_every_recovered_file() -> Result<()> {
 	assert_eq!(seen(&log), paths);
 	assert_eq!(files, paths.iter().map(|p| finished(p)).collect::<Vec<_>>());
 	for (file, batch) in files.iter().zip(&batches) {
-		assert_eq!(read_finished(file, KEY)?.batch(), batch);
+		assert_eq!(read_finished(file, &with_source(KEY))?.batch(), batch);
 	}
 	Ok(())
 }
@@ -89,7 +89,7 @@ fn test_first_fetch_returns_leftovers_and_this_sessions_files_in_order() -> Resu
 	let temp_dir = TempDir::new()?;
 	let (paths, batches) = three_leftovers(&temp_dir)?;
 
-	let mut config = config(&temp_dir, 1024, KEY);
+	let mut config = config(&temp_dir, 1024, with_source(KEY));
 	config.max_file_items = Some(2);
 	let mut store = DirectoryStore::new(config)?;
 	let log = recording(&mut store, |_| false);
@@ -144,7 +144,7 @@ fn test_rejected_leftover_does_not_fail_the_fetch() -> Result<()> {
 	drop(store);
 
 	// Nor in a new one.
-	let mut store = DirectoryStore::new(config(&temp_dir, 1024, KEY))?;
+	let mut store = DirectoryStore::new(config(&temp_dir, 1024, with_source(KEY)))?;
 	assert!(store.leftovers.is_empty());
 	let log = recording(&mut store, |_| false);
 	assert_eq!(fetched(&mut store)?.len(), 3);
@@ -171,7 +171,7 @@ fn test_leftovers_recover_as_before_without_a_validator() -> Result<()> {
 			assert!(bytes.starts_with(original));
 			assert_eq!(bytes.len(), original.len() + CLOSING);
 		}
-		assert_eq!(read_finished(file, KEY)?.batch(), batch);
+		assert_eq!(read_finished(file, &with_source(KEY))?.batch(), batch);
 	}
 	Ok(())
 }
@@ -180,7 +180,7 @@ fn test_leftovers_recover_as_before_without_a_validator() -> Result<()> {
 fn test_reset_before_first_fetch_removes_leftovers() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	three_leftovers(&temp_dir)?;
-	fs::write(temp_dir.path().join("3-other"), "{ \"batch\": [1")?;
+	fs::write(temp_dir.path().join("3-other"), "{\"items\":[1")?;
 
 	let mut store = store(&temp_dir, 1024)?;
 	let log = recording(&mut store, |_| false);
@@ -207,7 +207,7 @@ fn test_append_never_recovers() -> Result<()> {
 	let (paths, _) = three_leftovers(&temp_dir)?;
 	let before: Vec<Vec<u8>> = paths.iter().map(fs::read).collect::<Result<_>>()?;
 
-	let mut config = config(&temp_dir, 1024, KEY);
+	let mut config = config(&temp_dir, 1024, with_source(KEY));
 	config.max_file_items = Some(1);
 	let mut store = DirectoryStore::new(config)?;
 	let log = recording(&mut store, |_| false);
@@ -250,7 +250,7 @@ fn test_a_file_that_fails_to_finish_is_retried_once_by_the_next_fetch() -> Resul
 	let temp_dir = TempDir::new()?;
 	let (paths, _) = three_leftovers(&temp_dir)?;
 
-	let mut config = config(&temp_dir, 1024, KEY);
+	let mut config = config(&temp_dir, 1024, with_source(KEY));
 	config.max_file_items = Some(1);
 	let mut store = DirectoryStore::new(config)?;
 	// A directory where this session's first file would be renamed to makes finishing

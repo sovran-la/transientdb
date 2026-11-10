@@ -90,7 +90,7 @@ async fn test_a_second_instance_on_the_same_database_ignores_the_firsts_removabl
 		return;
 	}
 	settle().await;
-	let mut second = WebStore::new(config(db_name, 4096, KEY)).await;
+	let mut second = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	// The same items under the same keys, but a different instance.
 	assert_eq!(queued(&second), items());
 	assert_eq!(

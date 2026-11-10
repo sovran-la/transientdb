@@ -26,7 +26,7 @@ fn reject_containing(
 }
 
 fn one_per_file(dir: &TempDir, items: usize) -> Result<DirectoryStore> {
-	let mut config = config(dir, 1024, KEY);
+	let mut config = config(dir, 1024, with_source(KEY));
 	config.max_file_items = Some(items);
 	DirectoryStore::new(config)
 }

@@ -65,7 +65,7 @@ You should see something like:
 📊 Has data: true
 
 📥 Fetching first 2 events...
-   writeKey: demo-app
+   source: demo-app
    sentAt: 2024-01-01T10:00:00.000Z
    items: 2
      - page_view

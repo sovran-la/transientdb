@@ -7,14 +7,14 @@
 #![cfg(target_arch = "wasm32")]
 
 use serde_json::{json, Value};
-use transientdb::{TransientDB, WebConfig, WebStore};
+use transientdb::{Envelope, TransientDB, WebConfig, WebStore};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 fn test_config(db_name: &str) -> WebConfig {
 	WebConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		database_name: db_name.to_string(),
 		max_items: Some(1000),
 		max_fetch_size: 1024 * 1024,
@@ -65,7 +65,7 @@ async fn test_transientdb_append_multiple() {
 	// Fetch and verify count
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 10, "Should have 10 items");
 	} else {
 		panic!("Expected data but got none");
@@ -97,7 +97,7 @@ async fn test_transientdb_fetch_with_count_limit() {
 	// Fetch only 5 items
 	if let Some(result) = db.fetch(Some(5), None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 5, "Should respect count limit");
 
 		// Verify we got the first 5 (FIFO order)
@@ -127,7 +127,7 @@ async fn test_transientdb_fetch_with_byte_limit() {
 	// Fetch with small byte limit - should get fewer items
 	if let Some(result) = db.fetch(None, Some(500)).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert!(items.len() < 20, "Byte limit should restrict item count");
 		assert!(!items.is_empty(), "Should get at least one item");
 	} else {
@@ -190,7 +190,7 @@ async fn test_transientdb_partial_remove() {
 	// Should have 7 items left
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 7, "Should have 7 items remaining");
 
 		// First item should now be index 3
@@ -229,7 +229,7 @@ async fn test_transientdb_reset_then_append() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 1);
 		assert_eq!(items[0]["after"], "reset");
 	} else {
@@ -258,7 +258,7 @@ async fn test_transientdb_json_types() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 8, "All JSON types should be stored");
 	}
 }
@@ -283,7 +283,7 @@ async fn test_transientdb_nested_json() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0], nested);
 	}
 }
@@ -303,7 +303,7 @@ async fn test_transientdb_unicode() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0]["emoji"], "🦀💥👾");
 		assert_eq!(items[0]["chinese"], "你好世界");
 	}
@@ -315,7 +315,13 @@ async fn test_transientdb_unicode() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_batch_structure() {
-	let store = WebStore::new(test_config("test-batch-structure")).await;
+	let store = WebStore::new(WebConfig {
+		envelope: Envelope::new("items")
+			.field("source", "test-key")
+			.timestamp("sentAt"),
+		..test_config("test-batch-structure")
+	})
+	.await;
 	let db = TransientDB::new(store);
 
 	db.append(json!({"test": "data"})).unwrap();
@@ -324,14 +330,11 @@ async fn test_transientdb_batch_structure() {
 		let batch: Value = result.data.unwrap();
 
 		// Verify batch structure
-		assert!(batch.get("batch").is_some(), "Missing 'batch' field");
+		assert!(batch.get("items").is_some(), "Missing 'items' field");
 		assert!(batch.get("sentAt").is_some(), "Missing 'sentAt' field");
-		assert!(batch.get("writeKey").is_some(), "Missing 'writeKey' field");
-		assert_eq!(
-			batch["writeKey"].as_str(),
-			Some("test-key"),
-			"Wrong writeKey"
-		);
+		assert!(batch.get("source").is_some(), "Missing 'source' field");
+		assert_eq!(batch["source"].as_str(), Some("test-key"), "Wrong source");
+		assert_eq!(batch.as_object().unwrap().len(), 3);
 	}
 }
 
@@ -350,7 +353,7 @@ async fn test_transientdb_fifo_order() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 
 		for (i, item) in items.iter().enumerate() {
 			assert_eq!(item["order"], i as i64, "Items should be in FIFO order");
@@ -361,7 +364,7 @@ async fn test_transientdb_fifo_order() {
 #[wasm_bindgen_test]
 async fn test_transientdb_max_items_eviction() {
 	let config = WebConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		database_name: "test-max-items".to_string(),
 		max_items: Some(5), // Small limit
 		max_fetch_size: 1024 * 1024,
@@ -378,7 +381,7 @@ async fn test_transientdb_max_items_eviction() {
 	// Should only have last 5 items
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 5, "Should only have max_items");
 
 		// Should be items 5-9 (oldest evicted)
@@ -403,7 +406,7 @@ async fn test_transientdb_rapid_append() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 100);
 	}
 }
@@ -469,7 +472,7 @@ async fn test_transientdb_empty_object() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0], json!({}));
 	}
 }
@@ -483,7 +486,7 @@ async fn test_transientdb_empty_array() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0], json!([]));
 	}
 }
@@ -506,7 +509,7 @@ async fn test_transientdb_large_payload() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0]["field_50"]["number"], 50);
 	}
 }
@@ -527,7 +530,7 @@ async fn test_transientdb_special_characters() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0]["quotes"], "He said \"hello\"");
 		assert_eq!(items[0]["newlines"], "line1\nline2\r\nline3");
 	}
@@ -549,7 +552,7 @@ async fn test_transientdb_numeric_edge_cases() {
 
 	if let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items[0]["zero"], 0);
 		assert_eq!(items[0]["negative"], -42);
 	}
@@ -574,15 +577,15 @@ async fn test_transientdb_fetch_item_limit() {
 
 	// A count above the limit is clamped, below it wins.
 	let batch: Value = db.fetch(Some(100), None).unwrap().unwrap().data.unwrap();
-	assert_eq!(batch["batch"].as_array().unwrap().len(), 8);
+	assert_eq!(batch["items"].as_array().unwrap().len(), 8);
 	let batch: Value = db.fetch(Some(3), None).unwrap().unwrap().data.unwrap();
-	assert_eq!(batch["batch"].as_array().unwrap().len(), 3);
+	assert_eq!(batch["items"].as_array().unwrap().len(), 3);
 
 	let mut sizes = Vec::new();
 	let mut seen = Vec::new();
 	while let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		let removable = result.removable.unwrap();
 		assert_eq!(items.len(), removable.len());
 		sizes.push(items.len());
@@ -612,7 +615,7 @@ async fn test_transientdb_unbounded_store_never_drops() {
 	while let Some(result) = db.fetch(None, None).unwrap() {
 		let batch: Value = result.data.unwrap();
 		seen.extend(
-			batch["batch"]
+			batch["items"]
 				.as_array()
 				.unwrap()
 				.iter()

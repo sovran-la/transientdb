@@ -7,7 +7,7 @@ use super::*;
 use std::collections::VecDeque;
 
 fn capped(db_name: &str, max_items: Option<usize>) -> WebConfig {
-	let mut config = config(db_name, 8 * 1024, KEY);
+	let mut config = config(db_name, 8 * 1024, with_source(KEY));
 	config.max_items = max_items;
 	config
 }

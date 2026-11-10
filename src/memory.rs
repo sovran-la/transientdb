@@ -1,6 +1,5 @@
-use crate::{batch, DataResult, DataStore, Equivalent};
-use chrono::{DateTime, TimeZone, Utc};
-use serde_json::json;
+use crate::{batch, DataResult, DataStore, Envelope, Equivalent};
+use chrono::Utc;
 use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
@@ -48,14 +47,14 @@ impl Equivalent for MemoryKey {
 /// Configuration options for the in-memory data store.
 ///
 /// This struct provides the configuration parameters needed to create a new MemoryStore instance.
-/// It controls the store's identification, capacity, and fetch size and item limits.
+/// It controls the batch envelope, capacity, and fetch size and item limits.
 ///
 /// # Examples
 /// ```
-/// use transientdb::{MemoryConfig, MemoryStore};
+/// use transientdb::{Envelope, MemoryConfig, MemoryStore};
 ///
 /// let config = MemoryConfig {
-///     write_key: "my-store".into(),
+///     envelope: Envelope::new("events").field("source", "sensor-7").timestamp("sentAt"),
 ///     max_items: Some(1000),
 ///     max_fetch_size: 1024 * 1024, // 1MB
 ///     max_fetch_items: Some(8),    // at most 8 items per fetch
@@ -65,9 +64,8 @@ impl Equivalent for MemoryKey {
 /// ```
 #[derive(Clone)]
 pub struct MemoryConfig {
-	/// Key used to identify writes to this store.
-	/// This is included in the metadata of each batch of data fetched from the store.
-	pub write_key: String,
+	/// The JSON object each fetched batch wraps its items in; see [`Envelope`].
+	pub envelope: Envelope,
 	/// Total capacity: the maximum number of items the store holds, or `None` for no cap.
 	///
 	/// `None` means unbounded: nothing is ever dropped for capacity, and items leave the
@@ -83,13 +81,12 @@ pub struct MemoryConfig {
 	/// its own `max_bytes`.
 	///
 	/// This is a hard ceiling on the whole batch serialized compactly with
-	/// `serde_json::to_string`: envelope (`sentAt`, `writeKey`), every item, and every
-	/// separator count. An item too large to fit in a batch by itself under this limit is
-	/// rejected by `append` with `ErrorKind::InvalidInput`, so every stored item can be
-	/// fetched.
+	/// `serde_json::to_string`: the envelope, every item, and every separator count. An
+	/// item too large to fit in a batch by itself under this limit is rejected by `append`
+	/// with `ErrorKind::InvalidInput`, so every stored item can be fetched.
 	///
 	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once the
-	/// envelope is counted (the envelope grows with `write_key`'s length).
+	/// envelope is counted.
 	pub max_fetch_size: usize,
 	/// Maximum number of items returned by a single fetch (the size of one batch).
 	/// When `fetch` is also given a `count`, the smaller of the two applies.
@@ -105,10 +102,9 @@ pub struct MemoryConfig {
 /// no cap, nothing is dropped. `fetch` itself removes nothing. The store maintains data
 /// in a queue structure and supports concurrent access.
 ///
-/// When items are fetched, they are packaged into a JSON batch with metadata including:
-/// - A batch array containing the items
-/// - A timestamp indicating when the batch was created
-/// - The store's write key
+/// When items are fetched, they are packaged into one JSON object shaped by
+/// [`MemoryConfig::envelope`]: the items in an array under its items key, its fields, and
+/// its timestamp if it has one. The batch is a `Value`, whose key order is not meaningful.
 ///
 /// A fetched batch, serialized compactly, is never larger than the byte limit in effect
 /// for that fetch.
@@ -122,8 +118,9 @@ pub struct MemoryStore {
 	items: VecDeque<QueuedItem>,
 	/// The sequence number the next appended item gets
 	next_seq: u64,
-	/// The largest serialized item that fits alone in a batch under `max_fetch_size`,
-	/// whatever the timestamp.
+	/// Length of the configured envelope with no items, the same for every batch
+	envelope_len: usize,
+	/// The largest serialized item that fits alone in a batch under `max_fetch_size`
 	max_item_size: usize,
 }
 
@@ -135,7 +132,9 @@ impl MemoryStore {
 	/// * If max_items is `Some(0)`
 	/// * If max_fetch_items is `Some(0)`
 	/// * If max_fetch_size leaves no room for even a 1-byte item once the batch
-	///   envelope (which grows with `write_key`) is counted
+	///   envelope is counted
+	/// * If the envelope has an empty key, uses a key twice, or does not read back as
+	///   JSON (see [`Envelope`])
 	pub fn new(config: MemoryConfig) -> Self {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
@@ -146,12 +145,14 @@ impl MemoryStore {
 		if config.max_fetch_items == Some(0) {
 			panic!("max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold.");
 		}
-		let envelope_len = Self::widest_envelope_len(&config.write_key);
+		config.envelope.validate();
+		let envelope_len = config.envelope.byte_len();
 		if envelope_len + 1 > config.max_fetch_size {
 			panic!("max_fetch_size is all envelope and no room for an item? That's packaging, not a batch.");
 		}
 
 		Self {
+			envelope_len,
 			max_item_size: config.max_fetch_size - envelope_len,
 			config,
 			id: crate::next_store_id(),
@@ -160,86 +161,8 @@ impl MemoryStore {
 		}
 	}
 
-	/// The `sentAt` value for a batch created at `now`.
-	fn sent_at(now: DateTime<Utc>) -> String {
-		now.to_rfc3339()
-	}
-
-	/// The envelope length with the widest `sentAt` this store can produce.
-	///
-	/// RFC3339 output drops trailing zero groups from the fractional seconds, so its
-	/// width varies; a timestamp with nonzero nanoseconds prints all nine digits.
-	fn widest_envelope_len(write_key: &str) -> usize {
-		let widest = Utc
-			.timestamp_opt(0, 123_456_789)
-			.single()
-			.expect("valid timestamp");
-		batch::envelope_len(&Self::sent_at(widest), write_key)
-	}
-
-	/// Creates a JSON batch object containing the provided items and metadata.
-	///
-	/// # Arguments
-	/// * `items` - Slice of JSON values to include in the batch
-	/// * `sent_at` - The batch's `sentAt` value, the same one its size was measured with
-	///
-	/// # Returns
-	/// A JSON value containing:
-	/// - A `batch` array of the provided items
-	/// - A `sentAt` timestamp in RFC3339 format
-	/// - The store's `writeKey`
-	fn create_batch(&self, items: &[&Value], sent_at: &str) -> Value {
-		json!({
-			"batch": items,
-			"sentAt": sent_at,
-			"writeKey": self.config.write_key
-		})
-	}
-
 	fn get_item_size(item: &Value) -> usize {
 		item.to_string().len()
-	}
-
-	/// `fetch` with the batch's `sentAt` supplied, so its envelope length is known.
-	fn fetch_with_sent_at(
-		&mut self,
-		count: Option<usize>,
-		max_bytes: Option<usize>,
-		sent_at: &str,
-	) -> Option<DataResult<Value>> {
-		// Unlike WebStore, no head item can be too large for max_fetch_size: append
-		// rejects such items and nothing else adds to the queue.
-		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
-		let count = batch::effective_count(count, self.config.max_fetch_items);
-		let envelope_len = batch::envelope_len(sent_at, &self.config.write_key);
-		let num_items = batch::leading_items_that_fit(
-			self.items
-				.iter()
-				.map(|item| Self::get_item_size(&item.value)),
-			envelope_len,
-			max_bytes,
-			count,
-		);
-
-		if num_items == 0 {
-			return None;
-		}
-
-		let fetched = self.items.iter().take(num_items);
-		let items: Vec<&Value> = fetched.clone().map(|item| &item.value).collect();
-		let removable: Vec<Box<dyn Equivalent>> = fetched
-			.map(|item| {
-				Box::new(MemoryKey {
-					store: self.id,
-					seq: item.seq,
-				}) as Box<dyn Equivalent>
-			})
-			.collect();
-
-		Some(DataResult {
-			data: Some(self.create_batch(&items, sent_at)),
-			removable: Some(removable),
-		})
 	}
 }
 
@@ -306,8 +229,38 @@ impl DataStore for MemoryStore {
 		count: Option<usize>,
 		max_bytes: Option<usize>,
 	) -> Result<Option<DataResult<Self::Output>>> {
-		let sent_at = Self::sent_at(Utc::now());
-		Ok(self.fetch_with_sent_at(count, max_bytes, &sent_at))
+		// Unlike WebStore, no head item can be too large for max_fetch_size: append
+		// rejects such items and nothing else adds to the queue.
+		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
+		let count = batch::effective_count(count, self.config.max_fetch_items);
+		let num_items = batch::leading_items_that_fit(
+			self.items
+				.iter()
+				.map(|item| Self::get_item_size(&item.value)),
+			self.envelope_len,
+			max_bytes,
+			count,
+		);
+
+		if num_items == 0 {
+			return Ok(None);
+		}
+
+		let fetched = self.items.iter().take(num_items);
+		let items: Vec<Value> = fetched.clone().map(|item| item.value.clone()).collect();
+		let removable: Vec<Box<dyn Equivalent>> = fetched
+			.map(|item| {
+				Box::new(MemoryKey {
+					store: self.id,
+					seq: item.seq,
+				}) as Box<dyn Equivalent>
+			})
+			.collect();
+
+		Ok(Some(DataResult {
+			data: Some(self.config.envelope.batch(items, Utc::now())),
+			removable: Some(removable),
+		}))
 	}
 
 	/// Removes exactly the items a previous `fetch` returned.
@@ -333,24 +286,25 @@ impl DataStore for MemoryStore {
 #[cfg(test)]
 mod tests {
 	use crate::memory::{MemoryConfig, MemoryStore};
-	use crate::DataStore;
+	use crate::{DataStore, Envelope};
 	use serde_json::{json, Value};
 	use std::io::Result;
 
+	mod awkward_envelope;
 	mod capacity;
 	mod ceiling;
 	mod depth;
 	mod duplicates;
+	mod envelope;
 	mod foreign_removables;
 	mod oversized;
 	mod repeat;
 	mod support;
-	mod write_key;
 
 	#[test]
 	fn test_basic_operations() -> Result<()> {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(1000),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
@@ -369,7 +323,7 @@ mod tests {
 		// Test fetch - data should still be there after fetch
 		if let Some(result) = store.fetch(None, None)? {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 1);
 			assert_eq!(items[0]["value"], 123);
 
@@ -394,7 +348,7 @@ mod tests {
 	#[test]
 	fn test_fifo_behavior() -> Result<()> {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(3), // Small limit to test FIFO
 			max_fetch_size: 1024,
 			max_fetch_items: None,
@@ -413,7 +367,7 @@ mod tests {
 		// Verify they're the right items (2,3,4)
 		if let Some(result) = store.fetch(None, None)? {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 3);
 			assert_eq!(items[0]["index"], 2);
 			assert_eq!(items[1]["index"], 3);
@@ -426,7 +380,7 @@ mod tests {
 	#[test]
 	fn test_fetch_limits() -> Result<()> {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(100),
 			max_fetch_size: 1000,
 			max_fetch_items: None,
@@ -446,7 +400,7 @@ mod tests {
 		// Test count limit
 		if let Some(result) = store.fetch(Some(3), None)? {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(items.len(), 3, "Count limit not respected");
 		}
 
@@ -462,7 +416,7 @@ mod tests {
 		// Test byte limit (200 bytes should get us about 2-3 items)
 		if let Some(result) = store.fetch(None, Some(200))? {
 			let items = result.data.unwrap();
-			let items = items["batch"].as_array().unwrap();
+			let items = items["items"].as_array().unwrap();
 			assert!(items.len() <= 3, "Too many items for byte limit");
 
 			// Each raw item should be under the limit
@@ -476,7 +430,7 @@ mod tests {
 	#[test]
 	fn test_reset() -> Result<()> {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(100),
 			max_fetch_size: 1000,
 			max_fetch_items: None,
@@ -501,7 +455,7 @@ mod tests {
 	#[test]
 	fn test_memory_store_max_fetch_size_edge_cases() -> Result<()> {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(100),
 			max_fetch_size: 300, // Reasonable size that's easy to stay under/go over
 			max_fetch_items: None,
@@ -525,7 +479,7 @@ mod tests {
 		// First fetch should only get the small item
 		let result = store.fetch(None, None)?.expect("small item");
 		let batch: Value = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), 1, "Should only fetch the small item");
 		assert_eq!(items[0]["type"], "small");
 		store.remove(&result.removable.unwrap())?;
@@ -540,7 +494,7 @@ mod tests {
 	#[test]
 	fn test_memory_store_json_types() -> Result<()> {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(100),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
@@ -559,7 +513,7 @@ mod tests {
 
 		if let Some(result) = store.fetch(None, None)? {
 			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
+			let items = batch["items"].as_array().unwrap();
 			assert_eq!(
 				items.len(),
 				7,
@@ -576,7 +530,7 @@ mod tests {
 	)]
 	fn test_rejects_tiny_max_fetch_size() {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(1000),
 			max_fetch_size: 50, // Ridiculously small
 			max_fetch_items: None,
@@ -591,7 +545,7 @@ mod tests {
 	)]
 	fn test_rejects_zero_max_items() {
 		let config = MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(0), // Why even bother?
 			max_fetch_size: 1024,
 			max_fetch_items: None,
@@ -602,7 +556,7 @@ mod tests {
 
 	fn item_limit_store(max_fetch_items: Option<usize>) -> MemoryStore {
 		MemoryStore::new(MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(1000),
 			max_fetch_size: 1024 * 1024,
 			max_fetch_items,
@@ -626,7 +580,7 @@ mod tests {
 			return Ok(Vec::new());
 		};
 		let batch = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		assert_eq!(items.len(), result.removable.unwrap().len());
 		Ok(items.iter().map(|v| v["index"].as_i64().unwrap()).collect())
 	}
@@ -673,9 +627,8 @@ mod tests {
 		let item_size = MemoryStore::get_item_size(&json!({"index": 0, "padding": "x".repeat(50)}));
 
 		// Room for exactly 3 items and their 2 separators by bytes, envelope included, fewer
-		// than the item limit. The widest envelope leaves the 3 fitting whatever the
-		// timestamp, and is far less than a fourth item short.
-		let envelope = MemoryStore::widest_envelope_len("test-key");
+		// than the item limit.
+		let envelope = crate::envelope::samples::expected_len(&Envelope::default());
 		let indexes = fetch_indexes(&mut store, None, Some(envelope + item_size * 3 + 2))?;
 		assert_eq!(indexes, vec![0, 1, 2]);
 
@@ -694,7 +647,7 @@ mod tests {
 		let mut seen = Vec::new();
 		while let Some(result) = store.fetch(None, None)? {
 			let batch = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap().clone();
+			let items = batch["items"].as_array().unwrap().clone();
 			let removable = result.removable.unwrap();
 			assert_eq!(items.len(), removable.len());
 			sizes.push(items.len());
@@ -732,7 +685,7 @@ mod tests {
 	#[test]
 	fn test_fetch_item_limit_with_max_items_drop_oldest() -> Result<()> {
 		let mut store = MemoryStore::new(MemoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			max_items: Some(10),
 			max_fetch_size: 1024 * 1024,
 			max_fetch_items: Some(4),

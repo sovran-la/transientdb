@@ -1,10 +1,9 @@
 //! Byte-ceiling arithmetic shared by the stores, and the nesting limit on items.
 //!
-//! A batch is serialized as `{"batch":[item,item,...],"sentAt":"...","writeKey":"..."}`,
-//! so its compact length is the length of that envelope with an empty `batch`, plus
-//! every item, plus one comma between each pair of items.
+//! A batch is serialized as the envelope's opening, the items separated by commas, and
+//! the envelope's closing (see `envelope.rs`), so its compact length is the length of the
+//! envelope with no items, plus every item, plus one comma between each pair of items.
 
-use serde_json::json;
 use std::io;
 
 mod depth;
@@ -13,27 +12,8 @@ pub(crate) use depth::within_depth;
 #[cfg(test)]
 pub(crate) use depth::{nested, Shape, MAX_ITEM_DEPTH, SHAPES};
 
-/// Write keys that need escaping in JSON, or are multi-byte in UTF-8, for tests of every
-/// store's envelope.
-#[cfg(test)]
-pub(crate) const AWKWARD_WRITE_KEYS: [&str; 6] = [
-	"quote\"inside",
-	"back\\slash",
-	"new\nline",
-	"tab\there",
-	"ключ-🦀-鍵",
-	"control\u{1}char",
-];
-
-/// Bytes between two items in a serialized `batch` array.
+/// Bytes between two items in a serialized items array.
 pub(crate) const SEPARATOR_LEN: usize = 1;
-
-/// Length of the compact batch envelope with an empty `batch` array.
-pub(crate) fn envelope_len(sent_at: &str, write_key: &str) -> usize {
-	json!({"batch": [], "sentAt": sent_at, "writeKey": write_key})
-		.to_string()
-		.len()
-}
 
 /// The configured item limit caps the caller's count; a larger count is clamped.
 pub(crate) fn effective_count(
@@ -98,24 +78,6 @@ pub(crate) fn item_too_large(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use serde_json::Value;
-
-	#[test]
-	fn test_envelope_len_matches_serialized_batch() {
-		for (sent_at, key) in [("", ""), ("2026-01-01T00:00:00Z", "key"), ("t", "🦀\"q")] {
-			let len = envelope_len(sent_at, key);
-			let empty = json!({"batch": [], "sentAt": sent_at, "writeKey": key});
-			assert_eq!(len, serde_json::to_string(&empty).unwrap().len());
-
-			let items: Vec<Value> = vec![json!(1), json!("two"), json!({"three": 3})];
-			let full = json!({"batch": items, "sentAt": sent_at, "writeKey": key});
-			let items_len: usize = items.iter().map(|i| i.to_string().len()).sum();
-			assert_eq!(
-				serde_json::to_string(&full).unwrap().len(),
-				len + items_len + 2 * SEPARATOR_LEN
-			);
-		}
-	}
 
 	#[test]
 	fn test_leading_items_that_fit_counts_envelope_and_separators() {

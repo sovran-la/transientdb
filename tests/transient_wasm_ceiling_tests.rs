@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 use std::io::ErrorKind;
-use transientdb::{TransientDB, WebConfig, WebStore};
+use transientdb::{Envelope, TransientDB, WebConfig, WebStore};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -12,7 +12,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 async fn web_db(db_name: &str, max_fetch_size: usize) -> TransientDB<Value> {
 	let db = TransientDB::new(
 		WebStore::new(WebConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			database_name: db_name.to_string(),
 			max_items: Some(10_000),
 			max_fetch_size,
@@ -32,7 +32,7 @@ fn drain(db: &TransientDB<Value>, max: usize) -> Vec<Value> {
 		let batch = result.data.unwrap();
 		let len = serde_json::to_string(&batch).unwrap().len();
 		assert!(len <= max, "batch is {len} bytes, over {max}");
-		items.extend(batch["batch"].as_array().unwrap().iter().cloned());
+		items.extend(batch["items"].as_array().unwrap().iter().cloned());
 		db.remove(&result.removable.unwrap()).unwrap();
 	}
 	assert!(!db.has_data());

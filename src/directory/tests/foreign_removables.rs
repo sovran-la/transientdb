@@ -17,7 +17,7 @@ fn removables(paths: &[PathBuf]) -> Vec<Box<dyn Equivalent>> {
 /// the store and the fetched paths.
 fn store_with_files(dir: &Path, count: usize) -> Result<(DirectoryStore, Vec<PathBuf>)> {
 	let mut store = DirectoryStore::new(DirectoryConfig {
-		write_key: KEY.to_string(),
+		envelope: Envelope::default(),
 		storage_location: dir.to_path_buf(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
@@ -91,7 +91,7 @@ fn test_paths_that_are_not_the_stores_finished_files_are_left_in_place() -> Resu
 	// Another store's finished file in the same directory.
 	let mut logs = DirectoryStore::new(DirectoryConfig {
 		base_filename: "logs".to_string(),
-		..config(&temp_dir, 1024, KEY)
+		..config(&temp_dir, 1024, with_source(KEY))
 	})?;
 	logs.append(json!("log"))?;
 	let other_finished = logs.fetch(None, None)?.unwrap().data.unwrap();

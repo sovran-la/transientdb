@@ -10,7 +10,7 @@ fn store_capped(
 	max_fetch_items: Option<usize>,
 ) -> MemoryStore {
 	MemoryStore::new(MemoryConfig {
-		write_key: KEY.to_string(),
+		envelope: with_source(KEY),
 		max_items,
 		max_fetch_size,
 		max_fetch_items,
@@ -57,7 +57,7 @@ fn test_unbounded_batches_still_limited_by_item_limit() -> Result<()> {
 
 #[test]
 fn test_unbounded_batches_still_limited_by_bytes() -> Result<()> {
-	// Room for 5 items of 20 bytes and their separators (with any timestamp), not 6.
+	// Room for 5 items of 20 bytes and their separators, with 15 bytes to spare, not 6.
 	let max_fetch_size = envelope(KEY) + 5 * 20 + 4 + 15;
 	let mut store = store_capped(None, max_fetch_size, Some(8));
 	let appended: Vec<Value> = (0..2000).map(|tag| item_of_len(20, tag)).collect();

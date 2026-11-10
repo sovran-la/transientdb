@@ -23,7 +23,7 @@ fn read_back(store: &mut MemoryStore) -> Result<Vec<Value>> {
 	let result = store.fetch(None, None)?.unwrap();
 	let bytes = serde_json::to_vec(result.data.as_ref().unwrap())?;
 	let batch: Value = serde_json::from_slice(&bytes)?;
-	Ok(batch["batch"].as_array().unwrap().clone())
+	Ok(batch["items"].as_array().unwrap().clone())
 }
 
 #[test]
