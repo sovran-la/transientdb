@@ -6,7 +6,9 @@
 //! decimal, as the store writes it. Names are compared as whole strings, and only
 //! regular files count. Every listing of the directory goes through
 //! [`DirectoryStore::owned_files`], so a store never reads, closes, renames, counts or
-//! deletes anything else in the directory, including another store's files.
+//! deletes anything else in the directory, including another store's files. `remove`
+//! is handed paths rather than listing, and deletes only those that pass
+//! [`DirectoryStore::is_own_finished_file`].
 //!
 //! Indexes only grow. A new file takes the next index above every one in use, and
 //! once `u32::MAX` is taken there is no next index: starting a file fails rather than
@@ -97,6 +99,26 @@ impl DirectoryStore {
 		}
 		let extension = rest.strip_prefix(base)?.strip_prefix('.')?;
 		(extension == Self::TEMP_EXTENSION).then_some((index, true))
+	}
+
+	/// Whether `path` is one of this store's finished files: a regular file directly in
+	/// the storage directory, whose canonical path is `storage`, with a finished name by
+	/// the ownership rule. The directory part of `path` is canonicalized before it is
+	/// compared, so a relative and an absolute spelling of the same directory (or one
+	/// through `..` or a symlink) match, and no spelling of another directory does.
+	pub(super) fn is_own_finished_file(&self, path: &Path, storage: &Path) -> bool {
+		let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+			return false;
+		};
+		if !matches!(self.owned_name(name), Some((_, true))) {
+			return false;
+		}
+		let dir = match path.parent() {
+			Some(dir) if !dir.as_os_str().is_empty() => dir,
+			_ => Path::new("."),
+		};
+		fs::canonicalize(dir).is_ok_and(|dir| dir == storage)
+			&& fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 	}
 
 	/// Every file of this store in the storage directory, lowest index first.

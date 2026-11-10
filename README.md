@@ -69,6 +69,15 @@ items, and the data stays in the store until you pass `removable` to `remove()`.
 again before removing returns the same items. Remove a batch only once it has been
 processed (for example, after the upload succeeded), so a failure never loses data.
 
+`remove()` acts only on removables issued by the same store instance, and silently ignores
+anything else (returning `Ok`, as it does for items already removed). Every MemoryStore and
+WebStore instance has its own identity, so another instance's removables remove nothing,
+even a WebStore opened on the same `database_name`: remove items through the instance that
+fetched them. DirectoryStore deletes a path only if it is one of its own finished files in
+its own storage directory (compared by canonical path, so a relative and an absolute
+spelling both work); another store's file, its own open or unfinished file, and anything
+outside the directory are left in place.
+
 ## Usage
 
 ### Memory Store Example
@@ -365,6 +374,12 @@ An item too large to fit by itself under the configured limit (`max_file_size` o
 that fits. The rejected item is not stored, and the store is otherwise unchanged:
 DirectoryStore does not rotate or create a file, and WebStore issues no IndexedDB write.
 
+`append` also rejects, with `InvalidInput` and the same guarantees, an item nested more than
+125 levels deep in arrays and objects (each `[]` or `{}` is one level; scalars add none).
+`serde_json` cannot parse anything nested deeper inside a batch, so such an item could not
+be recovered from a file, hydrated from IndexedDB, or read by the consumer. The check does
+not recurse, so even an absurdly deep value is rejected without overflowing the stack.
+
 ```rust
 match db.append(event) {
     Ok(()) => {}
@@ -376,6 +391,14 @@ match db.append(event) {
 WebStore may hold items persisted under a larger `max_fetch_size`. Hydration loads them as usual; when one reaches the head of the queue and
 cannot fit under `max_fetch_size`, `fetch` drops it, deletes it from IndexedDB, logs a
 `console.warn`, and continues with the next item.
+
+DirectoryStore may likewise find unfinished files left by a session with a larger
+`max_file_size`. Recovery cuts each one down to the leading complete items that fit under
+the current `max_file_size` once closed, dropping the rest (with one line on stderr giving
+the bytes kept of the total), and deletes it if not even its first item fits. That holds
+for a file the earlier session had already closed but not renamed, too: one at or under the
+current limit is renamed untouched. Files an earlier session already finished (`.temp`) are
+fetched as they are.
 
 Because the envelope counts, the limit must leave room for at least a 1-byte item after it;
 the envelope grows with `write_key`'s length. Constructing a store whose envelope alone fills

@@ -77,6 +77,11 @@ pub struct DirectoryConfig {
 	///
 	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once
 	/// the envelope is counted (the envelope grows with `write_key`'s length).
+	///
+	/// An unfinished file an earlier session left under a larger limit, even one it had
+	/// already closed, is cut down when recovered to the leading items that fit under
+	/// this one, and deleted if not even its first item fits. Files already finished
+	/// (`.temp`) by an earlier session are fetched as they are.
 	pub max_file_size: usize,
 	/// Maximum number of items in an individual data file.
 	/// Once a file holds this many items, the next append starts a new file.
@@ -556,13 +561,13 @@ impl DataStore for DirectoryStore {
 		self.current_size = 0;
 		self.current_items = 0;
 
+		// Directly, not through `remove`, which deletes only finished files.
 		if let Ok(files) = self.sorted_files(true) {
-			let _ = self.remove(
-				&files
-					.iter()
-					.map(|p| Box::new(p.clone()) as Box<dyn Equivalent>)
-					.collect::<Vec<_>>(),
-			);
+			for path in files {
+				if let Err(e) = fs::remove_file(&path) {
+					eprintln!("Failed to remove file {:?}: {}", path, e);
+				}
+			}
 		}
 	}
 
@@ -578,7 +583,8 @@ impl DataStore for DirectoryStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, without touching any file, if the serialized
-	/// item is too large to fit even alone in a fresh file. Also propagates IO errors
+	/// item is too large to fit even alone in a fresh file, or if it is nested more than
+	/// 125 levels deep in arrays and objects, too deep to read back. Also propagates IO errors
 	/// from finishing the previous file, and from writing the item. A failed write
 	/// stores nothing of the item: the open file is rolled back to the items before it,
 	/// and the next append continues it. If even the rollback fails, the store stops
@@ -591,6 +597,8 @@ impl DataStore for DirectoryStore {
 	/// The files already there can still be fetched, and once they are removed, a store
 	/// opened again starts over from index 1.
 	fn append(&mut self, data: Value) -> Result<()> {
+		// First: serializing a value nested too deeply could overflow the stack.
+		let data = batch::within_depth(data)?;
 		let item = serde_json::to_vec(&data)?;
 
 		// Reject before touching anything: an item that cannot fit in any file must not
@@ -687,9 +695,26 @@ impl DataStore for DirectoryStore {
 		}))
 	}
 
+	/// Deletes the finished files a previous `fetch` returned.
+	///
+	/// Only this store's own finished files count: a path is deleted only if it names a
+	/// regular file directly in this store's storage directory, with a finished name by
+	/// the ownership rule (see [`DirectoryConfig::base_filename`]). The directory is
+	/// compared by canonical path, so a relative and an absolute spelling of it both
+	/// match. Anything else is ignored, which is not an error: another store's file
+	/// (another `base_filename`, or the same one in another directory), this store's open
+	/// or unfinished file, a file outside the directory, or a file already gone. A
+	/// failure to delete one of its own files is logged with `eprintln!` and skipped.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
+		// If the directory itself is gone, so is every file in it.
+		let Ok(storage) = fs::canonicalize(&self.config.storage_location) else {
+			return Ok(());
+		};
 		for item in data {
 			if let Some(path) = item.as_any().downcast_ref::<PathBuf>() {
+				if !self.is_own_finished_file(path, &storage) {
+					continue;
+				}
 				if let Err(e) = fs::remove_file(path) {
 					eprintln!("Failed to remove file {:?}: {}", path, e);
 				}
@@ -713,11 +738,14 @@ mod tests {
 	mod base_filename;
 	mod ceiling;
 	mod deferred;
+	mod depth;
 	mod duplicates;
 	mod finish_failure;
+	mod foreign_removables;
 	mod index_limit;
 	mod lifecycle;
 	mod oversized;
+	mod oversized_leftover;
 	mod ownership;
 	mod recovery;
 	mod rejection;

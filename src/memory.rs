@@ -27,9 +27,13 @@ struct QueuedItem {
 	value: Value,
 }
 
-/// A removable from `MemoryStore::fetch`: the sequence number of one fetched item.
+/// A removable from `MemoryStore::fetch`: the identity of the store that issued it and
+/// the sequence number of one fetched item.
 #[derive(Debug, PartialEq)]
-struct MemoryKey(u64);
+struct MemoryKey {
+	store: u64,
+	seq: u64,
+}
 
 impl Equivalent for MemoryKey {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
@@ -106,6 +110,8 @@ pub struct MemoryConfig {
 /// exactly the items a fetch returned, never an identical item still waiting.
 pub struct MemoryStore {
 	config: MemoryConfig,
+	/// This instance's identity, unique within the process, carried in its removables
+	id: u64,
 	items: VecDeque<QueuedItem>,
 	/// The sequence number the next appended item gets
 	next_seq: u64,
@@ -141,6 +147,7 @@ impl MemoryStore {
 		Self {
 			max_item_size: config.max_fetch_size - envelope_len,
 			config,
+			id: crate::next_store_id(),
 			items: VecDeque::new(),
 			next_seq: 0,
 		}
@@ -214,7 +221,12 @@ impl MemoryStore {
 		let fetched = self.items.iter().take(num_items);
 		let items: Vec<&Value> = fetched.clone().map(|item| &item.value).collect();
 		let removable: Vec<Box<dyn Equivalent>> = fetched
-			.map(|item| Box::new(MemoryKey(item.seq)) as Box<dyn Equivalent>)
+			.map(|item| {
+				Box::new(MemoryKey {
+					store: self.id,
+					seq: item.seq,
+				}) as Box<dyn Equivalent>
+			})
 			.collect();
 
 		Some(DataResult {
@@ -239,10 +251,14 @@ impl DataStore for MemoryStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store unchanged, if the serialized
-	/// item cannot fit in a batch by itself under `max_fetch_size`. Returns an error,
+	/// item cannot fit in a batch by itself under `max_fetch_size`, or if it is nested
+	/// more than 125 levels deep in arrays and objects, too deep to read back from a
+	/// batch. Returns an error,
 	/// leaving the store unchanged, if sequence numbers are exhausted: they never wrap,
 	/// so no two items can share one.
 	fn append(&mut self, data: Value) -> Result<()> {
+		// First: serializing a value nested too deeply could overflow the stack.
+		let data = batch::within_depth(data)?;
 		let item_size = Self::get_item_size(&data);
 		if item_size > self.max_item_size {
 			return Err(batch::item_too_large(
@@ -289,11 +305,16 @@ impl DataStore for MemoryStore {
 	///
 	/// Identical items that were not fetched stay queued. Items already gone (removed
 	/// before, or dropped by `max_items` since the fetch) are skipped.
+	///
+	/// Only removables this instance issued count. Another store's removables, even
+	/// another `MemoryStore`'s with the same sequence numbers, are ignored, as is
+	/// anything that did not come from a `fetch`; ignoring them is not an error.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
 		let fetched: HashSet<u64> = data
 			.iter()
 			.filter_map(|removable| removable.as_any().downcast_ref::<MemoryKey>())
-			.map(|key| key.0)
+			.filter(|key| key.store == self.id)
+			.map(|key| key.seq)
 			.collect();
 		self.items.retain(|item| !fetched.contains(&item.seq));
 		Ok(())
@@ -308,7 +329,9 @@ mod tests {
 	use std::io::Result;
 
 	mod ceiling;
+	mod depth;
 	mod duplicates;
+	mod foreign_removables;
 	mod oversized;
 	mod repeat;
 	mod support;

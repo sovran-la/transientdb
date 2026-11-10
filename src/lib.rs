@@ -18,6 +18,13 @@ pub use transient::TransientDB;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use web::{PersistenceState, WebConfig, WebStore};
 
+/// A new identity for a store instance, unique within the process. A store carries it
+/// in every removable it issues, so its `remove` can ignore another instance's.
+pub(crate) fn next_store_id() -> u64 {
+	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Represents the result of a data fetch operation.
 /// Contains either raw data bytes or paths to data files, along with items that can be removed.
 #[derive(Debug)]
@@ -58,6 +65,12 @@ pub trait DataStore {
 	/// The built-in stores return `ErrorKind::InvalidInput`, and store nothing, for an
 	/// item too large to fit by itself under the store's configured byte limit, envelope
 	/// included. Such an item could never be delivered.
+	///
+	/// They also return `ErrorKind::InvalidInput`, and store nothing, for an item nested
+	/// more than 125 levels deep in arrays and objects (each `[]` or `{}` is a level).
+	/// `serde_json` cannot read a deeper item back from a batch, so neither could the
+	/// store's own recovery or the consumer. The check does not recurse, so even a
+	/// pathologically deep item is rejected without overflowing the stack.
 	fn append(&mut self, data: Value) -> Result<()>;
 
 	/// Fetches a batch of data from the store, respecting optional count and size limits.
@@ -84,5 +97,9 @@ pub trait DataStore {
 	///
 	/// # Arguments
 	/// * `data` - Slice of removable items from a previous fetch operation
+	///
+	/// The built-in stores act only on removables issued by the same store instance
+	/// (for `DirectoryStore`, on paths to its own finished files) and silently ignore
+	/// anything else, returning `Ok`, as they do for items already removed.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()>;
 }
