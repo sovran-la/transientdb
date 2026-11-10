@@ -77,7 +77,9 @@ run_wasm_tests() {
     BROWSER="${WASM_BROWSER:-chrome}"
     
     echo "Running wasm-pack test (browser: $BROWSER)..."
-    if wasm-pack test --headless --"$BROWSER" --features web; then
+    # The test runner gives each test binary 20 seconds by default; the browser suite
+    # can take longer on a slow machine.
+    if WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-300}" wasm-pack test --headless --"$BROWSER" --features web; then
         print_success "WASM tests passed"
         return 0
     else

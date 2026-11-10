@@ -296,4 +296,8 @@ jobs:
         uses: browser-actions/setup-firefox@latest
 
       - name: Run WASM tests
+        # wasm-bindgen-test-runner gives each test binary 20 seconds by default, and the
+        # library's browser suite no longer fits in that on a CI runner.
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --${{ matrix.browser }} --features web
