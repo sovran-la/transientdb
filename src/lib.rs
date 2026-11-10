@@ -29,6 +29,8 @@ mod claims;
 #[cfg(test)]
 mod contract;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod file;
 #[cfg(test)]
 mod item_samples;
 mod items;
