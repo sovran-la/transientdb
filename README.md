@@ -218,9 +218,11 @@ store.set_file_validator(move |path| {
 Files are not fsynced, so durability across a power loss or OS crash is not guaranteed.
 What was written is salvaged by the next session's first `fetch`: a file cut short keeps
 every complete item, byte for byte and in order, and loses whatever follows the last one.
-A file that does not start like one of the store's data files is left untouched. A write
-that fails while the store is running (disk full, an I/O error) is rolled back, so the
-failed item leaves nothing behind and the next append continues the same file.
+A leftover with no complete item is deleted, and so is one of the store's files that does
+not even start like a data file (empty, or cut inside its opening): nothing in it can be
+read, so it could never be delivered. Files not named for the store are never touched. A
+write that fails while the store is running (disk full, an I/O error) is rolled back, so
+the failed item leaves nothing behind and the next append continues the same file.
 
 ### Web Store Example (WASM)
 

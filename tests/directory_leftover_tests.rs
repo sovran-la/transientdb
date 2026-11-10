@@ -140,10 +140,12 @@ fn test_leftover_cut_inside_an_item_is_salvaged() -> Result<()> {
 		"{OPENING}{{\"n\":1,\"s\":\"a,}}\"}},[2,{{\"x\":\"]\"}}]]"
 	)));
 	assert!(!cut.exists());
-	// The validator saw the salvaged file; the unreadable one is left as it was.
+	// The validator saw the salvaged file; the unreadable one is deleted unvalidated.
 	assert_eq!(seen.lock().unwrap().clone(), vec![cut]);
-	assert_eq!(fs::read_to_string(&unreadable)?, "garbage, not a data file");
+	assert!(!unreadable.exists());
 	db.remove(&result.removable.unwrap())?;
 	assert!(db.fetch(None, None)?.is_none());
+	assert!(!db.has_data());
+	assert_eq!(fs::read_dir(temp_dir.path())?.count(), 0);
 	Ok(())
 }
