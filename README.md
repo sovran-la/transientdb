@@ -331,7 +331,7 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 ### DirectoryConfig
 - `write_key`: Identifier for the data source
 - `storage_location`: Directory path for storing files
-- `base_filename`: Base name for generated files, which are named `{index}-{base_filename}`. Must be a plain file name: not empty, not `.` or `..`, no `/`, `\` or NUL byte (on every platform), and not ending in `.temp`. Dots, spaces, hyphens, digits and non-ASCII characters are fine
+- `base_filename`: Base name for generated files, which are named `{index}-{base_filename}`. Must be a plain file name: not empty, not `.` or `..`, no `/`, `\` or NUL byte (on every platform), and not ending in `.temp`. Dots, spaces, hyphens, digits and non-ASCII characters are fine. The index counts up from one above the highest index on disk and never wraps: if index 4294967295 is taken, an `append` that needs a new file returns an error, and the existing files can still be fetched
 - `max_file_size`: Hard ceiling in bytes on each finished file, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_file_items`: Maximum number of items in one file, or `None` for no limit (must not be `Some(0)`)
 

@@ -132,3 +132,26 @@ fn test_removables_that_are_not_from_fetch_remove_nothing() -> Result<()> {
 	assert_eq!(queued(&store), vec![json!("a"), json!("b")]);
 	Ok(())
 }
+
+#[test]
+fn test_sequence_numbers_stop_before_wrapping() -> Result<()> {
+	let mut store = store_of(100);
+	store.append(json!("first"))?;
+	store.next_seq = u64::MAX - 1;
+	store.append(json!("last"))?;
+	assert_eq!(store.items.back().unwrap().seq, u64::MAX - 1);
+	// The next item would need a sequence number the first item could end up sharing.
+	for _ in 0..3 {
+		let err = store.append(json!("one too many")).unwrap_err();
+		assert!(err.to_string().contains("exhausted"), "{err}");
+	}
+	assert_eq!(store.next_seq, u64::MAX);
+	assert_eq!(queued(&store), vec![json!("first"), json!("last")]);
+
+	// What is queued is still delivered and removed exactly.
+	let (items, removable) = fetch(&mut store, 1)?;
+	assert_eq!(items, vec![json!("first")]);
+	store.remove(&removable)?;
+	assert_eq!(queued(&store), vec![json!("last")]);
+	Ok(())
+}
