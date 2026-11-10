@@ -4,9 +4,12 @@
 //! the envelope's closing (see `envelope.rs`), so its compact length is the length of the
 //! envelope with no items, plus every item, plus one comma between each pair of items.
 
+use std::collections::VecDeque;
 use std::io;
 
 mod depth;
+#[cfg(test)]
+pub(crate) mod script;
 
 pub(crate) use depth::within_depth;
 #[cfg(test)]
@@ -24,6 +27,19 @@ pub(crate) fn effective_count(
 		(Some(count), Some(limit)) => Some(count.min(limit)),
 		(count, limit) => count.or(limit),
 	}
+}
+
+/// The items at the front of `queue` appended under the head item's batch number: the
+/// most one fetch may return, since a batch never crosses an `end_batch` boundary. Lazy,
+/// so a fetch looks only at the items it may take.
+pub(crate) fn head_batch<'a, T>(
+	queue: &'a VecDeque<T>,
+	batch_of: impl Fn(&T) -> u64 + 'a,
+) -> impl Iterator<Item = &'a T> + 'a {
+	let head = queue.front().map(&batch_of);
+	queue
+		.iter()
+		.take_while(move |item| Some(batch_of(item)) == head)
 }
 
 /// How many items from the front of the queue fit in one batch whose serialized length,
@@ -108,6 +124,33 @@ mod tests {
 		});
 		assert_eq!(leading_items_that_fit(sizes, 0, 1000, Some(3)), 3);
 		assert_eq!(measured, 3);
+	}
+
+	#[test]
+	fn test_head_batch_is_the_run_sharing_the_heads_number() {
+		let run = |queue: &[u64]| -> Vec<u64> {
+			let queue: VecDeque<u64> = queue.iter().copied().collect();
+			head_batch(&queue, |&b| b).copied().collect()
+		};
+		assert_eq!(run(&[3, 3, 4, 4, 3]), vec![3, 3]);
+		assert_eq!(run(&[5]), vec![5]);
+		assert_eq!(run(&[1, 2, 3]), vec![1]);
+		assert_eq!(run(&[7, 7, 7]), vec![7, 7, 7]);
+		assert!(run(&[]).is_empty());
+	}
+
+	#[test]
+	fn test_head_batch_is_lazy() {
+		let queue: VecDeque<u64> = vec![0; 1000].into();
+		let looked = std::cell::Cell::new(0);
+		let taken = head_batch(&queue, |&b| {
+			looked.set(looked.get() + 1);
+			b
+		})
+		.take(3)
+		.count();
+		// The head's own number, then one per item taken.
+		assert_eq!((taken, looked.get()), (3, 4));
 	}
 
 	#[test]

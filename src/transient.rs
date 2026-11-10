@@ -230,4 +230,42 @@ impl<T> TransientDB<T> {
 	pub fn remove(&self, data: &[Box<dyn Equivalent>]) -> Result<()> {
 		self.store.lock().unwrap().remove(data)
 	}
+
+	/// Ends the current batch: items appended before this call and items appended after
+	/// it are never returned in the same batch, in any store. A batch is one file for
+	/// `DirectoryStore` and one fetched `Value` for `MemoryStore` and `WebStore`, whose
+	/// `fetch` stops at the boundary and so can return fewer items than asked for.
+	///
+	/// With nothing appended since the store was created, since the last `end_batch`, or
+	/// since everything was removed or reset, this does nothing and returns `Ok(())`;
+	/// calling it several times in a row is the same as calling it once. It never creates
+	/// an empty batch, and it fetches, returns and removes nothing.
+	///
+	/// # Examples
+	/// ```
+	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
+	/// use serde_json::json;
+	///
+	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
+	///     envelope: Envelope::default(),
+	///     max_items: Some(100),
+	///     max_fetch_size: 1024,
+	///     max_fetch_items: None,
+	/// }));
+	///
+	/// db.append(json!({"user": "a", "event": "logout"})).unwrap();
+	/// db.end_batch().unwrap(); // the user changes: never send these events together
+	/// db.append(json!({"user": "b", "event": "login"})).unwrap();
+	///
+	/// // The first fetch stops at the boundary, though more items are stored.
+	/// let first = db.fetch(Some(100), None).unwrap().unwrap();
+	/// assert_eq!(first.data.unwrap()["items"], json!([{"user": "a", "event": "logout"}]));
+	/// db.remove(&first.removable.unwrap()).unwrap();
+	///
+	/// let second = db.fetch(Some(100), None).unwrap().unwrap();
+	/// assert_eq!(second.data.unwrap()["items"], json!([{"user": "b", "event": "login"}]));
+	/// ```
+	pub fn end_batch(&self) -> Result<()> {
+		self.store.lock().unwrap().end_batch()
+	}
 }

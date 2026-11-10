@@ -1,10 +1,17 @@
 //! IndexedDB plumbing for `WebStore`: the database schema, its record format, and the
 //! requests the store issues.
 //!
-//! Every record wraps one queued item as `{ "key": <u32>, "value": <item> }` in the
-//! object store [`STORE_NAME`], whose key path is `key` with no auto-increment. The
-//! store assigns every key itself, so memory and IndexedDB always agree on an item's
-//! key, and wrapping the item lets any JSON value be stored unmodified.
+//! Every record wraps one queued item as `{ "key": <u32>, "value": <item>, "batch": <u32> }`
+//! in the object store [`STORE_NAME`], whose key path is `key` with no auto-increment.
+//! The store assigns every key itself, so memory and IndexedDB always agree on an item's
+//! key, and wrapping the item lets any JSON value be stored unmodified. `batch` is the
+//! batch number the item was appended under, so `end_batch` boundaries survive a reload.
+//! Both are `u32`, which a JavaScript number holds exactly.
+//!
+//! One more record may exist, `{ "key": "boundary", "batch": <u32> }`: the batch number
+//! the store moved to at its last `end_batch`. It keeps a boundary set after the last
+//! append across a reload, when no item carries the new number yet. Its string key sorts
+//! after every numeric key, so reading the object store returns it after the items.
 //!
 //! Writes are issued synchronously by the caller and only their outcome is awaited
 //! in the background. IndexedDB runs read/write transactions on the same object store
@@ -21,19 +28,23 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransactionMode};
 
 /// Version 1 stored items in-line under an auto-incremented `_idb_key`. Version 2
-/// stores wrapper records keyed by the store's own counter.
-pub(super) const DB_VERSION: u32 = 2;
+/// stores wrapper records keyed by the store's own counter. Version 3 adds each item's
+/// batch number, and the boundary record.
+pub(super) const DB_VERSION: u32 = 3;
 pub(super) const STORE_NAME: &str = "events";
 const KEY_PATH: &str = "key";
 const VALUE_FIELD: &str = "value";
+const BATCH_FIELD: &str = "batch";
+/// The key of the boundary record; every item's key is a number.
+pub(super) const BOUNDARY_KEY: &str = "boundary";
 
 fn js_error(what: &str, e: JsValue) -> Error {
 	Error::other(format!("{what}: {e:?}"))
 }
 
-/// The record stored for the item `value` under `key`.
-pub(super) fn record(key: u32, value: &Value) -> Value {
-	json!({ (KEY_PATH): key, (VALUE_FIELD): value })
+/// The record stored for the item `value` under `key`, appended under `batch`.
+pub(super) fn record(key: u32, batch: u32, value: &Value) -> Value {
+	json!({ (KEY_PATH): key, (VALUE_FIELD): value, (BATCH_FIELD): batch })
 }
 
 /// The key of a record, if it has one this store could have assigned.
@@ -42,10 +53,23 @@ pub(super) fn record_key(record: &Value) -> Option<u32> {
 	u32::try_from(key).ok()
 }
 
-/// The item a record wraps, if the record has the wrapper shape.
+/// The batch number of a record, if it has one this store could have assigned.
+pub(super) fn record_batch(record: &Value) -> Option<u32> {
+	let batch = record.get(BATCH_FIELD)?.as_u64()?;
+	u32::try_from(batch).ok()
+}
+
+/// The item a record wraps, if the record has the wrapper shape: a key, a batch number
+/// and a value.
 pub(super) fn record_value(record: &Value) -> Option<&Value> {
 	record_key(record)?;
+	record_batch(record)?;
 	record.get(VALUE_FIELD)
+}
+
+/// Whether a record is the boundary record, valid or not.
+pub(super) fn is_boundary(record: &Value) -> bool {
+	record.get(KEY_PATH).and_then(Value::as_str) == Some(BOUNDARY_KEY)
 }
 
 /// Opens (or creates, or upgrades) the database `name` at [`DB_VERSION`].
@@ -130,13 +154,25 @@ fn begin_write(db: &IdbDatabase) -> Result<(IdbTransaction, IdbObjectStore)> {
 	Ok((transaction, store))
 }
 
-/// Issues the add of `value` under `key`.
-pub(super) fn add(db: &IdbDatabase, key: u32, value: &Value) -> Result<IdbTransaction> {
+fn to_js(record: &Value) -> Result<JsValue> {
+	let json =
+		serde_json::to_string(record).map_err(|e| Error::other(format!("JSON error: {e:?}")))?;
+	js_sys::JSON::parse(&json).map_err(|e| js_error("JS JSON parse error", e))
+}
+
+/// Issues the add of `value` under `key`, appended under `batch`.
+pub(super) fn add(db: &IdbDatabase, key: u32, batch: u32, value: &Value) -> Result<IdbTransaction> {
 	let (transaction, store) = begin_write(db)?;
-	let json = serde_json::to_string(&record(key, value))
-		.map_err(|e| Error::other(format!("JSON error: {e:?}")))?;
-	let js_value = js_sys::JSON::parse(&json).map_err(|e| js_error("JS JSON parse error", e))?;
+	let js_value = to_js(&record(key, batch, value))?;
 	store.add(&js_value).map_err(|e| js_error("Add error", e))?;
+	Ok(transaction)
+}
+
+/// Issues the write of the boundary record, replacing any earlier one.
+pub(super) fn put_boundary(db: &IdbDatabase, batch: u32) -> Result<IdbTransaction> {
+	let (transaction, store) = begin_write(db)?;
+	let js_value = to_js(&json!({ (KEY_PATH): BOUNDARY_KEY, (BATCH_FIELD): batch }))?;
+	store.put(&js_value).map_err(|e| js_error("Put error", e))?;
 	Ok(transaction)
 }
 
