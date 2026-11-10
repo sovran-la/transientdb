@@ -14,7 +14,7 @@ async fn web_db(db_name: &str, max_fetch_size: usize) -> TransientDB<Value> {
 		WebStore::new(WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: db_name.to_string(),
-			max_items: 10_000,
+			max_items: Some(10_000),
 			max_fetch_size,
 			max_fetch_items: None,
 		})

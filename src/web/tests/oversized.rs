@@ -97,7 +97,7 @@ async fn test_small_per_call_max_bytes_returns_none_without_wedging() {
 #[wasm_bindgen_test]
 async fn test_rejected_item_does_not_trigger_drop_oldest() {
 	let mut config = config("test-oversized-max-items", 200, KEY);
-	config.max_items = 3;
+	config.max_items = Some(3);
 	let mut store = fresh_store_with(config).await;
 	for tag in 0..3 {
 		store.append(item_of_len(20, tag)).unwrap();

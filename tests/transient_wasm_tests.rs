@@ -16,7 +16,7 @@ fn test_config(db_name: &str) -> WebConfig {
 	WebConfig {
 		write_key: "test-key".to_string(),
 		database_name: db_name.to_string(),
-		max_items: 1000,
+		max_items: Some(1000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
 	}
@@ -363,7 +363,7 @@ async fn test_transientdb_max_items_eviction() {
 	let config = WebConfig {
 		write_key: "test-key".to_string(),
 		database_name: "test-max-items".to_string(),
-		max_items: 5, // Small limit
+		max_items: Some(5), // Small limit
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
 	};
@@ -591,5 +591,35 @@ async fn test_transientdb_fetch_item_limit() {
 	}
 	assert_eq!(sizes, vec![8, 8, 4]);
 	assert_eq!(seen, (0..20).collect::<Vec<_>>());
+	assert!(!db.has_data());
+}
+
+#[wasm_bindgen_test]
+async fn test_transientdb_unbounded_store_never_drops() {
+	let mut config = test_config("test-transientdb-unbounded");
+	config.max_items = None;
+	config.max_fetch_size = 16 * 1024;
+	let store = WebStore::new(config).await;
+	let db = TransientDB::new(store);
+	// Discard anything hydrated from a previous run.
+	db.reset();
+
+	for i in 0..3000 {
+		db.append(json!({"index": i})).unwrap();
+	}
+
+	let mut seen = Vec::new();
+	while let Some(result) = db.fetch(None, None).unwrap() {
+		let batch: Value = result.data.unwrap();
+		seen.extend(
+			batch["batch"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|v| v["index"].as_i64().unwrap()),
+		);
+		db.remove(&result.removable.unwrap()).unwrap();
+	}
+	assert_eq!(seen, (0..3000).collect::<Vec<_>>());
 	assert!(!db.has_data());
 }

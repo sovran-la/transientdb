@@ -736,6 +736,7 @@ mod tests {
 	use tempfile::TempDir;
 
 	mod base_filename;
+	mod capacity;
 	mod ceiling;
 	mod deferred;
 	mod depth;

@@ -46,7 +46,7 @@ impl<T> TransientDB<T> {
 	///
 	/// let config = MemoryConfig {
 	///     write_key: "my-store".into(),
-	///     max_items: 1000,
+	///     max_items: Some(1000),
 	///     max_fetch_size: 1024 * 1024, // 1MB
 	///     max_fetch_items: None,
 	/// };
@@ -77,7 +77,7 @@ impl<T> TransientDB<T> {
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
 	///     write_key: "test".into(),
-	///     max_items: 100,
+	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
 	/// }));
@@ -99,7 +99,7 @@ impl<T> TransientDB<T> {
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
 	///     write_key: "test".into(),
-	///     max_items: 100,
+	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
 	/// }));
@@ -126,7 +126,7 @@ impl<T> TransientDB<T> {
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
 	///     write_key: "test".into(),
-	///     max_items: 100,
+	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
 	/// }));
@@ -164,7 +164,7 @@ impl<T> TransientDB<T> {
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
 	///     write_key: "test".into(),
-	///     max_items: 100,
+	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
 	/// }));
@@ -210,7 +210,7 @@ impl<T> TransientDB<T> {
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
 	///     write_key: "test".into(),
-	///     max_items: 100,
+	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
 	/// }));
