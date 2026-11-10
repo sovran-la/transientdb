@@ -69,6 +69,15 @@ items, and the data stays in the store until you pass `removable` to `remove()`.
 again before removing returns the same items. Remove a batch only once it has been
 processed (for example, after the upload succeeded), so a failure never loses data.
 
+`remove()` acts only on removables issued by the same store instance, and silently ignores
+anything else (returning `Ok`, as it does for items already removed). Every MemoryStore and
+WebStore instance has its own identity, so another instance's removables remove nothing,
+even a WebStore opened on the same `database_name`: remove items through the instance that
+fetched them. DirectoryStore deletes a path only if it is one of its own finished files in
+its own storage directory (compared by canonical path, so a relative and an absolute
+spelling both work); another store's file, its own open or unfinished file, and anything
+outside the directory are left in place.
+
 ## Usage
 
 ### Memory Store Example
