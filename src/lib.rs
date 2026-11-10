@@ -1,6 +1,8 @@
 mod batch;
 mod directory;
 mod envelope;
+#[cfg(test)]
+mod item_samples;
 mod memory;
 mod transient;
 

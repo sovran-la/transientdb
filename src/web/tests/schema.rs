@@ -43,6 +43,11 @@ async fn create_version_1(db_name: &str) -> IdbDatabase {
 	idb::await_request::<IdbDatabase>(&request).await.unwrap()
 }
 
+/// `item` as a record holds it: its compact JSON text, as a string.
+pub(super) fn text(item: Value) -> Value {
+	Value::String(item.to_string())
+}
+
 /// Adds raw JSON `records` to `db`'s object store and waits for them to commit.
 pub(super) async fn add_raw(db: &IdbDatabase, records: &[Value]) {
 	let transaction = db
@@ -124,11 +129,11 @@ async fn test_records_without_wrapper_shape_are_skipped() {
 	add_raw(
 		&db,
 		&[
-			json!({"key": 3, "value": "ok", "batch": 0}),
+			json!({"key": 3, "value": text(json!("ok")), "batch": 0}),
 			json!({"key": 10, "batch": 0}),
-			json!({"key": 12.5, "value": "fractional key", "batch": 0}),
-			json!({"key": "text", "value": "string key", "batch": 0}),
-			json!({"key": 4, "value": null, "batch": 0}),
+			json!({"key": 12.5, "value": text(json!("fractional key")), "batch": 0}),
+			json!({"key": "text", "value": text(json!("string key")), "batch": 0}),
+			json!({"key": 4, "value": text(json!(null)), "batch": 0}),
 		],
 	)
 	.await;
@@ -193,7 +198,7 @@ async fn test_record_at_the_last_key_is_kept_and_never_reused() {
 	let db = store.db.clone().unwrap();
 	add_raw(
 		&db,
-		&[json!({"key": u32::MAX, "value": "at the end", "batch": 0})],
+		&[json!({"key": u32::MAX, "value": text(json!("at the end")), "batch": 0})],
 	)
 	.await;
 
@@ -205,7 +210,7 @@ async fn test_record_at_the_last_key_is_kept_and_never_reused() {
 	settle().await;
 	assert_eq!(
 		idb::read_all(&db).await.unwrap(),
-		vec![json!({"key": u32::MAX, "value": "at the end", "batch": 0})]
+		vec![json!({"key": u32::MAX, "value": text(json!("at the end")), "batch": 0})]
 	);
 
 	let result = reopened.fetch(None, None).unwrap().unwrap();

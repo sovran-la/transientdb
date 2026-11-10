@@ -125,7 +125,8 @@ pub enum PersistenceState {
 /// Events are stored in an in-memory queue for fast synchronous access,
 /// with asynchronous fire-and-forget writes to IndexedDB for persistence
 /// across page refreshes. Any JSON value can be stored; it is persisted and
-/// restored unmodified.
+/// restored unmodified. Items round-trip exactly: each is persisted as JSON text, so one
+/// restored after a reload equals the appended value and serializes to the same bytes.
 ///
 /// When items are fetched, they are packaged into one JSON object shaped by
 /// [`WebConfig::envelope`]: the items in an array under its items key, its fields, and its
@@ -295,8 +296,9 @@ impl WebStore {
 	/// one stored, on an item or on the boundary record, so a reload is not a boundary
 	/// by itself, but every `end_batch` that reached IndexedDB still is.
 	///
-	/// A record without the wrapper shape (or a boundary record without a valid batch
-	/// number) is skipped with a warning; its key, if it has one, still counts, so no new
+	/// A record without the wrapper shape, including one whose value is not a string of
+	/// JSON text (or a boundary record without a valid batch number), is skipped with a
+	/// warning; its key, if it has one, still counts, so no new
 	/// item is given it.
 	async fn hydrate(&mut self, db: &IdbDatabase) -> Result<()> {
 		for record in idb::read_all(db).await? {
@@ -316,11 +318,7 @@ impl WebStore {
 			match (idb::record_key(&record), batch, idb::record_value(&record)) {
 				(Some(key), Some(batch), Some(value)) => {
 					self.current_batch = self.current_batch.max(batch);
-					self.items.push_back(StoredEvent {
-						key,
-						batch,
-						value: value.clone(),
-					});
+					self.items.push_back(StoredEvent { key, batch, value });
 				}
 				_ => web_sys::console::warn_1(
 					&"Skipping an IndexedDB record that is not a stored item".into(),
@@ -586,6 +584,7 @@ mod tests {
 	mod end_batch_limits;
 	mod end_batch_reload;
 	mod envelope;
+	mod exact_items;
 	mod foreign_removables;
 	mod head_drop;
 	mod isolation;

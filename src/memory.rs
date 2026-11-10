@@ -331,6 +331,7 @@ mod tests {
 	mod end_batch;
 	mod end_batch_limits;
 	mod envelope;
+	mod exact_items;
 	mod foreign_removables;
 	mod oversized;
 	mod repeat;

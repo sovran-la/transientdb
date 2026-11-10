@@ -98,12 +98,7 @@ async fn test_memory_keys_are_the_indexeddb_keys() {
 	let records = idb::read_all(&db).await.unwrap();
 	let stored: Vec<(u32, Value)> = records
 		.iter()
-		.map(|r| {
-			(
-				idb::record_key(r).unwrap(),
-				idb::record_value(r).unwrap().clone(),
-			)
-		})
+		.map(|r| (idb::record_key(r).unwrap(), idb::record_value(r).unwrap()))
 		.collect();
 	let in_memory: Vec<(u32, Value)> = store
 		.items

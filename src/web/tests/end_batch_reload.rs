@@ -1,7 +1,7 @@
 //! `end_batch` boundaries persist: every record carries its batch number, and the
 //! boundary record keeps one set after the last append. A reload alone is no boundary.
 
-use super::schema::{add_raw, delete_database, factory, indexed_db_available};
+use super::schema::{add_raw, delete_database, factory, indexed_db_available, text};
 use super::support::*;
 use super::*;
 use web_sys::{IdbOpenDbRequest, IdbRequest};
@@ -162,13 +162,13 @@ async fn test_records_without_a_valid_batch_number_are_skipped() {
 	add_raw(
 		&db,
 		&[
-			json!({"key": 0, "value": "ok", "batch": 0}),
-			json!({"key": 1, "value": "no batch"}),
-			json!({"key": 2, "value": "negative", "batch": -1}),
-			json!({"key": 3, "value": "fractional", "batch": 1.5}),
-			json!({"key": 4, "value": "too large", "batch": 1u64 << 32}),
-			json!({"key": 5, "value": "text", "batch": "1"}),
-			json!({"key": 6, "value": "ok too", "batch": 2}),
+			json!({"key": 0, "value": text(json!("ok")), "batch": 0}),
+			json!({"key": 1, "value": text(json!("no batch"))}),
+			json!({"key": 2, "value": text(json!("negative")), "batch": -1}),
+			json!({"key": 3, "value": text(json!("fractional")), "batch": 1.5}),
+			json!({"key": 4, "value": text(json!("too large")), "batch": 1u64 << 32}),
+			json!({"key": 5, "value": text(json!("text")), "batch": "1"}),
+			json!({"key": 6, "value": text(json!("ok too")), "batch": 2}),
 			json!({"key": "boundary", "batch": "not a number"}),
 		],
 	)
