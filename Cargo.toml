@@ -16,10 +16,9 @@ default = []
 web = ["web-sys", "js-sys", "wasm-bindgen", "wasm-bindgen-futures", "futures-channel"]
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = "1.0"
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 chrono = "0.4"
-toml_edit = "0.22"
 
 # Web/WASM dependencies (optional)
 wasm-bindgen = { version = "0.2", optional = true }
@@ -57,10 +56,6 @@ getrandom = { version = "0.2", features = ["js"] }
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
-
-[[bin]]
-name = "release"
-path = "tools/release.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(wasm_bindgen_unstable_test_coverage)"] }
