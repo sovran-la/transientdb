@@ -1,8 +1,9 @@
-use crate::{DataResult, DataStore, Equivalent};
+use crate::{batch, DataResult, DataStore, Equivalent};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use serde_json::Value;
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Result;
 
 impl Equivalent for Value {
@@ -12,6 +13,27 @@ impl Equivalent for Value {
 		} else {
 			false
 		}
+	}
+
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+}
+
+/// A queued item and its sequence number, unique within its store.
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedItem {
+	seq: u64,
+	value: Value,
+}
+
+/// A removable from `MemoryStore::fetch`: the sequence number of one fetched item.
+#[derive(Debug, PartialEq)]
+struct MemoryKey(u64);
+
+impl Equivalent for MemoryKey {
+	fn equals(&self, other: &dyn Equivalent) -> bool {
+		other.as_any().downcast_ref::<MemoryKey>() == Some(self)
 	}
 
 	fn as_any(&self) -> &dyn Any {
@@ -46,8 +68,17 @@ pub struct MemoryConfig {
 	/// Once this limit is reached, adding new items will remove the oldest items to make space.
 	/// This does not limit how many items a single fetch returns; see `max_fetch_items`.
 	pub max_items: usize,
-	/// Maximum size in bytes that can be fetched in a single operation.
-	/// This prevents memory spikes during fetch operations by limiting the amount of data returned.
+	/// Maximum size in bytes of the batch a single fetch returns, unless `fetch` is given
+	/// its own `max_bytes`.
+	///
+	/// This is a hard ceiling on the whole batch serialized compactly with
+	/// `serde_json::to_string`: envelope (`sentAt`, `writeKey`), every item, and every
+	/// separator count. An item too large to fit in a batch by itself under this limit is
+	/// rejected by `append` with `ErrorKind::InvalidInput`, so every stored item can be
+	/// fetched.
+	///
+	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once the
+	/// envelope is counted (the envelope grows with `write_key`'s length).
 	pub max_fetch_size: usize,
 	/// Maximum number of items returned by a single fetch (the size of one batch).
 	/// When `fetch` is also given a `count`, the smaller of the two applies.
@@ -58,17 +89,29 @@ pub struct MemoryConfig {
 
 /// A FIFO data store that keeps items in memory.
 ///
-/// Items are stored until fetched or until max_items is reached, at which point
-/// older items are removed to make space for new ones. The store maintains data in a
-/// queue structure and supports concurrent access.
+/// Items are stored until a fetched batch is passed to `remove`, or until max_items is
+/// reached, at which point older items are removed to make space for new ones. `fetch`
+/// itself removes nothing. The store maintains data in a queue structure and supports
+/// concurrent access.
 ///
 /// When items are fetched, they are packaged into a JSON batch with metadata including:
 /// - A batch array containing the items
 /// - A timestamp indicating when the batch was created
 /// - The store's write key
+///
+/// A fetched batch, serialized compactly, is never larger than the byte limit in effect
+/// for that fetch.
+///
+/// Every appended item is a distinct entry, even if it equals another: `remove` deletes
+/// exactly the items a fetch returned, never an identical item still waiting.
 pub struct MemoryStore {
 	config: MemoryConfig,
-	items: VecDeque<Value>,
+	items: VecDeque<QueuedItem>,
+	/// The sequence number the next appended item gets
+	next_seq: u64,
+	/// The largest serialized item that fits alone in a batch under `max_fetch_size`,
+	/// whatever the timestamp.
+	max_item_size: usize,
 }
 
 impl MemoryStore {
@@ -78,6 +121,8 @@ impl MemoryStore {
 	/// * If max_fetch_size is less than 100 bytes
 	/// * If max_items is 0
 	/// * If max_fetch_items is `Some(0)`
+	/// * If max_fetch_size leaves no room for even a 1-byte item once the batch
+	///   envelope (which grows with `write_key`) is counted
 	pub fn new(config: MemoryConfig) -> Self {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
@@ -88,33 +133,94 @@ impl MemoryStore {
 		if config.max_fetch_items == Some(0) {
 			panic!("max_fetch_items = Some(0)? Fetching nothing, efficiently, forever. Bold.");
 		}
+		let envelope_len = Self::widest_envelope_len(&config.write_key);
+		if envelope_len + 1 > config.max_fetch_size {
+			panic!("max_fetch_size is all envelope and no room for an item? That's packaging, not a batch.");
+		}
 
 		Self {
+			max_item_size: config.max_fetch_size - envelope_len,
 			config,
 			items: VecDeque::new(),
+			next_seq: 0,
 		}
+	}
+
+	/// The `sentAt` value for a batch created at `now`.
+	fn sent_at(now: DateTime<Utc>) -> String {
+		now.to_rfc3339()
+	}
+
+	/// The envelope length with the widest `sentAt` this store can produce.
+	///
+	/// RFC3339 output drops trailing zero groups from the fractional seconds, so its
+	/// width varies; a timestamp with nonzero nanoseconds prints all nine digits.
+	fn widest_envelope_len(write_key: &str) -> usize {
+		let widest = Utc
+			.timestamp_opt(0, 123_456_789)
+			.single()
+			.expect("valid timestamp");
+		batch::envelope_len(&Self::sent_at(widest), write_key)
 	}
 
 	/// Creates a JSON batch object containing the provided items and metadata.
 	///
 	/// # Arguments
 	/// * `items` - Slice of JSON values to include in the batch
+	/// * `sent_at` - The batch's `sentAt` value, the same one its size was measured with
 	///
 	/// # Returns
 	/// A JSON value containing:
 	/// - A `batch` array of the provided items
 	/// - A `sentAt` timestamp in RFC3339 format
 	/// - The store's `writeKey`
-	fn create_batch(&self, items: &[Value]) -> Value {
+	fn create_batch(&self, items: &[&Value], sent_at: &str) -> Value {
 		json!({
 			"batch": items,
-			"sentAt": chrono::Utc::now().to_rfc3339(),
+			"sentAt": sent_at,
 			"writeKey": self.config.write_key
 		})
 	}
 
 	fn get_item_size(item: &Value) -> usize {
 		item.to_string().len()
+	}
+
+	/// `fetch` with the batch's `sentAt` supplied, so its envelope length is known.
+	fn fetch_with_sent_at(
+		&mut self,
+		count: Option<usize>,
+		max_bytes: Option<usize>,
+		sent_at: &str,
+	) -> Option<DataResult<Value>> {
+		// Unlike WebStore, no head item can be too large for max_fetch_size: append
+		// rejects such items and nothing else adds to the queue.
+		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
+		let count = batch::effective_count(count, self.config.max_fetch_items);
+		let envelope_len = batch::envelope_len(sent_at, &self.config.write_key);
+		let num_items = batch::leading_items_that_fit(
+			self.items
+				.iter()
+				.map(|item| Self::get_item_size(&item.value)),
+			envelope_len,
+			max_bytes,
+			count,
+		);
+
+		if num_items == 0 {
+			return None;
+		}
+
+		let fetched = self.items.iter().take(num_items);
+		let items: Vec<&Value> = fetched.clone().map(|item| &item.value).collect();
+		let removable: Vec<Box<dyn Equivalent>> = fetched
+			.map(|item| Box::new(MemoryKey(item.seq)) as Box<dyn Equivalent>)
+			.collect();
+
+		Some(DataResult {
+			data: Some(self.create_batch(&items, sent_at)),
+			removable: Some(removable),
+		})
 	}
 }
 
@@ -129,8 +235,33 @@ impl DataStore for MemoryStore {
 		self.items.clear();
 	}
 
+	/// Appends an item, dropping the oldest items beyond `max_items`.
+	///
+	/// # Errors
+	/// Returns an `InvalidInput` error, leaving the store unchanged, if the serialized
+	/// item cannot fit in a batch by itself under `max_fetch_size`. Returns an error,
+	/// leaving the store unchanged, if sequence numbers are exhausted: they never wrap,
+	/// so no two items can share one.
 	fn append(&mut self, data: Value) -> Result<()> {
-		self.items.push_back(data);
+		let item_size = Self::get_item_size(&data);
+		if item_size > self.max_item_size {
+			return Err(batch::item_too_large(
+				item_size,
+				self.max_item_size,
+				"max_fetch_size",
+				self.config.max_fetch_size,
+			));
+		}
+		let next_seq = self
+			.next_seq
+			.checked_add(1)
+			.ok_or_else(|| std::io::Error::other("MemoryStore sequence numbers exhausted"))?;
+
+		self.items.push_back(QueuedItem {
+			seq: self.next_seq,
+			value: data,
+		});
+		self.next_seq = next_seq;
 
 		while self.items.len() > self.config.max_items {
 			self.items.pop_front();
@@ -139,59 +270,32 @@ impl DataStore for MemoryStore {
 		Ok(())
 	}
 
+	/// Returns the oldest items as one batch, without removing them.
+	///
+	/// The batch, serialized compactly, is at most `max_bytes` (or `max_fetch_size` if
+	/// `None`) bytes, envelope included, and holds at most `count` and `max_fetch_items`
+	/// items. A `max_bytes` too small for the oldest item returns `Ok(None)` even though
+	/// the store has data; a fetch at the configured `max_fetch_size` always returns it.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
 		max_bytes: Option<usize>,
 	) -> Result<Option<DataResult<Self::Output>>> {
-		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
-		// The configured item limit caps the caller's count; a larger count is clamped.
-		let count = match (count, self.config.max_fetch_items) {
-			(Some(count), Some(limit)) => Some(count.min(limit)),
-			(count, limit) => count.or(limit),
-		};
-		let mut accumulated_size = 0;
-		let mut num_items = 0;
-
-		// Just look at items without draining
-		for item in self.items.iter() {
-			let item_size = Self::get_item_size(item);
-			if accumulated_size + item_size > max_bytes {
-				break;
-			}
-			if let Some(count) = count {
-				if num_items >= count {
-					break;
-				}
-			}
-			accumulated_size += item_size;
-			num_items += 1;
-		}
-
-		if num_items == 0 {
-			return Ok(None);
-		}
-
-		// Create vectors of items and removable references
-		let items: Vec<Value> = self.items.iter().take(num_items).cloned().collect();
-
-		let removable: Vec<Box<dyn Equivalent>> = items
-			.iter()
-			.map(|item| Box::new(item.clone()) as Box<dyn Equivalent>)
-			.collect();
-
-		let batch = self.create_batch(&items);
-
-		Ok(Some(DataResult {
-			data: Some(batch),
-			removable: Some(removable),
-		}))
+		let sent_at = Self::sent_at(Utc::now());
+		Ok(self.fetch_with_sent_at(count, max_bytes, &sent_at))
 	}
 
+	/// Removes exactly the items a previous `fetch` returned.
+	///
+	/// Identical items that were not fetched stay queued. Items already gone (removed
+	/// before, or dropped by `max_items` since the fetch) are skipped.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
-		// Remove items that match the provided equivalents
-		self.items
-			.retain(|item| !data.iter().any(|removable| removable.equals(item)));
+		let fetched: HashSet<u64> = data
+			.iter()
+			.filter_map(|removable| removable.as_any().downcast_ref::<MemoryKey>())
+			.map(|key| key.0)
+			.collect();
+		self.items.retain(|item| !fetched.contains(&item.seq));
 		Ok(())
 	}
 }
@@ -202,6 +306,13 @@ mod tests {
 	use crate::DataStore;
 	use serde_json::{json, Value};
 	use std::io::Result;
+
+	mod ceiling;
+	mod duplicates;
+	mod oversized;
+	mod repeat;
+	mod support;
+	mod write_key;
 
 	#[test]
 	fn test_basic_operations() -> Result<()> {
@@ -368,37 +479,27 @@ mod tests {
 		// Small item ~30-40 bytes
 		store.append(json!({"type": "small", "value": "tiny"}))?;
 
-		// Large item ~500 bytes
-		store.append(json!({
-			"type": "large",
-			"value": "x".repeat(400),  // Make it obviously too big
-		}))?;
+		// Large item ~430 bytes can never fit in a 300 byte batch, so append rejects it
+		// rather than letting it sit unfetchable at the head of the queue.
+		let err = store
+			.append(json!({
+				"type": "large",
+				"value": "x".repeat(400),  // Make it obviously too big
+			}))
+			.unwrap_err();
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
 		// First fetch should only get the small item
-		if let Some(result) = store.fetch(None, None)? {
-			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
-			assert_eq!(items.len(), 1, "Should only fetch the small item");
-			assert_eq!(items[0]["type"], "small");
+		let result = store.fetch(None, None)?.expect("small item");
+		let batch: Value = result.data.unwrap();
+		let items = batch["batch"].as_array().unwrap();
+		assert_eq!(items.len(), 1, "Should only fetch the small item");
+		assert_eq!(items[0]["type"], "small");
+		store.remove(&result.removable.unwrap())?;
 
-			// Remove the fetched item
-			if let Some(removable) = result.removable {
-				store.remove(&removable)?;
-			}
-		}
-
-		// Second fetch should get the large item
-		if let Some(result) = store.fetch(None, None)? {
-			let batch: Value = result.data.unwrap();
-			let items = batch["batch"].as_array().unwrap();
-			assert_eq!(items.len(), 1, "Should fetch the large item");
-			assert_eq!(items[0]["type"], "large");
-
-			// Remove the fetched item
-			if let Some(removable) = result.removable {
-				store.remove(&removable)?;
-			}
-		}
+		// Nothing is left behind: the large item was never stored.
+		assert!(!store.has_data());
+		assert!(store.fetch(None, None)?.is_none());
 
 		Ok(())
 	}
@@ -538,8 +639,11 @@ mod tests {
 		}
 		let item_size = MemoryStore::get_item_size(&json!({"index": 0, "padding": "x".repeat(50)}));
 
-		// Room for exactly 3 items by bytes, fewer than the item limit.
-		let indexes = fetch_indexes(&mut store, None, Some(item_size * 3 + 1))?;
+		// Room for exactly 3 items and their 2 separators by bytes, envelope included, fewer
+		// than the item limit. The widest envelope leaves the 3 fitting whatever the
+		// timestamp, and is far less than a fourth item short.
+		let envelope = MemoryStore::widest_envelope_len("test-key");
+		let indexes = fetch_indexes(&mut store, None, Some(envelope + item_size * 3 + 2))?;
 		assert_eq!(indexes, vec![0, 1, 2]);
 
 		// Byte limit large enough for all 20: the item limit still caps it.

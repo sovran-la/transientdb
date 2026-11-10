@@ -221,11 +221,18 @@ fn test_file_system_edge_cases() -> Result<()> {
 		}
 	}
 
-	// Try multiple fetches, expecting some to succeed and some to fail
-	for _ in 0..5 {
+	// Try multiple fetches, expecting some to succeed and some to fail. Each fetch has
+	// a fresh item to finish, so the validator decides each one; the special files are
+	// not the store's and are never returned.
+	for i in 0..5 {
+		let _ = db.append(json!({"before_fetch": i}));
 		match db.fetch(None, None) {
 			Ok(Some(result)) => {
 				successful_fetches += 1;
+				for file in result.data.unwrap_or_default() {
+					let name = file.file_name().unwrap().to_string_lossy().into_owned();
+					assert!(name.ends_with("-events.temp"), "fetched {name}");
+				}
 				if let Some(removable) = result.removable {
 					let _ = db.remove(&removable); // Ignore removal errors
 				}
