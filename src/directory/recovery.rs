@@ -2,7 +2,8 @@
 //!
 //! `new` only lists this store's unfinished files; nothing on disk changes until the
 //! first `fetch`, which recovers each listed file once, after any validator has been
-//! set. A file that fails to recover is logged and left for a later session.
+//! set. A file the validator rejects is deleted; one that fails to recover for any
+//! other reason is logged and left for a later session.
 
 use super::DirectoryStore;
 use serde_json::Value;
@@ -12,7 +13,8 @@ use std::path::Path;
 
 impl DirectoryStore {
 	/// Recovers every file `new` listed as left over, lowest index first, then forgets
-	/// the list. A failure recovering one file is logged and does not stop the others.
+	/// the list. A failure recovering one file is logged and does not stop the others;
+	/// a file the validator rejects is deleted, which is not a failure.
 	pub(super) fn recover_leftovers(&mut self) {
 		for path in std::mem::take(&mut self.leftovers) {
 			if let Err(e) = self.recover_file(&path) {

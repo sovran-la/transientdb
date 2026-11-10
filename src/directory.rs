@@ -79,7 +79,14 @@ pub struct DirectoryConfig {
 	pub max_file_items: Option<usize>,
 }
 
-/// Type alias for the file validator function
+/// Type alias for the file validator function.
+///
+/// The validator is given the path of each finished data file before it is renamed with
+/// `.temp`. Returning `Ok(())` accepts the file. Returning an error rejects it: the store
+/// deletes the file and every item in it, and the operation that finished the file
+/// carries on and succeeds. A rejection is never reported through `append` or `fetch`,
+/// so the validator is the one place to observe it; see
+/// [`DirectoryStore::set_file_validator`].
 pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 
 /// A data store that persists items to files in a directory.
@@ -185,13 +192,26 @@ impl DirectoryStore {
 
 	/// Sets a validator function that will be called before finalizing each data file.
 	///
-	/// The validator is called just before a file is marked as complete (renamed with .temp extension).
-	/// If the validator returns an error, the file will not be finalized and the error will be propagated.
+	/// The validator is called just before a file is marked as complete (renamed with
+	/// .temp extension), with the file's path. It runs:
+	/// - when `append` finishes the open file because the next item would not fit
+	///   (rotation),
+	/// - when `fetch` finishes the open file,
+	/// - when the first `fetch` of a session recovers or salvages the files an earlier
+	///   session left unfinished. Those are recovered by that fetch, not by `new`, so a
+	///   validator set before it sees them.
 	///
-	/// It also runs on every file an earlier session left unfinished: those are recovered
-	/// by the first `fetch`, not by `new`, so a validator set before that fetch sees them.
-	/// A recovered file it rejects is logged, left without `.temp`, and not retried until
-	/// a later session; the fetch still succeeds.
+	/// Returning `Ok(())` accepts the file. **Returning an error means "delete this file
+	/// and every item in it".** The store deletes it, and the operation that triggered
+	/// validation continues and succeeds: `append` still writes its item, to a fresh
+	/// file, and `fetch` returns the other finished files, or `Ok(None)`. Nothing about
+	/// the rejection is reported through the return value of `append` or `fetch`.
+	///
+	/// The validator is the caller's own code, and it is the one place to observe a
+	/// rejection. A caller that wants to record, count, report, or keep a copy of a
+	/// rejected file must do so inside the validator, before returning the error; once
+	/// it returns, the file is gone. The store's own notice is a single line on stderr,
+	/// which many targets (mobile apps in particular) never surface, so do not rely on it.
 	///
 	/// # Arguments
 	/// * `validator` - Function that takes a file path and returns Ok(()) if the file is valid
@@ -225,6 +245,51 @@ impl DirectoryStore {
 	///
 	///     Ok(())
 	/// });
+	/// # Ok::<(), std::io::Error>(())
+	/// ```
+	///
+	/// Recording a rejection, and keeping a copy of the file, before it is deleted:
+	/// ```
+	/// use std::fs;
+	/// use std::io;
+	/// use std::sync::atomic::{AtomicUsize, Ordering};
+	/// use std::sync::Arc;
+	/// use serde_json::json;
+	/// use transientdb::{DataStore, DirectoryConfig, DirectoryStore};
+	///
+	/// let dir = std::env::temp_dir().join("transientdb-doc-rejections");
+	/// # let _ = fs::remove_dir_all(&dir);
+	/// let quarantine = dir.join("quarantine");
+	/// fs::create_dir_all(&quarantine)?;
+	///
+	/// let mut store = DirectoryStore::new(DirectoryConfig {
+	///     write_key: "test".into(),
+	///     storage_location: dir.clone(),
+	///     base_filename: "events".into(),
+	///     max_file_size: 1024,
+	///     max_file_items: None,
+	/// })?;
+	///
+	/// let rejected = Arc::new(AtomicUsize::new(0));
+	/// let counter = rejected.clone();
+	/// let keep = quarantine.clone();
+	/// store.set_file_validator(move |path| {
+	///     if fs::read_to_string(path)?.contains("\"debug\":true") {
+	///         // Observe the rejection here: afterwards the file is deleted.
+	///         counter.fetch_add(1, Ordering::SeqCst);
+	///         fs::copy(path, keep.join(path.file_name().unwrap()))?;
+	///         return Err(io::Error::other("debug events are not uploaded"));
+	///     }
+	///     Ok(())
+	/// });
+	///
+	/// store.append(json!({"event": "test", "debug": true}))?;
+	/// // The rejection is not an error of the fetch; there is just nothing to return.
+	/// assert!(store.fetch(None, None)?.is_none());
+	/// assert_eq!(rejected.load(Ordering::SeqCst), 1);
+	/// assert_eq!(fs::read_dir(&quarantine)?.count(), 1);
+	/// assert!(!store.has_data());
+	/// # fs::remove_dir_all(&dir)?;
 	/// # Ok::<(), std::io::Error>(())
 	/// ```
 	pub fn set_file_validator<F>(&mut self, validator: F)
@@ -349,11 +414,21 @@ impl DirectoryStore {
 		self.mark_finished(path)
 	}
 
-	/// Validates a closed file, if a validator is set, and renames it with the .temp extension
+	/// Validates a closed file, if a validator is set, and renames it with the .temp
+	/// extension.
+	///
+	/// A file the validator rejects is deleted instead, with every item in it. That is
+	/// logged and is not an error: the caller carries on. Failing to delete it is logged
+	/// too; the file is still never renamed, so it is never fetched.
 	fn mark_finished(&self, path: &Path) -> Result<()> {
-		// Run validation if configured
 		if let Some(validator) = &self.file_validator {
-			validator(path)?;
+			if let Err(e) = validator(path) {
+				eprintln!("File validator rejected {:?}, deleting it: {}", path, e);
+				if let Err(e) = fs::remove_file(path) {
+					eprintln!("Failed to delete rejected file {:?}: {}", path, e);
+				}
+				return Ok(());
+			}
 		}
 
 		// Rename to .temp to mark as complete
@@ -452,10 +527,15 @@ impl DataStore for DirectoryStore {
 	/// A finished file is never larger than `max_file_size` bytes, envelope and
 	/// separators included, and never holds more than `max_file_items` items.
 	///
+	/// If the file validator rejects the file finished by rotation, that file is
+	/// deleted with every item in it, and the append still succeeds: the new item goes
+	/// into a fresh file. The rejection is not reported here; see
+	/// [`set_file_validator`](DirectoryStore::set_file_validator).
+	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, without touching any file, if the serialized
 	/// item is too large to fit even alone in a fresh file. Also propagates IO errors
-	/// and file validator errors from finishing the previous file.
+	/// from finishing the previous file.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let item = serde_json::to_vec(&data)?;
 
@@ -496,14 +576,19 @@ impl DataStore for DirectoryStore {
 	///
 	/// The first fetch of a session also recovers the files an earlier session left
 	/// unfinished, after finishing the open file and before choosing what to return, so
-	/// they come back from that same fetch in index order. The validator runs on each;
-	/// a recovered file that fails, whether rejected or for any other reason, is logged
-	/// with `eprintln!`, is not returned, and does not fail the fetch or stop the other
-	/// files from being recovered. Recovery happens once per session.
+	/// they come back from that same fetch in index order. The validator runs on each.
+	/// Recovery happens once per session. A recovered file that fails for a reason other
+	/// than the validator is logged with `eprintln!`, is not returned, and does not fail
+	/// the fetch or stop the other files from being recovered.
+	///
+	/// Any file the validator rejects, the open one or a recovered one, is deleted with
+	/// every item in it, and the fetch carries on: it returns the other finished files,
+	/// or `Ok(None)` if there are none. The rejection is not reported here; see
+	/// [`set_file_validator`](DirectoryStore::set_file_validator).
 	///
 	/// # Errors
-	/// Propagates IO errors and validator errors from finishing the open file, and IO
-	/// errors listing the directory.
+	/// Propagates IO errors from finishing the open file, and IO errors listing the
+	/// directory.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
@@ -571,6 +656,7 @@ mod tests {
 	mod oversized;
 	mod ownership;
 	mod recovery;
+	mod rejection;
 	mod support;
 	mod write_key;
 
@@ -1218,14 +1304,25 @@ mod tests {
 	}
 
 	#[test]
-	fn test_validator_failure_on_item_limit_rotation_propagates() -> Result<()> {
+	fn test_validator_rejection_on_item_limit_rotation_deletes_the_file() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(2)))?;
 		store.set_file_validator(|_| Err(io::Error::other("rejected")));
 
 		append_indexed(&mut store, 0..2)?;
-		let err = store.append(json!({"index": 2})).unwrap_err();
-		assert_eq!(err.to_string(), "rejected");
+		let full = store.current_path.clone().unwrap();
+		// Rotation's rejection deletes the full file; item 2 goes into a fresh one.
+		store.append(json!({"index": 2}))?;
+		assert!(!full.exists());
+		assert_eq!(store.current_items, 1);
+		assert_eq!(
+			store.sorted_files(true)?,
+			vec![store.current_path.clone().unwrap()]
+		);
+		// The fetch rejects that one too: nothing is left, and nothing is returned.
+		assert!(store.fetch(None, None)?.is_none());
+		assert!(store.sorted_files(true)?.is_empty());
+		assert!(!store.has_data());
 		Ok(())
 	}
 

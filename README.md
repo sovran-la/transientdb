@@ -174,6 +174,45 @@ if let Some(result) = db.fetch(None, None)? {
 }
 ```
 
+### File Validation (DirectoryStore)
+
+A validator set with `set_file_validator` is your own code. It is given the path of each
+finished file before the file is marked ready (renamed with `.temp`), and it runs:
+
+- when `append` finishes the open file because the next item would not fit (rotation),
+- when `fetch` finishes the open file,
+- when the first `fetch` of a session recovers or salvages files an earlier session left
+  unfinished. Recovery happens there, not in `DirectoryStore::new`, so a validator set
+  right after `new` sees those files too.
+
+Returning `Ok(())` accepts the file. **Returning an error means "delete this file and
+every item in it".** The store deletes it, and the operation that triggered validation
+continues and succeeds: `append` still writes its item, to a fresh file, and `fetch`
+returns the other finished files, or nothing. A rejection is never reported through the
+return value of `append` or `fetch`.
+
+The validator is therefore the one place to observe a rejection. If you want to record,
+count, report, or keep a copy of a rejected file, do it inside the validator, before you
+return the error: once it returns, the file is gone. The store's own notice is a single
+line on stderr, which many targets (mobile apps in particular) never surface, so do not
+rely on it.
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+let rejected = Arc::new(AtomicUsize::new(0));
+let counter = rejected.clone();
+store.set_file_validator(move |path| {
+    let content = std::fs::read_to_string(path)?;
+    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+        counter.fetch_add(1, Ordering::SeqCst); // record it now; the file is about to go
+        return Err(std::io::Error::other("not valid JSON"));
+    }
+    Ok(())
+});
+```
+
 ### Web Store Example (WASM)
 
 ```rust

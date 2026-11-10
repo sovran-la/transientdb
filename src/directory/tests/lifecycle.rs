@@ -161,7 +161,7 @@ fn test_validator_runs_on_byte_ceiling_rotation() -> Result<()> {
 }
 
 #[test]
-fn test_validator_failure_on_byte_ceiling_rotation_propagates() -> Result<()> {
+fn test_validator_rejection_on_byte_ceiling_rotation_deletes_the_file() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 200)?;
 	store.set_file_validator(|_| Err(io::Error::other("rejected")));
@@ -169,8 +169,16 @@ fn test_validator_failure_on_byte_ceiling_rotation_propagates() -> Result<()> {
 	for _ in 0..3 {
 		store.append(item_of_len(40))?;
 	}
-	let err = store.append(item_of_len(40)).unwrap_err();
-	assert_eq!(err.to_string(), "rejected");
+	let full = store.current_path.clone().unwrap();
+	// The rotation's rejection deletes the full file; the fourth item starts a new one.
+	let fourth = item_of_len(40);
+	store.append(fourth.clone())?;
+	assert!(!full.exists());
+	let open = store.current_path.clone().unwrap();
+	assert_ne!(open, full);
+	assert_eq!((store.current_items, store.current_size), (1, OPENING + 40));
+	assert_eq!(files_on_disk(&temp_dir)?, vec![open.clone()]);
+	assert_eq!(fs::read(&open)?, unclosed(&[fourth]));
 	Ok(())
 }
 
@@ -226,11 +234,11 @@ fn test_validator_failure_does_not_corrupt_next_file() -> Result<()> {
 	});
 
 	append_indexed(&mut store, 0..1)?;
-	// Rotation finishes file 0; its validator rejects it, so the append fails.
-	let err = store.append(json!({"index": 1})).unwrap_err();
-	assert_eq!(err.to_string(), "rejected once");
+	// Rotation finishes file 0; its validator rejects it, deleting it, and the append
+	// still writes item 1, to a fresh file.
+	append_indexed(&mut store, 1..2)?;
 
-	// The store must start a clean file, not continue the abandoned one's accounting.
+	// The store must start a clean file, not continue the deleted one's accounting.
 	append_indexed(&mut store, 2..4)?;
 	let files = store.fetch(None, None)?.unwrap().data.unwrap();
 	let mut indexes = Vec::new();
@@ -239,6 +247,7 @@ fn test_validator_failure_does_not_corrupt_next_file() -> Result<()> {
 			indexes.push(item["index"].as_u64().unwrap());
 		}
 	}
-	assert_eq!(indexes, vec![2, 3]);
+	assert_eq!(indexes, vec![1, 2, 3]);
+	assert_eq!(files_on_disk(&temp_dir)?.len(), 3);
 	Ok(())
 }
