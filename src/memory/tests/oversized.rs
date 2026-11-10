@@ -92,7 +92,7 @@ fn test_small_per_call_max_bytes_returns_none_without_wedging() -> Result<()> {
 fn test_rejected_item_does_not_trigger_drop_oldest() -> Result<()> {
 	let mut store = MemoryStore::new(MemoryConfig {
 		write_key: KEY.to_string(),
-		max_items: 3,
+		max_items: Some(3),
 		max_fetch_size: 200,
 		max_fetch_items: None,
 	});

@@ -24,7 +24,7 @@ fn directory_db(dir: &TempDir, max_file_size: usize) -> Result<TransientDB<Vec<P
 fn memory_db(max_fetch_size: usize) -> TransientDB<Value> {
 	TransientDB::new(MemoryStore::new(MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items: 100_000,
+		max_items: Some(100_000),
 		max_fetch_size,
 		max_fetch_items: None,
 	}))

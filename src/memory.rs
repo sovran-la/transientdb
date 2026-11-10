@@ -56,7 +56,7 @@ impl Equivalent for MemoryKey {
 ///
 /// let config = MemoryConfig {
 ///     write_key: "my-store".into(),
-///     max_items: 1000,
+///     max_items: Some(1000),
 ///     max_fetch_size: 1024 * 1024, // 1MB
 ///     max_fetch_items: Some(8),    // at most 8 items per fetch
 /// };
@@ -68,10 +68,17 @@ pub struct MemoryConfig {
 	/// Key used to identify writes to this store.
 	/// This is included in the metadata of each batch of data fetched from the store.
 	pub write_key: String,
-	/// Total capacity: the maximum number of items held in the store before old items are removed.
-	/// Once this limit is reached, adding new items will remove the oldest items to make space.
+	/// Total capacity: the maximum number of items the store holds, or `None` for no cap.
+	///
+	/// `None` means unbounded: nothing is ever dropped for capacity, and items leave the
+	/// store only through `remove` or `reset`. The store then grows without limit until
+	/// items are removed, so memory use is the caller's responsibility.
+	///
+	/// `Some(n)` caps the store at `n` items: once an append takes it past `n`, the oldest
+	/// items are dropped, silently. Must not be `Some(0)`.
+	///
 	/// This does not limit how many items a single fetch returns; see `max_fetch_items`.
-	pub max_items: usize,
+	pub max_items: Option<usize>,
 	/// Maximum size in bytes of the batch a single fetch returns, unless `fetch` is given
 	/// its own `max_bytes`.
 	///
@@ -93,10 +100,10 @@ pub struct MemoryConfig {
 
 /// A FIFO data store that keeps items in memory.
 ///
-/// Items are stored until a fetched batch is passed to `remove`, or until max_items is
-/// reached, at which point older items are removed to make space for new ones. `fetch`
-/// itself removes nothing. The store maintains data in a queue structure and supports
-/// concurrent access.
+/// Items are stored until a fetched batch is passed to `remove`. If `max_items` sets a
+/// cap, appending past it also drops the oldest items to make space for new ones; with
+/// no cap, nothing is dropped. `fetch` itself removes nothing. The store maintains data
+/// in a queue structure and supports concurrent access.
 ///
 /// When items are fetched, they are packaged into a JSON batch with metadata including:
 /// - A batch array containing the items
@@ -125,7 +132,7 @@ impl MemoryStore {
 	///
 	/// # Panics
 	/// * If max_fetch_size is less than 100 bytes
-	/// * If max_items is 0
+	/// * If max_items is `Some(0)`
 	/// * If max_fetch_items is `Some(0)`
 	/// * If max_fetch_size leaves no room for even a 1-byte item once the batch
 	///   envelope (which grows with `write_key`) is counted
@@ -133,7 +140,7 @@ impl MemoryStore {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
 		}
-		if config.max_items == 0 {
+		if config.max_items == Some(0) {
 			panic!("max_items = 0? So... you want a store that stores nothing? That's what /dev/null is for.");
 		}
 		if config.max_fetch_items == Some(0) {
@@ -247,7 +254,7 @@ impl DataStore for MemoryStore {
 		self.items.clear();
 	}
 
-	/// Appends an item, dropping the oldest items beyond `max_items`.
+	/// Appends an item, dropping the oldest items beyond `max_items` if it sets a cap.
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store unchanged, if the serialized
@@ -279,8 +286,10 @@ impl DataStore for MemoryStore {
 		});
 		self.next_seq = next_seq;
 
-		while self.items.len() > self.config.max_items {
-			self.items.pop_front();
+		if let Some(max_items) = self.config.max_items {
+			while self.items.len() > max_items {
+				self.items.pop_front();
+			}
 		}
 
 		Ok(())
@@ -328,6 +337,7 @@ mod tests {
 	use serde_json::{json, Value};
 	use std::io::Result;
 
+	mod capacity;
 	mod ceiling;
 	mod depth;
 	mod duplicates;
@@ -341,7 +351,7 @@ mod tests {
 	fn test_basic_operations() -> Result<()> {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		};
@@ -385,7 +395,7 @@ mod tests {
 	fn test_fifo_behavior() -> Result<()> {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 3, // Small limit to test FIFO
+			max_items: Some(3), // Small limit to test FIFO
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		};
@@ -417,7 +427,7 @@ mod tests {
 	fn test_fetch_limits() -> Result<()> {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 100,
+			max_items: Some(100),
 			max_fetch_size: 1000,
 			max_fetch_items: None,
 		};
@@ -467,7 +477,7 @@ mod tests {
 	fn test_reset() -> Result<()> {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 100,
+			max_items: Some(100),
 			max_fetch_size: 1000,
 			max_fetch_items: None,
 		};
@@ -492,7 +502,7 @@ mod tests {
 	fn test_memory_store_max_fetch_size_edge_cases() -> Result<()> {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 100,
+			max_items: Some(100),
 			max_fetch_size: 300, // Reasonable size that's easy to stay under/go over
 			max_fetch_items: None,
 		};
@@ -531,7 +541,7 @@ mod tests {
 	fn test_memory_store_json_types() -> Result<()> {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 100,
+			max_items: Some(100),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		};
@@ -567,7 +577,7 @@ mod tests {
 	fn test_rejects_tiny_max_fetch_size() {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 50, // Ridiculously small
 			max_fetch_items: None,
 		};
@@ -582,7 +592,7 @@ mod tests {
 	fn test_rejects_zero_max_items() {
 		let config = MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 0, // Why even bother?
+			max_items: Some(0), // Why even bother?
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		};
@@ -593,7 +603,7 @@ mod tests {
 	fn item_limit_store(max_fetch_items: Option<usize>) -> MemoryStore {
 		MemoryStore::new(MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 1024 * 1024,
 			max_fetch_items,
 		})
@@ -723,7 +733,7 @@ mod tests {
 	fn test_fetch_item_limit_with_max_items_drop_oldest() -> Result<()> {
 		let mut store = MemoryStore::new(MemoryConfig {
 			write_key: "test-key".to_string(),
-			max_items: 10,
+			max_items: Some(10),
 			max_fetch_size: 1024 * 1024,
 			max_fetch_items: Some(4),
 		});

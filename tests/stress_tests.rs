@@ -63,7 +63,7 @@ fn test_memory_store_stress() -> Result<()> {
 
 	let config = MemoryConfig {
 		write_key: "test-key-mem".to_string(),
-		max_items: 10_000,
+		max_items: Some(10_000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
 	};

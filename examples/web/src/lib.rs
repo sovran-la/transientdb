@@ -68,7 +68,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     let config = WebConfig {
         write_key: "demo-app".to_string(),
         database_name: "transientdb-demo".to_string(),
-        max_items: 100,
+        max_items: Some(100),
         max_fetch_size: 1024 * 1024,
         max_fetch_items: None,
     };

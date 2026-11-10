@@ -20,7 +20,7 @@ use transientdb::{DirectoryConfig, DirectoryStore, MemoryConfig, MemoryStore, Tr
 fn test_concurrent_appends() -> Result<()> {
 	let config = MemoryConfig {
 		write_key: "test-key-concurrent-appends".to_string(),
-		max_items: 10000,
+		max_items: Some(10000),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
 	};
@@ -75,7 +75,7 @@ fn test_concurrent_appends() -> Result<()> {
 fn test_concurrent_append_and_fetch() -> Result<()> {
 	let config = MemoryConfig {
 		write_key: "test-key-append-and-fetch".to_string(), // Unique key
-		max_items: 1000,
+		max_items: Some(1000),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
 	};
@@ -123,7 +123,7 @@ fn test_concurrent_append_and_fetch() -> Result<()> {
 fn test_concurrent_reset() -> Result<()> {
 	let config = MemoryConfig {
 		write_key: "test-key-reset".to_string(), // Unique key
-		max_items: 1000,
+		max_items: Some(1000),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
 	};
@@ -337,7 +337,7 @@ fn test_directory_store_stress() -> Result<()> {
 fn test_memory_store_chaos() -> Result<()> {
 	let config = MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items: 100_000,
+		max_items: Some(100_000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
 	};
@@ -619,7 +619,7 @@ fn test_transient_db_panic_recovery() -> Result<()> {
 
 	let config = MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items: 100,
+		max_items: Some(100),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
 	};
@@ -792,7 +792,7 @@ fn test_directory_store_concurrent_validation() -> Result<()> {
 fn test_heavy_concurrent_load() -> Result<()> {
 	let config = MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items: 100_000,
+		max_items: Some(100_000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
 	};
@@ -875,7 +875,7 @@ fn drain_memory_batches(db: &TransientDB<Value>) -> Result<(Vec<usize>, Vec<i64>
 fn test_memory_fetch_item_limit_through_transientdb() -> Result<()> {
 	let db = TransientDB::new(MemoryStore::new(MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items: 1000,
+		max_items: Some(1000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: Some(8),
 	}));
@@ -981,7 +981,7 @@ fn test_directory_file_item_limit_concurrent_appends() -> Result<()> {
 fn test_removables_pass_through_to_the_one_wrapped_store() -> Result<()> {
 	let config = MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items: 100,
+		max_items: Some(100),
 		max_fetch_size: 4096,
 		max_fetch_items: None,
 	};
@@ -1008,5 +1008,51 @@ fn test_removables_pass_through_to_the_one_wrapped_store() -> Result<()> {
 	// Another TransientDB's store ignores them.
 	b.remove(&removable)?;
 	assert_eq!(batch(&b)?, all);
+	Ok(())
+}
+
+#[test]
+fn test_unbounded_memory_store_never_drops_under_concurrent_appends() -> Result<()> {
+	let store = MemoryStore::new(MemoryConfig {
+		write_key: "test-key-unbounded".to_string(),
+		max_items: None,
+		max_fetch_size: 16 * 1024,
+		max_fetch_items: None,
+	});
+	let db = Arc::new(TransientDB::new(store));
+	const THREADS: usize = 8;
+	const PER_THREAD: usize = 500;
+
+	let handles: Vec<_> = (0..THREADS)
+		.map(|t| {
+			let db = db.clone();
+			thread::spawn(move || -> Result<()> {
+				for n in 0..PER_THREAD {
+					db.append(json!({"t": t, "n": n}))?;
+				}
+				Ok(())
+			})
+		})
+		.collect();
+	for handle in handles {
+		handle.join().expect("append thread panicked")?;
+	}
+
+	// Every item comes back exactly once, each thread's in the order it appended them.
+	let mut next = [0usize; THREADS];
+	let mut total = 0;
+	while let Some(result) = db.fetch(None, None)? {
+		let batch: Value = result.data.unwrap();
+		for item in batch["batch"].as_array().unwrap() {
+			let t = item["t"].as_u64().unwrap() as usize;
+			assert_eq!(item["n"].as_u64().unwrap() as usize, next[t], "{item}");
+			next[t] += 1;
+			total += 1;
+		}
+		db.remove(&result.removable.unwrap())?;
+	}
+	assert_eq!(next, [PER_THREAD; THREADS]);
+	assert_eq!(total, THREADS * PER_THREAD);
+	assert!(!db.has_data());
 	Ok(())
 }

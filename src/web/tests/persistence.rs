@@ -198,7 +198,7 @@ async fn test_reset_of_this_sessions_items_persists() {
 async fn test_drop_oldest_persists() {
 	let db_name = "test-persist-drop-oldest";
 	let mut config = config_for(db_name);
-	config.max_items = 3;
+	config.max_items = Some(3);
 	let Some(mut store) = persisted(config).await else {
 		return;
 	};

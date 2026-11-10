@@ -144,7 +144,7 @@ async fn test_count_item_limit_and_bytes_each_win() {
 #[wasm_bindgen_test]
 async fn test_max_items_drop_oldest_with_ceiling() {
 	let mut config = config("test-ceiling-max-items", 200, KEY);
-	config.max_items = 10;
+	config.max_items = Some(10);
 	let mut store = fresh_store_with(config).await;
 	let appended: Vec<Value> = (0..15).map(|tag| item_of_len(30, tag)).collect();
 	for item in &appended {

@@ -43,10 +43,20 @@ pub struct WebConfig {
 	/// Name of the IndexedDB database.
 	/// Different stores should use different database names to avoid collisions.
 	pub database_name: String,
-	/// Total capacity: the maximum number of items to keep in memory.
-	/// Oldest items are dropped when this limit is exceeded.
+	/// Total capacity: the maximum number of items the store holds, or `None` for no cap.
+	///
+	/// `None` means unbounded: nothing is ever dropped for capacity, and items leave the
+	/// store only through `remove`, `reset`, or `fetch` dropping a persisted item too large
+	/// to fetch (see `max_fetch_size`). The store, in memory and in IndexedDB, then grows
+	/// without limit until items are removed, so memory use is the caller's responsibility.
+	///
+	/// `Some(n)` caps the store at `n` items: once an append takes it past `n`, the oldest
+	/// items are dropped, silently, and deleted from IndexedDB. Hydration does not apply the
+	/// cap; a store opened over more than `n` persisted items holds them all until its next
+	/// append. Must not be `Some(0)`.
+	///
 	/// This does not limit how many items a single fetch returns; see `max_fetch_items`.
-	pub max_items: usize,
+	pub max_items: Option<usize>,
 	/// Maximum size in bytes of the batch a single fetch returns, unless `fetch` is given
 	/// its own `max_bytes`.
 	///
@@ -114,6 +124,10 @@ pub enum PersistenceState {
 /// across page refreshes. Any JSON value can be stored; it is persisted and
 /// restored unmodified.
 ///
+/// Items are stored until a fetched batch is passed to `remove`. If `max_items` sets a
+/// cap, appending past it also drops the oldest items, in memory and in IndexedDB; with
+/// no cap, nothing is dropped for capacity.
+///
 /// # Persistence Behavior
 ///
 /// The store attempts to use IndexedDB for durable storage. If IndexedDB is
@@ -162,7 +176,7 @@ impl WebStore {
 	///
 	/// # Panics
 	/// * If max_fetch_size is less than 100 bytes
-	/// * If max_items is 0
+	/// * If max_items is `Some(0)`
 	/// * If max_fetch_items is `Some(0)`
 	/// * If max_fetch_size leaves no room for even a 1-byte item once the batch
 	///   envelope (which grows with `write_key`) is counted
@@ -170,7 +184,7 @@ impl WebStore {
 		if config.max_fetch_size < 100 {
 			panic!("max_fetch_size < 100 bytes? What are you even trying to fetch, empty arrays?");
 		}
-		if config.max_items == 0 {
+		if config.max_items == Some(0) {
 			panic!("max_items = 0? So... you want a store that stores nothing? That's what /dev/null is for.");
 		}
 		if config.max_fetch_items == Some(0) {
@@ -411,7 +425,8 @@ impl DataStore for WebStore {
 		}
 	}
 
-	/// Appends an item, dropping the oldest items beyond `max_items`.
+	/// Appends an item, dropping the oldest items beyond `max_items` if it sets a cap, and
+	/// deleting them from IndexedDB.
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store and IndexedDB unchanged, if the
@@ -445,10 +460,12 @@ impl DataStore for WebStore {
 		self.persist_event(&event);
 		self.items.push_back(event);
 
-		// Enforce max_items
-		let excess = self.items.len().saturating_sub(self.config.max_items);
-		let evicted: Vec<u32> = self.items.drain(..excess).map(|e| e.key).collect();
-		self.remove_from_idb(&evicted);
+		// Enforce max_items, if it sets a cap
+		if let Some(max_items) = self.config.max_items {
+			let excess = self.items.len().saturating_sub(max_items);
+			let evicted: Vec<u32> = self.items.drain(..excess).map(|e| e.key).collect();
+			self.remove_from_idb(&evicted);
+		}
 
 		Ok(())
 	}
@@ -511,6 +528,7 @@ mod tests {
 
 	wasm_bindgen_test_configure!(run_in_browser);
 
+	mod capacity;
 	mod ceiling;
 	mod depth;
 	mod duplicates;
@@ -529,7 +547,7 @@ mod tests {
 		WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: db_name.to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		}
@@ -575,7 +593,7 @@ mod tests {
 		let config = WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: "test-fifo".to_string(),
-			max_items: 3, // Small limit to test FIFO
+			max_items: Some(3), // Small limit to test FIFO
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		};
@@ -623,7 +641,7 @@ mod tests {
 		let config = WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: "test-fetch-bytes".to_string(),
-			max_items: 100,
+			max_items: Some(100),
 			max_fetch_size: 1000,
 			max_fetch_items: None,
 		};
@@ -733,7 +751,7 @@ mod tests {
 			let mut store = WebStore::new(WebConfig {
 				write_key: "test-key".to_string(),
 				database_name: db_name.to_string(),
-				max_items: 1000,
+				max_items: Some(1000),
 				max_fetch_size: 1024,
 				max_fetch_items: None,
 			})
@@ -759,7 +777,7 @@ mod tests {
 			let mut store = WebStore::new(WebConfig {
 				write_key: "test-key".to_string(),
 				database_name: db_name.to_string(),
-				max_items: 1000,
+				max_items: Some(1000),
 				max_fetch_size: 1024,
 				max_fetch_items: None,
 			})
@@ -788,7 +806,7 @@ mod tests {
 		let mut store_a = WebStore::new(WebConfig {
 			write_key: "key-a".to_string(),
 			database_name: "test-isolated-a".to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		})
@@ -797,7 +815,7 @@ mod tests {
 		let mut store_b = WebStore::new(WebConfig {
 			write_key: "key-b".to_string(),
 			database_name: "test-isolated-b".to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		})
@@ -829,7 +847,7 @@ mod tests {
 		let config = WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: "test-panic".to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 50,
 			max_fetch_items: None,
 		};
@@ -843,7 +861,7 @@ mod tests {
 		let config = WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: "test-panic".to_string(),
-			max_items: 0,
+			max_items: Some(0),
 			max_fetch_size: 1024,
 			max_fetch_items: None,
 		};
@@ -855,7 +873,7 @@ mod tests {
 		let mut store = WebStore::new(WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: db_name.to_string(),
-			max_items: 1000,
+			max_items: Some(1000),
 			max_fetch_size: 1024 * 1024,
 			max_fetch_items,
 		})
@@ -985,7 +1003,7 @@ mod tests {
 		let mut store = WebStore::new(WebConfig {
 			write_key: "test-key".to_string(),
 			database_name: "test-item-limit-max-items".to_string(),
-			max_items: 10,
+			max_items: Some(10),
 			max_fetch_size: 1024 * 1024,
 			max_fetch_items: Some(4),
 		})
