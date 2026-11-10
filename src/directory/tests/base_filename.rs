@@ -6,7 +6,7 @@ use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 fn named(dir: &TempDir, base_filename: &str) -> DirectoryConfig {
-	let mut config = config(dir, 1024, KEY);
+	let mut config = config(dir, 1024, with_source(KEY));
 	config.base_filename = base_filename.to_string();
 	config
 }
@@ -162,7 +162,7 @@ fn test_ordinary_names_round_trip_across_sessions() -> Result<()> {
 			"{base:?}"
 		);
 		assert_eq!(
-			read_finished(&files[0], KEY)?.batch(),
+			read_finished(&files[0], &with_source(KEY))?.batch(),
 			&vec![json!({"base": base, "n": 1}), json!({"base": base, "n": 2})],
 			"{base:?}"
 		);
@@ -185,7 +185,7 @@ fn test_ordinary_names_round_trip_across_sessions() -> Result<()> {
 			"{base:?}"
 		);
 		assert_eq!(
-			read_finished(&files[1], KEY)?.batch(),
+			read_finished(&files[1], &with_source(KEY))?.batch(),
 			&vec![json!({"base": base, "n": 3})],
 			"{base:?}"
 		);

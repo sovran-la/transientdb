@@ -1,18 +1,32 @@
 //! Helpers shared by the byte-ceiling tests.
 
 use super::*;
+use crate::envelope::samples::items_of;
 use std::path::PathBuf;
 
+/// The value of the test envelope's `source` field.
 pub(super) const KEY: &str = "test-key";
-/// `{ "batch": [` with `write_key` "test-key".
-pub(super) const OPENING: usize = 12;
-/// `],"sentAt":"<24 byte timestamp>","writeKey":"test-key"}`.
-pub(super) const CLOSING: usize = 60;
+/// `{"items":[`, the opening of [`with_source`]`(KEY)`.
+pub(super) const OPENING: usize = 10;
+/// `],"source":"test-key","sentAt":"<24 byte timestamp>"}`, the closing of
+/// [`with_source`]`(KEY)`. `test_envelope_lengths_match_constants` checks both against the
+/// store.
+pub(super) const CLOSING: usize = 58;
 pub(super) const ENVELOPE: usize = OPENING + CLOSING;
+/// The item that, after a 60 byte one and its comma, fills a 200 byte file exactly.
+pub(super) const FILLER: usize = 200 - ENVELOPE - 60 - 1;
 
-pub(super) fn config(dir: &TempDir, max_file_size: usize, write_key: &str) -> DirectoryConfig {
+/// A test envelope with a field and a timestamp:
+/// `{"items":[...],"source":<source>,"sentAt":"..."}`.
+pub(super) fn with_source(source: &str) -> Envelope {
+	Envelope::new("items")
+		.field("source", source)
+		.timestamp("sentAt")
+}
+
+pub(super) fn config(dir: &TempDir, max_file_size: usize, envelope: Envelope) -> DirectoryConfig {
 	DirectoryConfig {
-		write_key: write_key.to_string(),
+		envelope,
 		storage_location: dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size,
@@ -21,7 +35,7 @@ pub(super) fn config(dir: &TempDir, max_file_size: usize, write_key: &str) -> Di
 }
 
 pub(super) fn store(dir: &TempDir, max_file_size: usize) -> Result<DirectoryStore> {
-	DirectoryStore::new(config(dir, max_file_size, KEY))
+	DirectoryStore::new(config(dir, max_file_size, with_source(KEY)))
 }
 
 /// A JSON string item whose compact serialization is exactly `len` bytes (`len >= 2`).
@@ -38,26 +52,34 @@ pub(super) fn item_len(item: &Value) -> usize {
 pub(super) struct Finished {
 	pub len: u64,
 	pub json: Value,
+	/// The envelope's items key.
+	pub items_key: String,
 }
 
 impl Finished {
 	pub fn batch(&self) -> &Vec<Value> {
-		self.json["batch"].as_array().expect("batch array")
+		self.json[&self.items_key].as_array().expect("items array")
 	}
 }
 
-/// Reads one finished file and checks its envelope.
-pub(super) fn read_finished(path: &std::path::Path, write_key: &str) -> Result<Finished> {
+/// Reads one finished file and checks it is exactly what `envelope` describes: it starts
+/// with the opening, has the items key, every field with its value, the timestamp if
+/// configured, and no other key.
+pub(super) fn read_finished(path: &std::path::Path, envelope: &Envelope) -> Result<Finished> {
 	let len = fs::metadata(path)?.len();
 	let content = fs::read_to_string(path)?;
+	let opening = format!("{{{}:[", serde_json::to_string(&envelope.items_key)?);
 	assert!(
-		content.starts_with("{ \"batch\": ["),
+		content.starts_with(&opening),
 		"Bad envelope start: {content}"
 	);
 	let json: Value = serde_json::from_str(&content)?;
-	assert!(json["sentAt"].is_string(), "Missing sentAt: {content}");
-	assert_eq!(json["writeKey"], write_key);
-	let finished = Finished { len, json };
+	items_of(&json, envelope);
+	let finished = Finished {
+		len,
+		json,
+		items_key: envelope.items_key.clone(),
+	};
 	assert!(
 		!finished.batch().is_empty(),
 		"Empty or envelope-only file: {content}"
@@ -70,12 +92,12 @@ pub(super) fn finished_files(store: &mut DirectoryStore) -> Result<Vec<Finished>
 	let Some(result) = store.fetch(None, None)? else {
 		return Ok(Vec::new());
 	};
-	let key = store.config.write_key.clone();
+	let envelope = store.config.envelope.clone();
 	result
 		.data
 		.unwrap()
 		.iter()
-		.map(|f| read_finished(f, &key))
+		.map(|f| read_finished(f, &envelope))
 		.collect()
 }
 
@@ -130,10 +152,10 @@ pub(super) fn snapshot(
 	Ok(files)
 }
 
-/// The bytes the store writes for `items` in an open file: the opening, then the items
-/// separated by commas, without a closing.
-pub(super) fn unclosed(items: &[Value]) -> Vec<u8> {
-	let mut bytes = b"{ \"batch\": [".to_vec();
+/// The bytes a store with `envelope` writes for `items` in an open file: the opening,
+/// then the items separated by commas, without a closing.
+pub(super) fn unclosed_with(envelope: &Envelope, items: &[Value]) -> Vec<u8> {
+	let mut bytes = envelope.opening();
 	for (i, item) in items.iter().enumerate() {
 		if i > 0 {
 			bytes.push(b',');
@@ -143,13 +165,29 @@ pub(super) fn unclosed(items: &[Value]) -> Vec<u8> {
 	bytes
 }
 
-/// `unclosed(items)` followed by a closing, as a file finished but not yet renamed.
-pub(super) fn closed(items: &[Value]) -> Vec<u8> {
-	let mut bytes = unclosed(items);
-	bytes.extend_from_slice(
-		format!("],\"sentAt\":\"2026-11-09T12:34:56.789Z\",\"writeKey\":\"{KEY}\"}}").as_bytes(),
-	);
+/// A fixed finishing time, so files built by the tests are reproducible.
+pub(super) fn fixed_time() -> chrono::DateTime<chrono::Utc> {
+	chrono::DateTime::parse_from_rfc3339("2026-11-09T12:34:56.789Z")
+		.unwrap()
+		.to_utc()
+}
+
+/// `unclosed_with(envelope, items)` followed by its closing at [`fixed_time`], as a file
+/// finished but not yet renamed.
+pub(super) fn closed_with(envelope: &Envelope, items: &[Value]) -> Vec<u8> {
+	let mut bytes = unclosed_with(envelope, items);
+	bytes.extend(envelope.closing(fixed_time()));
 	bytes
+}
+
+/// [`unclosed_with`] under [`with_source`]`(KEY)`, the envelope of [`store`].
+pub(super) fn unclosed(items: &[Value]) -> Vec<u8> {
+	unclosed_with(&with_source(KEY), items)
+}
+
+/// [`closed_with`] under [`with_source`]`(KEY)`, the envelope of [`store`].
+pub(super) fn closed(items: &[Value]) -> Vec<u8> {
+	closed_with(&with_source(KEY), items)
 }
 
 /// Writes `bytes` as the "events" store's unfinished file `index`, as an earlier session

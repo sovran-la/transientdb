@@ -2,7 +2,8 @@
 
 use super::support::*;
 use super::*;
-use crate::batch;
+use crate::envelope::samples::expected_len;
+use chrono::{DateTime, Utc};
 
 #[test]
 fn test_ceiling_holds_for_mixed_sizes_and_drains_in_order() -> Result<()> {
@@ -30,13 +31,11 @@ fn test_exact_fit_and_one_byte_over() {
 		store.append(item_of_len(40, tag)).unwrap();
 	}
 	let exact = envelope(KEY) + 3 * 40 + 2;
-	let result = store
-		.fetch_with_sent_at(None, Some(exact), SENT_AT)
-		.unwrap();
+	let result = store.fetch(None, Some(exact)).unwrap().unwrap();
 	let batch = serde_json::to_string(result.data.as_ref().unwrap()).unwrap();
 	assert_eq!(batch.len(), exact);
-	assert_eq!(fetched_at_fixed_time(&mut store, exact), 3);
-	assert_eq!(fetched_at_fixed_time(&mut store, exact - 1), 2);
+	assert_eq!(fetched(&mut store, exact), 3);
+	assert_eq!(fetched(&mut store, exact - 1), 2);
 }
 
 #[test]
@@ -46,11 +45,8 @@ fn test_separators_are_counted() {
 		store.append(item_of_len(40, tag)).unwrap();
 	}
 	// Room for the three items only if the two commas were free.
-	assert_eq!(fetched_at_fixed_time(&mut store, envelope(KEY) + 3 * 40), 2);
-	assert_eq!(
-		fetched_at_fixed_time(&mut store, envelope(KEY) + 3 * 40 + 1),
-		2
-	);
+	assert_eq!(fetched(&mut store, envelope(KEY) + 3 * 40), 2);
+	assert_eq!(fetched(&mut store, envelope(KEY) + 3 * 40 + 1), 2);
 }
 
 #[test]
@@ -60,43 +56,41 @@ fn test_envelope_is_counted() {
 		store.append(item_of_len(40, tag)).unwrap();
 	}
 	// Room for the three items and commas, and all but one byte of the envelope.
-	assert_eq!(
-		fetched_at_fixed_time(&mut store, envelope(KEY) - 1 + 3 * 40 + 2),
-		2
-	);
+	assert_eq!(fetched(&mut store, envelope(KEY) - 1 + 3 * 40 + 2), 2);
 	// One item and its envelope, exactly; a byte less fetches nothing.
-	assert_eq!(fetched_at_fixed_time(&mut store, envelope(KEY) + 40), 1);
-	assert_eq!(fetched_at_fixed_time(&mut store, envelope(KEY) + 39), 0);
+	assert_eq!(fetched(&mut store, envelope(KEY) + 40), 1);
+	assert_eq!(fetched(&mut store, envelope(KEY) + 39), 0);
 }
 
 #[test]
-fn test_actual_timestamp_width_is_measured() {
-	let mut store = store(4096);
-	for tag in 0..3 {
-		store.append(item_of_len(40, tag)).unwrap();
+fn test_timestamp_width_is_the_same_at_every_instant() {
+	let store = store(4096);
+	// Whole seconds, whole milliseconds, nanoseconds past them, and the extremes of the
+	// four-digit years: the timestamp always prints three fraction digits, so a batch's
+	// envelope is the length the store counted whenever it is finished.
+	let instants = [
+		DateTime::UNIX_EPOCH,
+		DateTime::from_timestamp(1_762_691_696, 0).unwrap(),
+		DateTime::from_timestamp(1_762_691_696, 120_000_000).unwrap(),
+		DateTime::from_timestamp(1_762_691_696, 123_456_789).unwrap(),
+		DateTime::from_timestamp(-62_167_219_200, 0).unwrap(),
+		DateTime::from_timestamp(253_402_300_799, 999_999_999).unwrap(),
+		Utc::now(),
+	];
+	for at in instants {
+		let batch = store.config.envelope.batch(Vec::new(), at);
+		let len = serde_json::to_string(&batch).unwrap().len();
+		assert_eq!(len, store.envelope_len, "{at}");
+		assert_eq!(len, envelope(KEY), "{at}");
 	}
-	// Whole seconds print no fraction; nonzero nanoseconds print nine digits.
-	let short = "2026-11-09T12:34:56+00:00";
-	let wide = "2026-11-09T12:34:56.123456789+00:00";
-	let max = batch::envelope_len(short, KEY) + 3 * 40 + 2;
-	let count = |store: &mut MemoryStore, sent_at| {
-		let result = store.fetch_with_sent_at(None, Some(max), sent_at).unwrap();
-		checked_batch(&result, max).len()
-	};
-	assert_eq!(count(&mut store, short), 3);
-	assert_eq!(count(&mut store, wide), 2);
-	assert_eq!(
-		batch::envelope_len(wide, KEY),
-		MemoryStore::widest_envelope_len(KEY)
-	);
 }
 
 #[test]
-fn test_longer_write_key_fits_fewer_items() -> Result<()> {
-	let long_key = "k".repeat(60);
+fn test_longer_field_value_fits_fewer_items() -> Result<()> {
+	let long_source = "k".repeat(60);
 	let mut sizes = Vec::new();
-	for key in [KEY, long_key.as_str()] {
-		let mut store = store_with(400, key);
+	for source in [KEY, long_source.as_str()] {
+		let mut store = store_with(400, with_source(source));
 		let appended: Vec<Value> = (0..30).map(|tag| item_of_len(40, tag)).collect();
 		for item in &appended {
 			store.append(item.clone())?;
@@ -145,7 +139,7 @@ fn test_per_call_max_bytes_is_the_ceiling() -> Result<()> {
 #[test]
 fn test_count_item_limit_and_bytes_each_win() -> Result<()> {
 	let mut store = MemoryStore::new(MemoryConfig {
-		write_key: KEY.to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(1000),
 		max_fetch_size: 1000,
 		max_fetch_items: Some(6),
@@ -155,15 +149,15 @@ fn test_count_item_limit_and_bytes_each_win() -> Result<()> {
 	}
 	let count = |store: &mut MemoryStore, count, max_bytes| {
 		let result = store.fetch(count, max_bytes).unwrap().unwrap();
-		checked_batch(&result, max_bytes.unwrap_or(1000)).len()
+		checked_batch_with(&result, max_bytes.unwrap_or(1000), &Envelope::default()).len()
 	};
 	// count wins
 	assert_eq!(count(&mut store, Some(2), None), 2);
 	// max_fetch_items wins
 	assert_eq!(count(&mut store, Some(50), None), 6);
 	assert_eq!(count(&mut store, None, None), 6);
-	// bytes win: the widest envelope plus 3 items and 2 commas, short of a 4th
-	let three = MemoryStore::widest_envelope_len(KEY) + 3 * 40 + 2;
+	// bytes win: the envelope plus 3 items and 2 commas, short of a 4th
+	let three = expected_len(&Envelope::default()) + 3 * 40 + 2;
 	assert_eq!(count(&mut store, Some(50), Some(three)), 3);
 	assert_eq!(count(&mut store, None, Some(three)), 3);
 
@@ -176,7 +170,7 @@ fn test_count_item_limit_and_bytes_each_win() -> Result<()> {
 #[test]
 fn test_max_items_drop_oldest_with_ceiling() -> Result<()> {
 	let mut store = MemoryStore::new(MemoryConfig {
-		write_key: KEY.to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(10),
 		max_fetch_size: 200,
 		max_fetch_items: None,

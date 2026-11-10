@@ -122,14 +122,19 @@ pub(crate) const SHAPES: [Shape; 3] = [Shape::Arrays, Shape::Objects, Shape::Mix
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Envelope;
 	use serde_json::json;
 
-	/// Whether `serde_json` reads `item` back from inside a batch envelope.
+	/// Whether `serde_json` reads `item` back from inside a batch, under an envelope with
+	/// a field and a timestamp. Whatever the envelope, the items sit two levels deep.
 	fn reads_back_in_a_batch(item: &Value) -> bool {
-		let mut bytes = b"{\"batch\":[".to_vec();
+		let envelope = Envelope::new("items")
+			.field("source", json!({"deep": [[1]]}))
+			.timestamp("sentAt");
+		let mut bytes = envelope.opening();
 		bytes.extend(serde_json::to_vec(item).unwrap());
-		bytes.extend_from_slice(b"],\"sentAt\":\"s\",\"writeKey\":\"k\"}");
-		serde_json::from_slice::<Value>(&bytes).is_ok_and(|batch| batch["batch"][0] == *item)
+		bytes.extend(envelope.closing(chrono::Utc::now()));
+		serde_json::from_slice::<Value>(&bytes).is_ok_and(|batch| batch["items"][0] == *item)
 	}
 
 	#[test]

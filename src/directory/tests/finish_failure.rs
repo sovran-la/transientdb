@@ -83,7 +83,7 @@ fn fails_to_finish(fault: Fault, at_fetch: bool, fetch_first: bool) -> Result<()
 		expected.extend(assert_ceiling(&finished_files(&mut store)?, max));
 	}
 
-	let (a, b) = (tagged(60, "a"), tagged(67, "b"));
+	let (a, b) = (tagged(60, "a"), tagged(FILLER, "b"));
 	store.append(a.clone())?;
 	store.append(b.clone())?;
 	assert_eq!(store.current_size + CLOSING, max, "{case}");
@@ -230,7 +230,7 @@ fn test_recovery_failure_is_not_retried_in_the_same_session() -> Result<()> {
 fn closed_bytes_of(path: &std::path::Path) -> Result<Vec<u8>> {
 	let bytes = fs::read(path)?;
 	let json: Value = serde_json::from_slice(&bytes)?;
-	assert_eq!(json["batch"], json!(["stuck"]));
+	assert_eq!(json["items"], json!(["stuck"]));
 	Ok(bytes)
 }
 
@@ -270,7 +270,7 @@ impl Schedule {
 fn test_mixed_failures_lose_and_duplicate_nothing() -> Result<()> {
 	let max = 300;
 	let temp_dir = TempDir::new()?;
-	let mut config = config(&temp_dir, max, KEY);
+	let mut config = config(&temp_dir, max, with_source(KEY));
 	config.max_file_items = Some(4);
 	let mut store = DirectoryStore::new(config.clone())?;
 	recording(&mut store);
@@ -281,7 +281,7 @@ fn test_mixed_failures_lose_and_duplicate_nothing() -> Result<()> {
 	let deliver = |store: &mut DirectoryStore, delivered: &mut Vec<Value>| -> Result<()> {
 		if let Some(result) = store.fetch(None, None)? {
 			for path in result.data.as_ref().unwrap() {
-				let file = read_finished(path, KEY)?;
+				let file = read_finished(path, &with_source(KEY))?;
 				assert!(file.len <= max as u64, "{path:?} is {} bytes", file.len);
 				delivered.extend(file.batch().iter().cloned());
 			}

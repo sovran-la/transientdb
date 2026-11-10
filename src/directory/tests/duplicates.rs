@@ -26,7 +26,10 @@ fn test_removing_one_fetched_duplicate_keeps_the_rest() -> Result<()> {
 	let result = store.fetch(Some(1), None)?.unwrap();
 	let files = result.data.unwrap();
 	assert_eq!(files.len(), 1);
-	assert_eq!(read_finished(&files[0], KEY)?.batch(), &vec![same.clone()]);
+	assert_eq!(
+		read_finished(&files[0], &with_source(KEY))?.batch(),
+		&vec![same.clone()]
+	);
 	store.remove(&result.removable.unwrap())?;
 
 	assert!(!files[0].exists());
@@ -45,7 +48,12 @@ fn test_walking_the_store_returns_every_duplicate() -> Result<()> {
 	let mut seen = Vec::new();
 	while let Some(result) = store.fetch(Some(2), None)? {
 		for file in result.data.unwrap() {
-			seen.extend(read_finished(&file, KEY)?.batch().iter().cloned());
+			seen.extend(
+				read_finished(&file, &with_source(KEY))?
+					.batch()
+					.iter()
+					.cloned(),
+			);
 		}
 		store.remove(&result.removable.unwrap())?;
 	}

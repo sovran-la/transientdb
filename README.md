@@ -20,7 +20,7 @@ TransientDB is a lightweight, thread-safe temporary data storage system designed
     - Customizable maximum file/batch sizes
     - File validation hooks
     - Flexible fetch limits (count and size-based)
-    - Consistent data format across stores
+    - Configurable batch [envelope](#envelope), the same shape in every store
 
 - **FIFO (First-In-First-Out) Data Management**
     - Automatic cleanup of old data
@@ -83,12 +83,12 @@ outside the directory are left in place.
 ### Memory Store Example
 
 ```rust
-use transientdb::{MemoryConfig, MemoryStore, TransientDB};
+use transientdb::{Envelope, MemoryConfig, MemoryStore, TransientDB};
 use serde_json::json;
 
 // Configure an in-memory store
 let config = MemoryConfig {
-    write_key: "my-app".into(),
+    envelope: Envelope::default(),
     max_items: Some(1000),
     max_fetch_size: 1024 * 1024, // 1MB
     max_fetch_items: None,
@@ -108,7 +108,7 @@ db.append(json!({
 if let Some(result) = db.fetch(Some(100), None)? {
     if let Some(batch) = result.data {
         // Process the batch - it's already a serde_json::Value
-        if let Some(items) = batch["batch"].as_array() {
+        if let Some(items) = batch["items"].as_array() {
             for item in items {
                 println!("Processing event: {}", item["event"]);
             }
@@ -125,12 +125,12 @@ if let Some(result) = db.fetch(Some(100), None)? {
 
 ```rust
 use std::path::PathBuf;
-use transientdb::{DirectoryConfig, DirectoryStore, TransientDB};
+use transientdb::{DirectoryConfig, DirectoryStore, Envelope, TransientDB};
 use serde_json::json;
 
 // Configure a file-based store
 let config = DirectoryConfig {
-    write_key: "my-app".into(),
+    envelope: Envelope::default(),
     storage_location: PathBuf::from("/tmp/events"),
     base_filename: "batch".into(),
     max_file_size: 1024 * 1024, // 1MB
@@ -169,7 +169,7 @@ if let Some(result) = db.fetch(None, None)? {
             let batch: serde_json::Value = serde_json::from_str(&content)?;
             
             // Access the items array
-            if let Some(items) = batch["batch"].as_array() {
+            if let Some(items) = batch["items"].as_array() {
                 for item in items {
                     println!("Processing event: {}", item["event"]);
                 }
@@ -238,12 +238,12 @@ tried returns the error, and the next `fetch` recovers that file with all its it
 ### Web Store Example (WASM)
 
 ```rust
-use transientdb::{TransientDB, WebConfig, WebStore, PersistenceState};
+use transientdb::{Envelope, TransientDB, WebConfig, WebStore, PersistenceState};
 use serde_json::json;
 
 // Configure a browser-based store
 let config = WebConfig {
-    write_key: "my-app".into(),
+    envelope: Envelope::default(),
     database_name: "my-app-events".into(),
     max_items: Some(1000),
     max_fetch_size: 1024 * 1024, // 1MB
@@ -278,7 +278,7 @@ db.append(json!({
 if let Some(result) = db.fetch(Some(100), None)? {
     if let Some(batch) = result.data {
         // Process the batch
-        if let Some(items) = batch["batch"].as_array() {
+        if let Some(items) = batch["items"].as_array() {
             for item in items {
                 println!("Processing event: {}", item["event"]);
             }
@@ -334,20 +334,20 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 ## Configuration Options
 
 ### MemoryConfig
-- `write_key`: Identifier for the data source
+- `envelope`: The JSON object each batch wraps its items in; see [Envelope](#envelope)
 - `max_items`: Total store capacity, or `None` for no cap. With `Some(n)`, the oldest items are dropped silently beyond `n` (must not be `Some(0)`); see [Item cap](#item-cap)
 - `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
 
 ### DirectoryConfig
-- `write_key`: Identifier for the data source
+- `envelope`: The JSON object each batch wraps its items in; see [Envelope](#envelope)
 - `storage_location`: Directory path for storing files
 - `base_filename`: Base name for generated files, which are named `{index}-{base_filename}`. Must be a plain file name: not empty, not `.` or `..`, no `/`, `\` or NUL byte (on every platform), and not ending in `.temp`. Dots, spaces, hyphens, digits and non-ASCII characters are fine. The index counts up from one above the highest index on disk and never wraps: if index 4294967295 is taken, an `append` that needs a new file returns an error, and the existing files can still be fetched
 - `max_file_size`: Hard ceiling in bytes on each finished file, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_file_items`: Maximum number of items in one file, or `None` for no limit (must not be `Some(0)`)
 
 ### WebConfig
-- `write_key`: Identifier for the data source
+- `envelope`: The JSON object each batch wraps its items in; see [Envelope](#envelope)
 - `database_name`: Name of the IndexedDB database (use unique names per store)
 - `max_items`: Total store capacity, or `None` for no cap. With `Some(n)`, the oldest items are dropped silently beyond `n` (must not be `Some(0)`); see [Item cap](#item-cap)
 - `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
@@ -362,7 +362,7 @@ it for a store that must never lose data by its own policy.
 
 ```rust
 let config = MemoryConfig {
-    write_key: "my-app".into(),
+    envelope: Envelope::default(),
     max_items: None, // never drop items for capacity
     max_fetch_size: 1024 * 1024,
     max_fetch_items: None,
@@ -377,8 +377,8 @@ keeping memory (and, for WebStore, IndexedDB) use in check is the caller's respo
 
 Some consumers send each batch as one request body to an API that rejects bodies over a
 fixed size. Every store's byte limit is a hard ceiling on what it hands back, measured in
-bytes (not characters) and counting the whole JSON batch: the envelope (`batch`, `sentAt`,
-`writeKey`), every item, and the commas between items. An exact fit is allowed.
+bytes (not characters) and counting the whole JSON batch: the [envelope](#envelope) (its items
+key, fields and timestamp), every item, and the commas between items. An exact fit is allowed.
 
 - **DirectoryStore**: no finished file is ever larger than `max_file_size` on disk. Before
   each `append` the store computes the size the open file would have once finished with the
@@ -423,8 +423,8 @@ current limit is renamed untouched. Files an earlier session already finished (`
 fetched as they are.
 
 Because the envelope counts, the limit must leave room for at least a 1-byte item after it;
-the envelope grows with `write_key`'s length. Constructing a store whose envelope alone fills
-the limit panics.
+the envelope grows with its keys and field values. Constructing a store whose envelope alone
+fills the limit panics.
 
 ### Item limits per batch
 
@@ -437,7 +437,7 @@ Each store can enforce one:
 
   ```rust
   let config = DirectoryConfig {
-      write_key: "my-app".into(),
+      envelope: Envelope::default(),
       storage_location: PathBuf::from("/tmp/events"),
       base_filename: "batch".into(),
       max_file_size: 1024 * 1024,
@@ -452,25 +452,75 @@ Each store can enforce one:
 
   ```rust
   let config = MemoryConfig {
-      write_key: "my-app".into(),
+      envelope: Envelope::default(),
       max_items: Some(1000),
       max_fetch_size: 1024 * 1024,
       max_fetch_items: Some(8), // every fetch returns at most 8 items
   };
   ```
 
-## Data Format
+## Envelope
 
-All stores produce data in a consistent JSON format:
+Every store wraps a batch of items in one JSON object, described by the `envelope` field of
+its config. `Envelope` has three public fields:
+
+- `items_key`: the name of the array that holds the items.
+- `fields`: other top-level keys and their values, written exactly as given (any JSON).
+- `timestamp_key`: if set, the time the batch was finished is written under this key.
+
+`Envelope::default()` puts the items under `items` and adds nothing else, so a default batch
+is exactly:
+
 ```json
-{
-    "batch": [
-        // Array of stored items
-    ],
-    "sentAt": "2024-01-01T00:00:00Z",
-    "writeKey": "store-identifier"
-}
+{"items":[{"event":"a"},{"event":"b"}]}
 ```
+
+A builder covers the common cases. Rename the items key:
+
+```rust
+let envelope = Envelope::new("events");
+// {"events":[...]}
+```
+
+Add a field and a timestamp:
+
+```rust
+let envelope = Envelope::new("events")
+    .field("source", "sensor-7")
+    .timestamp("sentAt");
+// {"events":[...],"source":"sensor-7","sentAt":"2026-11-10T17:04:05.123Z"}
+```
+
+The timestamp is the only value computed per batch. It is always UTC in the format
+`%Y-%m-%dT%H:%M:%S.%3fZ`, 24 bytes, so a given envelope is the same size in every batch and
+the [byte limits](#byte-limits) count it exactly. There is no callback for computed fields:
+`DirectoryStore` must know the exact size of a file's closing before the file is finished.
+
+**DirectoryStore** writes each file as these bytes, compact, with no spaces:
+
+```text
+{"<items_key>":[<item>,<item>,...]<,"<field key>":<field value>>...<,"<timestamp_key>":"<timestamp>">}
+```
+
+That is: `{`, the items key as a JSON string, `:[`; the items separated by commas; then `]`,
+each field in the order given as `,` + key + `:` + value, the timestamp if configured as `,` +
+key + `:` + the timestamp as a JSON string, and `}`. Keys are JSON-escaped and values are
+serialized compactly by `serde_json`.
+
+**MemoryStore and WebStore** return the batch as a `serde_json::Value`: an object with the items
+under the items key, each field under its key, and the timestamp if configured. Key order
+inside a `Value` is not meaningful (`serde_json` serializes it in its own order), but its
+serialized length is the same in any order, and length is what the byte limit guarantees.
+WebStore keeps bare items in IndexedDB, so items persisted earlier are returned under whatever
+envelope the current store is configured with.
+
+Each store's `new` panics if the items key, a field key or the timestamp key is empty, if any
+two of those keys are the same, or if the envelope does not read back as JSON (a field value
+nested too deeply for `serde_json`, for example).
+
+Changing the envelope between sessions is not supported: `DirectoryStore` files already closed
+under the old one are delivered as they were written, and unfinished ones are closed with the
+new envelope or discarded.
 
 ## Thread Safety
 

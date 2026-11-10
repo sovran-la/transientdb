@@ -4,10 +4,16 @@
 
 use super::support::*;
 use super::*;
+use crate::envelope::samples::items_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Six 40 byte items: 12 + 6 * 40 + 5 + 60 = 317 bytes once closed.
+/// The size of a finished file holding `n` 40 byte items.
+fn fit(n: usize) -> usize {
+	ENVELOPE + n * 40 + (n - 1)
+}
+
+/// Six 40 byte items: 10 + 6 * 40 + 5 + 58 = 313 bytes once closed.
 fn six_items() -> Vec<Value> {
 	(0..6)
 		.map(|i| Value::String(format!("{i}{}", "x".repeat(37))))
@@ -30,9 +36,7 @@ fn fetch_bytes(dir: &TempDir, max_file_size: usize) -> Result<Vec<Vec<u8>>> {
 fn assert_cut_to(bytes: &[u8], items: &[Value], max: usize) {
 	assert!(bytes.len() <= max, "{} bytes, over {max}", bytes.len());
 	let json: Value = serde_json::from_slice(bytes).expect("valid JSON");
-	assert_eq!(json["writeKey"], KEY);
-	assert!(json["sentAt"].is_string());
-	assert_eq!(json["batch"].as_array().unwrap(), items);
+	assert_eq!(items_of(&json, &with_source(KEY)), items);
 	let kept = unclosed(items);
 	assert!(bytes.starts_with(&kept), "original bytes not kept");
 	assert_eq!(bytes.len(), kept.len() + CLOSING);
@@ -42,9 +46,18 @@ fn assert_cut_to(bytes: &[u8], items: &[Value], max: usize) {
 fn test_complete_leftover_over_the_ceiling_keeps_the_leading_items_that_fit() -> Result<()> {
 	let items = six_items();
 	let bytes = closed(&items);
-	assert_eq!(bytes.len(), 317);
-	// 12 + 3 * 40 + 2 + 60 = 194 fits in 200 and 193; a fourth item does not.
-	for (max, kept) in [(200, 3), (194, 3), (193, 2), (316, 5), (153, 2), (152, 1)] {
+	assert_eq!(bytes.len(), fit(6));
+	assert_eq!(fit(6), 313);
+	// fit(3) = 10 + 3 * 40 + 2 + 58 = 190 fits in 200; a fourth item does not.
+	let cases = [
+		(200, 3),
+		(fit(3), 3),
+		(fit(3) - 1, 2),
+		(fit(6) - 1, 5),
+		(fit(2), 2),
+		(fit(2) - 1, 1),
+	];
+	for (max, kept) in cases {
 		let temp_dir = TempDir::new()?;
 		let path = write_leftover(&temp_dir, 1, &bytes)?;
 		let files = fetch_bytes(&temp_dir, max)?;
@@ -61,7 +74,7 @@ fn test_complete_leftover_over_the_ceiling_keeps_the_leading_items_that_fit() ->
 
 #[test]
 fn test_complete_leftover_whose_first_item_does_not_fit_is_deleted() -> Result<()> {
-	// 12 + 150 + 60 = 222 bytes: no 150 byte item fits in a 200 byte file.
+	// 10 + 150 + 58 = 218 bytes: no 150 byte item fits in a 200 byte file.
 	let bytes = closed(&[item_of_len(150), json!("small")]);
 	let temp_dir = TempDir::new()?;
 	let path = write_leftover(&temp_dir, 1, &bytes)?;

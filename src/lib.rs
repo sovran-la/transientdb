@@ -1,5 +1,6 @@
 mod batch;
 mod directory;
+mod envelope;
 mod memory;
 mod transient;
 
@@ -12,6 +13,7 @@ use std::fmt::Debug;
 use std::io::Result;
 
 pub use directory::{DirectoryConfig, DirectoryStore};
+pub use envelope::Envelope;
 pub use memory::{MemoryConfig, MemoryStore};
 pub use transient::TransientDB;
 

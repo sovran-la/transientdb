@@ -8,13 +8,15 @@ use std::io::Result;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use transientdb::{DirectoryConfig, DirectoryStore, TransientDB};
+use transientdb::{DirectoryConfig, DirectoryStore, Envelope, TransientDB};
 
-const OPENING: &str = "{ \"batch\": [";
+const OPENING: &str = "{\"items\":[";
 
 fn config(dir: &TempDir) -> DirectoryConfig {
 	DirectoryConfig {
-		write_key: "leftover-key".to_string(),
+		envelope: Envelope::new("items")
+			.field("source", "leftover-key")
+			.timestamp("sentAt"),
 		storage_location: dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 4096,
@@ -30,9 +32,9 @@ fn write(dir: &TempDir, name: &str, content: &str) -> Result<PathBuf> {
 
 fn batch(path: &Path) -> Result<Vec<Value>> {
 	let json: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-	assert_eq!(json["writeKey"], "leftover-key");
+	assert_eq!(json["source"], "leftover-key");
 	assert!(json["sentAt"].is_string());
-	Ok(json["batch"].as_array().unwrap().clone())
+	Ok(json["items"].as_array().unwrap().clone())
 }
 
 /// Every path a validator was given, in order.

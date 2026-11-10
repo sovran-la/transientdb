@@ -13,7 +13,7 @@ use std::time::Duration;
 use std::{io, thread};
 use tempfile::TempDir;
 use transientdb::TransientDB;
-use transientdb::{DirectoryConfig, DirectoryStore};
+use transientdb::{DirectoryConfig, DirectoryStore, Envelope};
 
 // Helper to corrupt a file in various ways
 fn corrupt_file(path: &Path, corruption_type: u8) -> Result<()> {
@@ -50,7 +50,7 @@ fn corrupt_file(path: &Path, corruption_type: u8) -> Result<()> {
 fn test_recovery_from_corrupted_files() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
@@ -94,7 +94,7 @@ fn test_recovery_from_corrupted_files() -> Result<()> {
 fn test_concurrent_corruption_recovery() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 512, // Small size to force more files
@@ -157,7 +157,7 @@ fn test_concurrent_corruption_recovery() -> Result<()> {
 fn test_file_system_edge_cases() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,

@@ -38,9 +38,10 @@ fn test_ceiling_holds_for_mixed_sizes() -> Result<()> {
 fn test_exact_fit_fills_file_to_the_limit() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 200)?;
-	// 12 + 60 + 1 + 67 + 60 = 200
+	// ENVELOPE + 60 + 1 + FILLER = 200
+	assert_eq!(FILLER, 71);
 	store.append(item_of_len(60))?;
-	store.append(item_of_len(67))?;
+	store.append(item_of_len(FILLER))?;
 
 	let files = finished_files(&mut store)?;
 	assert_eq!(batch_counts(&files), vec![2]);
@@ -52,7 +53,8 @@ fn test_exact_fit_fills_file_to_the_limit() -> Result<()> {
 fn test_one_byte_over_rotates() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 200)?;
-	let second = item_of_len(68);
+	// One byte more than test_exact_fit_fills_file_to_the_limit's second item.
+	let second = item_of_len(FILLER + 1);
 	store.append(item_of_len(60))?;
 	store.append(second.clone())?;
 
@@ -69,15 +71,17 @@ fn test_one_byte_over_rotates() -> Result<()> {
 fn test_separators_are_counted() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 200)?;
-	// 42 + 43 + 43 = 128 bytes of items is exactly the room left by the envelope,
+	// 44 + 44 + 44 = 132 bytes of items is exactly the room left by the envelope,
 	// so the three fit only if the two commas were free.
-	for len in [42, 43, 43] {
-		store.append(item_of_len(len))?;
+	let room = 200 - ENVELOPE;
+	assert_eq!(room, 3 * 44);
+	for _ in 0..3 {
+		store.append(item_of_len(room / 3))?;
 	}
 
 	let files = finished_files(&mut store)?;
 	assert_eq!(batch_counts(&files), vec![2, 1]);
-	assert_eq!(files[0].len, (ENVELOPE + 42 + 1 + 43) as u64);
+	assert_eq!(files[0].len, (ENVELOPE + 44 + 1 + 44) as u64);
 	assert_ceiling(&files, 200);
 	Ok(())
 }
@@ -86,8 +90,9 @@ fn test_separators_are_counted() -> Result<()> {
 fn test_closing_envelope_is_counted() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 200)?;
-	// Opening + 60 + 1 + 100 = 173 bytes written so far, under 200; only the
-	// 60 byte closing pushes it over.
+	// Opening + 60 + 1 + 100 = 171 bytes written so far, under 200; only the
+	// 58 byte closing pushes it over.
+	const { assert!(OPENING + 60 + 1 + 100 <= 200 && ENVELOPE + 60 + 1 + 100 > 200) };
 	store.append(item_of_len(60))?;
 	store.append(item_of_len(100))?;
 
@@ -98,12 +103,12 @@ fn test_closing_envelope_is_counted() -> Result<()> {
 }
 
 #[test]
-fn test_longer_write_key_rotates_earlier() -> Result<()> {
-	let long_key = "k".repeat(40);
+fn test_longer_field_value_rotates_earlier() -> Result<()> {
+	let long_source = "k".repeat(40);
 	let mut counts = Vec::new();
-	for key in [KEY, long_key.as_str()] {
+	for source in [KEY, long_source.as_str()] {
 		let temp_dir = TempDir::new()?;
-		let mut store = DirectoryStore::new(config(&temp_dir, 300, key))?;
+		let mut store = DirectoryStore::new(config(&temp_dir, 300, with_source(source)))?;
 		let appended: Vec<Value> = (0..20).map(|_| item_of_len(40)).collect();
 		for item in &appended {
 			store.append(item.clone())?;
@@ -112,7 +117,7 @@ fn test_longer_write_key_rotates_earlier() -> Result<()> {
 		assert_eq!(assert_ceiling(&files, 300), appended);
 		counts.push(batch_counts(&files));
 	}
-	// 72 + 41n - 1 <= 300 gives 5 per file; with 32 more envelope bytes, 4.
+	// 68 + 41n - 1 <= 300 gives 5 per file; with 32 more envelope bytes, 4.
 	assert_eq!(counts[0], vec![5, 5, 5, 5]);
 	assert_eq!(counts[1], vec![4, 4, 4, 4, 4]);
 	Ok(())
@@ -142,12 +147,12 @@ fn test_multibyte_utf8_is_measured_in_bytes() -> Result<()> {
 fn test_multibyte_exact_fit_and_overflow() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 100)?;
-	// Six crabs (24 bytes) + é (2) + quotes (2) = 28 bytes, the most that fits; 9 chars.
-	let fits = json!(format!("{}é", "🦀".repeat(6)));
-	assert_eq!(item_len(&fits), 28);
+	// Seven crabs (28 bytes) + é (2) + quotes (2) = 32 bytes, the most that fits; 10 chars.
+	let fits = json!(format!("{}é", "🦀".repeat(7)));
+	assert_eq!(item_len(&fits), 100 - ENVELOPE);
 	store.append(fits)?;
-	// Seven crabs is 30 bytes but only 9 chars: rejected, counted in bytes.
-	let err = store.append(json!("🦀".repeat(7))).unwrap_err();
+	// Eight crabs is 34 bytes but only 10 chars: rejected, counted in bytes.
+	let err = store.append(json!("🦀".repeat(8))).unwrap_err();
 	assert_invalid_input(&err);
 
 	let files = finished_files(&mut store)?;

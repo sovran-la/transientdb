@@ -14,7 +14,7 @@ fn path(dir: &TempDir, index: u32, finished: bool) -> PathBuf {
 }
 
 fn one_per_file(dir: &TempDir) -> Result<DirectoryStore> {
-	let mut config = config(dir, 1024, KEY);
+	let mut config = config(dir, 1024, with_source(KEY));
 	config.max_file_items = Some(1);
 	DirectoryStore::new(config)
 }

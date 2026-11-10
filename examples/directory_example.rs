@@ -2,15 +2,18 @@ use serde_json::json;
 use std::io::Result;
 use std::thread;
 use std::time::Duration;
-use transientdb::{DirectoryConfig, DirectoryStore, TransientDB};
+use transientdb::{DirectoryConfig, DirectoryStore, Envelope, TransientDB};
 
 fn directory_store_example() -> Result<()> {
 	// Create a temporary directory for testing
 	let dir = tempfile::tempdir()?;
 
-	// Create a directory store configuration
+	// Create a directory store configuration. Each file is written as
+	// {"logs":[...],"service":"web-api","sentAt":"<time the file was finished>"}
 	let config = DirectoryConfig {
-		write_key: "logs-key".into(),
+		envelope: Envelope::new("logs")
+			.field("service", "web-api")
+			.timestamp("sentAt"),
 		storage_location: dir.path().to_owned(),
 		base_filename: "events".into(),
 		max_file_size: 1024 * 10, // 10KB max file size
@@ -25,10 +28,10 @@ fn directory_store_example() -> Result<()> {
 		let content = std::fs::read_to_string(path)?;
 		// Validate JSON structure
 		let value: serde_json::Value = serde_json::from_str(&content)?;
-		if value["batch"].as_array().is_none() {
+		if value["logs"].as_array().is_none() {
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
-				"Missing batch array",
+				"Missing logs array",
 			));
 		}
 		Ok(())

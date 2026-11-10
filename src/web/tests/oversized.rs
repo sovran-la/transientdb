@@ -96,7 +96,7 @@ async fn test_small_per_call_max_bytes_returns_none_without_wedging() {
 
 #[wasm_bindgen_test]
 async fn test_rejected_item_does_not_trigger_drop_oldest() {
-	let mut config = config("test-oversized-max-items", 200, KEY);
+	let mut config = config("test-oversized-max-items", 200, with_source(KEY));
 	config.max_items = Some(3);
 	let mut store = fresh_store_with(config).await;
 	for tag in 0..3 {
@@ -133,15 +133,16 @@ async fn test_rejected_item_is_never_persisted() {
 	expected = "max_fetch_size is all envelope and no room for an item? That's packaging, not a batch."
 )]
 async fn test_rejects_envelope_that_leaves_no_room() {
-	// The envelope with this key is exactly 100 bytes.
-	let key = "k".repeat(100 - envelope(""));
-	let _store = WebStore::new(config("test-panic", 100, &key)).await;
+	// The envelope with this source is exactly 100 bytes.
+	let source = "k".repeat(100 - envelope(""));
+	let _store = WebStore::new(config("test-panic", 100, with_source(&source))).await;
 }
 
 #[wasm_bindgen_test]
 async fn test_envelope_leaving_one_byte_is_accepted() {
-	let key = "k".repeat(99 - envelope(""));
-	let mut store = fresh_store_with(config("test-oversized-one-byte", 100, &key)).await;
+	let source = "k".repeat(99 - envelope(""));
+	let mut store =
+		fresh_store_with(config("test-oversized-one-byte", 100, with_source(&source))).await;
 	assert_eq!(store.max_item_size, 1);
 	assert_invalid_input(&store.append(json!(10)).unwrap_err());
 	store.append(json!(7)).unwrap();

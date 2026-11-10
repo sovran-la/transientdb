@@ -2,12 +2,15 @@ use serde_json::json;
 use std::io::Result;
 use std::thread;
 use std::time::Duration;
-use transientdb::{MemoryConfig, MemoryStore, TransientDB};
+use transientdb::{Envelope, MemoryConfig, MemoryStore, TransientDB};
 
 fn memory_store_example() -> Result<()> {
-	// Create a memory store configuration
+	// Create a memory store configuration. Each batch is
+	// {"events":[...],"source":"sensor-7","sentAt":"<time the batch was fetched>"}
 	let config = MemoryConfig {
-		write_key: "analytics-key".into(),
+		envelope: Envelope::new("events")
+			.field("source", "sensor-7")
+			.timestamp("sentAt"),
 		max_items: Some(1000),     // Store up to 1000 items
 		max_fetch_size: 1024 * 64, // 64KB max fetch size
 		max_fetch_items: None,

@@ -133,7 +133,7 @@ async fn test_persisted_oversized_items_dropped_at_head_only() {
 		return;
 	}
 
-	let mut store = WebStore::new(config(db_name, SMALL, KEY)).await;
+	let mut store = WebStore::new(config(db_name, SMALL, with_source(KEY))).await;
 	// Hydration keeps everything; nothing is dropped before a fetch.
 	assert!(store.has_data());
 	assert_eq!(values(&store), items.to_vec());
@@ -168,7 +168,7 @@ async fn test_persisted_small_budget_deletes_nothing() {
 		return;
 	}
 
-	let mut store = WebStore::new(config(db_name, SMALL, KEY)).await;
+	let mut store = WebStore::new(config(db_name, SMALL, with_source(KEY))).await;
 	assert!(store
 		.fetch(None, Some(envelope(KEY) + 50))
 		.unwrap()
@@ -186,7 +186,7 @@ async fn test_persisted_queue_of_only_oversized_items_ends_empty() {
 		return;
 	}
 
-	let mut store = WebStore::new(config(db_name, SMALL, KEY)).await;
+	let mut store = WebStore::new(config(db_name, SMALL, with_source(KEY))).await;
 	assert!(store.has_data());
 	assert!(store.fetch(None, None).unwrap().is_none());
 	assert!(!store.has_data());
