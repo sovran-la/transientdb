@@ -577,7 +577,11 @@ impl DataStore for DirectoryStore {
 	/// The first fetch of a session also recovers the files an earlier session left
 	/// unfinished, after finishing the open file and before choosing what to return, so
 	/// they come back from that same fetch in index order. The validator runs on each.
-	/// Recovery happens once per session. A recovered file that fails for a reason other
+	/// Recovery happens once per session. A file cut short partway through an item
+	/// (the process was killed, or the machine lost power) is salvaged: it keeps every
+	/// complete item, in order and byte for byte, and loses what follows the last one.
+	/// A file with no complete item is deleted, and one that does not start like a data
+	/// file is left untouched and never returned. A recovered file that fails for a reason other
 	/// than the validator is logged with `eprintln!`, is not returned, and does not fail
 	/// the fetch or stop the other files from being recovered.
 	///
@@ -657,6 +661,7 @@ mod tests {
 	mod ownership;
 	mod recovery;
 	mod rejection;
+	mod salvage;
 	mod support;
 	mod write_key;
 

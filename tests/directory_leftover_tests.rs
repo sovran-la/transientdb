@@ -116,3 +116,34 @@ fn test_rejected_file_is_deleted_and_later_fetches_succeed() -> Result<()> {
 	assert_eq!(batch(&files[0])?, vec![json!("later")]);
 	Ok(())
 }
+
+#[test]
+fn test_leftover_cut_inside_an_item_is_salvaged() -> Result<()> {
+	let temp_dir = TempDir::new()?;
+	// Killed partway through the third item, which holds a "}" and a comma.
+	let cut = write(
+		&temp_dir,
+		"1-events",
+		&format!("{OPENING}{{\"n\":1,\"s\":\"a,}}\"}},[2,{{\"x\":\"]\"}}],{{\"n\":3,\"s\":\"b,}}"),
+	)?;
+	let unreadable = write(&temp_dir, "2-events", "garbage, not a data file")?;
+
+	let (db, seen) = recording_db(&temp_dir)?;
+	let result = db.fetch(None, None)?.unwrap();
+	let files = result.data.unwrap();
+	assert_eq!(files.len(), 1);
+	assert_eq!(
+		batch(&files[0])?,
+		vec![json!({"n": 1, "s": "a,}"}), json!([2, {"x": "]"}])]
+	);
+	assert!(fs::read_to_string(&files[0])?.starts_with(&format!(
+		"{OPENING}{{\"n\":1,\"s\":\"a,}}\"}},[2,{{\"x\":\"]\"}}]]"
+	)));
+	assert!(!cut.exists());
+	// The validator saw the salvaged file; the unreadable one is left as it was.
+	assert_eq!(seen.lock().unwrap().clone(), vec![cut]);
+	assert_eq!(fs::read_to_string(&unreadable)?, "garbage, not a data file");
+	db.remove(&result.removable.unwrap())?;
+	assert!(db.fetch(None, None)?.is_none());
+	Ok(())
+}
