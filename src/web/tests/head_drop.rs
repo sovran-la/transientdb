@@ -21,6 +21,7 @@ fn inject(store: &mut WebStore, items: &[Value]) {
 	for (i, value) in items.iter().enumerate() {
 		store.items.push_back(StoredEvent {
 			key: 1_000_000 + i as u32,
+			batch: store.current_batch,
 			value: value.clone(),
 		});
 	}

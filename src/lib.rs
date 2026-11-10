@@ -86,6 +86,11 @@ pub trait DataStore {
 	/// configured `max_fetch_size`) to the returned batch; `DirectoryStore` applies it to
 	/// the total size of the returned files, each of which is at most `max_file_size`.
 	///
+	/// A batch also never crosses a boundary set by [`end_batch`](Self::end_batch).
+	/// `MemoryStore` and `WebStore` stop their batch at the first boundary, so a fetch can
+	/// return fewer items than asked for while more are stored; `DirectoryStore` ends a
+	/// file there.
+	///
 	/// Returns the fetched data along with items that can be passed to `remove()`.
 	/// Fetching removes nothing: the data stays in the store, and a later fetch returns it
 	/// again, until those items are passed to `remove()`.
@@ -104,4 +109,15 @@ pub trait DataStore {
 	/// (for `DirectoryStore`, on paths to its own finished files) and silently ignore
 	/// anything else, returning `Ok`, as they do for items already removed.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()>;
+
+	/// Ends the current batch: items appended before this call and items appended after
+	/// it are never returned in the same batch. A batch is one file for `DirectoryStore`
+	/// and one fetched `Value` for `MemoryStore` and `WebStore`.
+	///
+	/// When nothing has been appended since the store was created, since the last
+	/// `end_batch`, or since everything was removed or reset, there is nothing to end:
+	/// the call does nothing and returns `Ok(())`. Calling it several times in a row is
+	/// the same as calling it once. It never creates an empty batch, fetches nothing,
+	/// returns no data, and removes nothing.
+	fn end_batch(&mut self) -> Result<()>;
 }

@@ -27,7 +27,7 @@ async fn test_failed_write_leaves_memory_and_other_records_intact() {
 	// constraint error and its transaction aborts.
 	let blocker = json!("already stored under this key");
 	let db = store.db.clone().unwrap();
-	let occupied = idb::add(&db, store.next_key, &blocker).unwrap();
+	let occupied = idb::add(&db, store.next_key, store.current_batch, &blocker).unwrap();
 	idb::completion(&occupied).await.unwrap();
 
 	let failed = json!({"i": "fails to persist"});
