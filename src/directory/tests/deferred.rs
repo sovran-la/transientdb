@@ -120,7 +120,6 @@ fn test_rejected_leftover_does_not_fail_the_fetch() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let (paths, batches) = three_leftovers(&temp_dir)?;
 	let rejected = paths[1].clone();
-	let rejected_bytes = fs::read(&rejected)?;
 
 	let mut store = store(&temp_dir, 1024)?;
 	let target = rejected.clone();
@@ -133,25 +132,23 @@ fn test_rejected_leftover_does_not_fail_the_fetch() -> Result<()> {
 		[batches[0].clone(), batches[2].clone(), vec![json!("new")]].concat()
 	);
 	assert_eq!(seen(&log).len(), 4);
-	// Left in place, unchanged and unfinished.
-	assert_eq!(fs::read(&rejected)?, rejected_bytes);
+	// Deleted, in every form.
+	assert!(!rejected.exists());
 	assert!(!finished(&rejected).exists());
+	assert_eq!(files_on_disk(&temp_dir)?.len(), 3);
 
-	// Not retried in this session.
+	// Nothing to retry in this session.
 	let again = finished_files(&mut store)?;
 	assert_eq!(again.len(), 3);
 	assert_eq!(seen(&log).len(), 4);
-	assert!(store.has_data());
 	drop(store);
 
-	// A new session tries it again.
+	// Nor in a new one.
 	let mut store = DirectoryStore::new(config(&temp_dir, 1024, KEY))?;
+	assert!(store.leftovers.is_empty());
 	let log = recording(&mut store, |_| false);
-	let files = fetched(&mut store)?;
-	assert_eq!(seen(&log), vec![rejected.clone()]);
-	assert_eq!(files.len(), 4);
-	assert_eq!(files[1], finished(&rejected));
-	assert_eq!(read_finished(&files[1], KEY)?.batch(), &batches[1]);
+	assert_eq!(fetched(&mut store)?.len(), 3);
+	assert!(seen(&log).is_empty());
 	Ok(())
 }
 
@@ -256,17 +253,18 @@ fn test_this_sessions_unfinished_files_are_never_leftovers() -> Result<()> {
 	let mut config = config(&temp_dir, 1024, KEY);
 	config.max_file_items = Some(1);
 	let mut store = DirectoryStore::new(config)?;
-	// Reject this session's first file on rotation, leaving it unfinished on disk.
+	// A directory where this session's first file would be renamed to makes finishing
+	// it fail, leaving it unfinished on disk.
 	let first_new = temp_dir.path().join("10-events");
-	let target = first_new.clone();
-	let log = recording(&mut store, move |p| p == target);
+	fs::create_dir(finished(&first_new))?;
+	let log = recording(&mut store, |_| false);
 	store.append(json!("a"))?;
 	assert!(store.append(json!("b")).is_err());
 	assert!(first_new.exists());
 	store.append(json!("c"))?;
 
 	let files = fetched(&mut store)?;
-	// Leftovers, then this session's later file; the rejected one is not recovered.
+	// Leftovers, then this session's later file; the unfinished one is not recovered.
 	assert_eq!(files.len(), 4);
 	assert_eq!(files[3], finished(&temp_dir.path().join("11-events")));
 	assert_eq!(
