@@ -89,7 +89,7 @@ use serde_json::json;
 // Configure an in-memory store
 let config = MemoryConfig {
     write_key: "my-app".into(),
-    max_items: 1000,
+    max_items: Some(1000),
     max_fetch_size: 1024 * 1024, // 1MB
     max_fetch_items: None,
 };
@@ -245,7 +245,7 @@ use serde_json::json;
 let config = WebConfig {
     write_key: "my-app".into(),
     database_name: "my-app-events".into(),
-    max_items: 1000,
+    max_items: Some(1000),
     max_fetch_size: 1024 * 1024, // 1MB
     max_fetch_items: None,
 };
@@ -297,7 +297,7 @@ if let Some(result) = db.fetch(Some(100), None)? {
 
 ### MemoryStore
 - Stores data in memory using a FIFO queue
-- Automatically removes old items when max_items is reached
+- Drops the oldest items past `max_items` when it sets a cap; with `max_items: None`, never drops
 - Returns data as serde_json::Value
 - Ideal for high-throughput, temporary data storage
 - Requires explicit cleanup via remove(); fetch does not remove returned items
@@ -312,6 +312,8 @@ if let Some(result) = db.fetch(Some(100), None)? {
 
 ### WebStore (WASM)
 - Browser-based storage using IndexedDB
+- Drops the oldest items past `max_items` (in memory and in IndexedDB) when it sets a cap;
+  with `max_items: None`, never drops
 - Async construction, sync operations (fire-and-forget persistence)
 - Graceful fallback to memory-only if IndexedDB unavailable
 - Automatic hydration from IndexedDB on startup, in append order
@@ -333,7 +335,7 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 
 ### MemoryConfig
 - `write_key`: Identifier for the data source
-- `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
+- `max_items`: Total store capacity, or `None` for no cap. With `Some(n)`, the oldest items are dropped silently beyond `n` (must not be `Some(0)`); see [Item cap](#item-cap)
 - `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
 
@@ -347,9 +349,29 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 ### WebConfig
 - `write_key`: Identifier for the data source
 - `database_name`: Name of the IndexedDB database (use unique names per store)
-- `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
+- `max_items`: Total store capacity, or `None` for no cap. With `Some(n)`, the oldest items are dropped silently beyond `n` (must not be `Some(0)`); see [Item cap](#item-cap)
 - `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
+
+### Item cap
+
+`MemoryConfig::max_items` and `WebConfig::max_items` set the store's total capacity.
+`Some(n)` drops the oldest items, silently, once an append takes the store past `n`.
+`None` means unbounded: the store never drops an item because of how many it holds, so use
+it for a store that must never lose data by its own policy.
+
+```rust
+let config = MemoryConfig {
+    write_key: "my-app".into(),
+    max_items: None, // never drop items for capacity
+    max_fetch_size: 1024 * 1024,
+    max_fetch_items: None,
+};
+```
+
+With `None` the store grows without limit until fetched items are passed to `remove()`, so
+keeping memory (and, for WebStore, IndexedDB) use in check is the caller's responsibility.
+`DirectoryStore` has no item cap and never drops items for capacity.
 
 ### Byte limits
 
@@ -431,7 +453,7 @@ Each store can enforce one:
   ```rust
   let config = MemoryConfig {
       write_key: "my-app".into(),
-      max_items: 1000,
+      max_items: Some(1000),
       max_fetch_size: 1024 * 1024,
       max_fetch_items: Some(8), // every fetch returns at most 8 items
   };

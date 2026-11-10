@@ -59,7 +59,7 @@ fn benchmark_memory_store() -> Result<()> {
 
 	let config = MemoryConfig {
 		write_key: "bench-key".to_string(),
-		max_items: 2_000_000,             // 2M to avoid FIFO cleanup during test
+		max_items: Some(2_000_000),       // 2M to avoid FIFO cleanup during test
 		max_fetch_size: 1024 * 1024 * 10, // 10MB
 		max_fetch_items: None,
 	};

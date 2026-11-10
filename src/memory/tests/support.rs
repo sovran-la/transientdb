@@ -8,7 +8,7 @@ pub(super) const KEY: &str = "test-key";
 pub(super) fn store_with(max_fetch_size: usize, write_key: &str) -> MemoryStore {
 	MemoryStore::new(MemoryConfig {
 		write_key: write_key.to_string(),
-		max_items: 10_000,
+		max_items: Some(10_000),
 		max_fetch_size,
 		max_fetch_items: None,
 	})

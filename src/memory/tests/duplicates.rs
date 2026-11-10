@@ -6,7 +6,7 @@ use crate::Equivalent;
 fn store_of(max_items: usize) -> MemoryStore {
 	MemoryStore::new(MemoryConfig {
 		write_key: "test-key".to_string(),
-		max_items,
+		max_items: Some(max_items),
 		max_fetch_size: 4096,
 		max_fetch_items: None,
 	})

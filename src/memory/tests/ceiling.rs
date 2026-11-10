@@ -146,7 +146,7 @@ fn test_per_call_max_bytes_is_the_ceiling() -> Result<()> {
 fn test_count_item_limit_and_bytes_each_win() -> Result<()> {
 	let mut store = MemoryStore::new(MemoryConfig {
 		write_key: KEY.to_string(),
-		max_items: 1000,
+		max_items: Some(1000),
 		max_fetch_size: 1000,
 		max_fetch_items: Some(6),
 	});
@@ -177,7 +177,7 @@ fn test_count_item_limit_and_bytes_each_win() -> Result<()> {
 fn test_max_items_drop_oldest_with_ceiling() -> Result<()> {
 	let mut store = MemoryStore::new(MemoryConfig {
 		write_key: KEY.to_string(),
-		max_items: 10,
+		max_items: Some(10),
 		max_fetch_size: 200,
 		max_fetch_items: None,
 	});
