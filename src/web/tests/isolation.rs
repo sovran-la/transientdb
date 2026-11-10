@@ -60,3 +60,46 @@ async fn test_stores_on_different_databases_are_isolated() {
 	assert_eq!(hydrated(name_a, 4096).await, more_a);
 	assert!(hydrated(name_b, 4096).await.is_empty());
 }
+
+/// IndexedDB names are arbitrary strings, so unlike `DirectoryConfig::base_filename`
+/// no `database_name` is refused: even an empty one, or one with what would be path
+/// separators or a NUL byte in a file name, persists and is isolated from the others.
+#[wasm_bindgen_test]
+async fn test_any_database_name_persists_and_is_isolated() {
+	let names = [
+		"",
+		" ",
+		"../escape",
+		"a\\b/c",
+		"nul\0inside",
+		".",
+		"🦀 データ",
+	];
+	let mut stores = Vec::new();
+	for name in names {
+		let store = fresh_store(name, 4096).await;
+		if !store.is_persisted() {
+			web_sys::console::log_1(&"Skipping database name test - no persistence".into());
+			return;
+		}
+		stores.push(store);
+	}
+	for (store, name) in stores.iter_mut().zip(names) {
+		for item in items(name, 2) {
+			store.append(item).unwrap();
+		}
+	}
+	settle().await;
+
+	for (store, name) in stores.iter_mut().zip(names) {
+		assert_eq!(fetched_items(store), items(name, 2), "{name:?}");
+		assert_eq!(hydrated(name, 4096).await, items(name, 2), "{name:?}");
+	}
+	for store in &mut stores {
+		store.reset();
+	}
+	settle().await;
+	for name in names {
+		assert!(hydrated(name, 4096).await.is_empty(), "{name:?}");
+	}
+}

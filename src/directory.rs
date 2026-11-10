@@ -59,6 +59,10 @@ pub struct DirectoryConfig {
 	/// to that whole name ("5-events.json" becomes "5-events.json.temp"), so
 	/// `base_filename` must not itself end in `.temp`.
 	///
+	/// It must be a plain file name: not empty, not `.` or `..`, and without `/`, `\` or
+	/// a NUL byte (both separators are refused on every platform). Dots, spaces, hyphens,
+	/// digits and non-ASCII characters are fine. `DirectoryStore::new` panics otherwise.
+	///
 	/// The store owns exactly the files with those two names and ignores everything else
 	/// in `storage_location`, so stores with different `base_filename`s can share one
 	/// directory without seeing, counting, finishing, fetching or deleting each other's
@@ -162,6 +166,8 @@ impl DirectoryStore {
 	/// * If max_file_items is `Some(0)`
 	/// * If max_file_size leaves no room for even a 1-byte item once the file's
 	///   envelope (which grows with `write_key`) is counted
+	/// * If base_filename is empty, is `.` or `..`, or contains `/`, `\` or a NUL byte:
+	///   the store's file names would escape the storage directory or not be names
 	/// * If base_filename ends in `.temp`: its open files would carry the name another
 	///   store's finished files have, so ownership could not be told from the name
 	pub fn new(config: DirectoryConfig) -> Result<Self> {
@@ -171,12 +177,7 @@ impl DirectoryStore {
 		if config.max_file_items == Some(0) {
 			panic!("max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory.");
 		}
-		if config
-			.base_filename
-			.ends_with(&format!(".{}", Self::TEMP_EXTENSION))
-		{
-			panic!("base_filename ends in \".temp\"? That's the mark of a finished file; a name that looks done before it starts can't be told apart from one that is.");
-		}
+		Self::validate_base_filename(&config.base_filename);
 
 		let mut store = DirectoryStore {
 			config,
@@ -692,6 +693,7 @@ mod tests {
 	use std::io::Result;
 	use tempfile::TempDir;
 
+	mod base_filename;
 	mod ceiling;
 	mod deferred;
 	mod duplicates;

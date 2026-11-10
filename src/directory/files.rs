@@ -24,6 +24,28 @@ pub(super) struct OwnedFile {
 }
 
 impl DirectoryStore {
+	/// Panics unless `base_filename` names files inside the storage directory that the
+	/// ownership rule can tell apart: not empty, not `.` or `..`, no `/`, `\` or NUL, and
+	/// not ending in `.temp`. Both separators are refused on every platform, so the same
+	/// configuration behaves the same everywhere.
+	pub(super) fn validate_base_filename(base_filename: &str) {
+		if base_filename.is_empty() {
+			panic!("base_filename is empty? Every file would be named \"{{index}}-\", which is a number and a dash, not a name.");
+		}
+		if base_filename.contains(['/', '\\']) {
+			panic!("base_filename contains a path separator? Files go in storage_location, not wherever the name wanders off to.");
+		}
+		if base_filename == "." || base_filename == ".." {
+			panic!("base_filename is \".\" or \"..\"? Those name directories, not files.");
+		}
+		if base_filename.contains('\0') {
+			panic!("base_filename contains a NUL byte? The filesystem stops reading there, and so would ownership.");
+		}
+		if base_filename.ends_with(&format!(".{}", Self::TEMP_EXTENSION)) {
+			panic!("base_filename ends in \".temp\"? That's the mark of a finished file; a name that looks done before it starts can't be told apart from one that is.");
+		}
+	}
+
 	/// The name of this store's file `index` while it is open or unfinished.
 	pub(super) fn unfinished_name(&self, index: u32) -> String {
 		format!("{index}-{}", self.config.base_filename)
