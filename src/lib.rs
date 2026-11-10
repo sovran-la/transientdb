@@ -58,6 +58,12 @@ pub trait DataStore {
 	/// The built-in stores return `ErrorKind::InvalidInput`, and store nothing, for an
 	/// item too large to fit by itself under the store's configured byte limit, envelope
 	/// included. Such an item could never be delivered.
+	///
+	/// They also return `ErrorKind::InvalidInput`, and store nothing, for an item nested
+	/// more than 125 levels deep in arrays and objects (each `[]` or `{}` is a level).
+	/// `serde_json` cannot read a deeper item back from a batch, so neither could the
+	/// store's own recovery or the consumer. The check does not recurse, so even a
+	/// pathologically deep item is rejected without overflowing the stack.
 	fn append(&mut self, data: Value) -> Result<()>;
 
 	/// Fetches a batch of data from the store, respecting optional count and size limits.
