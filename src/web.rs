@@ -498,6 +498,7 @@ mod tests {
 	mod reopen;
 	mod schema;
 	mod support;
+	mod write_failure;
 	mod write_key;
 
 	fn test_config(db_name: &str) -> WebConfig {

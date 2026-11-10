@@ -2,13 +2,16 @@ use crate::{batch, DataResult, DataStore, Equivalent};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::any::Any;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Result, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod data_file;
 mod files;
 mod recovery;
+
+use data_file::DataFile;
 
 impl Equivalent for PathBuf {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
@@ -105,9 +108,17 @@ pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 /// - A `batch` array containing the stored items
 /// - A `sentAt` timestamp in RFC3339 format
 /// - The store's `writeKey`
+///
+/// # Durability
+/// Files are not fsynced, so durability across a power loss or OS crash is not
+/// guaranteed: an append that returned `Ok` may not survive one. What was written is
+/// salvaged by the next session's first `fetch`: a file cut short keeps every complete
+/// item and loses what follows the last one. A write that fails while the store is
+/// running (disk full, an I/O error) is rolled back, so it never leaves a partial item
+/// in a file.
 pub struct DirectoryStore {
 	config: DirectoryConfig,
-	writer: Option<BufWriter<File>>,
+	writer: Option<BufWriter<DataFile>>,
 	current_size: usize,
 	current_items: usize,
 	current_path: Option<PathBuf>,
@@ -115,9 +126,12 @@ pub struct DirectoryStore {
 	closing_len: usize,
 	file_validator: Option<FileValidator>,
 	next_index: AtomicU32,
-	/// This store's unfinished files that an earlier session left behind, listed by
-	/// `new` and recovered by the next `fetch`.
+	/// Unfinished files for the next `fetch` to recover: those an earlier session left
+	/// behind, listed by `new`, and any this session abandoned after a failed write.
 	leftovers: Vec<PathBuf>,
+	/// Failures to inject into the data files this store opens.
+	#[cfg(test)]
+	faults: std::sync::Arc<std::sync::Mutex<data_file::Faults>>,
 }
 
 impl DirectoryStore {
@@ -174,6 +188,8 @@ impl DirectoryStore {
 			file_validator: None,
 			next_index: AtomicU32::new(0),
 			leftovers: Vec::new(),
+			#[cfg(test)]
+			faults: Default::default(),
 		};
 		store.closing_len = store.closing(Utc::now()).len();
 		if store.opening().len() + store.closing_len + 1 > store.config.max_file_size {
@@ -365,8 +381,28 @@ impl DirectoryStore {
 				.open(&file_path)
 			{
 				Ok(file) => {
-					let mut writer = BufWriter::new(file);
-					writer.write_all(self.opening())?;
+					let mut writer = BufWriter::new(DataFile::new(
+						file,
+						#[cfg(test)]
+						self.faults.clone(),
+					));
+					// Flushed now, so the opening is known to be on disk before any item
+					// is written and a rollback never has to restore it.
+					if let Err(e) = writer
+						.write_all(self.opening())
+						.and_then(|()| writer.flush())
+					{
+						// Discard the buffer without flushing; the file holds no item, so
+						// remove it rather than keep a file the store cannot use.
+						drop(writer.into_parts());
+						if let Err(remove) = fs::remove_file(&file_path) {
+							eprintln!(
+								"Failed to remove {:?} after failing to start it: {}",
+								file_path, remove
+							);
+						}
+						return Err(e);
+					}
 					self.current_path = Some(file_path);
 					self.current_size = self.opening().len();
 					self.current_items = 0;
@@ -535,7 +571,11 @@ impl DataStore for DirectoryStore {
 	/// # Errors
 	/// Returns an `InvalidInput` error, without touching any file, if the serialized
 	/// item is too large to fit even alone in a fresh file. Also propagates IO errors
-	/// from finishing the previous file.
+	/// from finishing the previous file, and from writing the item. A failed write
+	/// stores nothing of the item: the open file is rolled back to the items before it,
+	/// and the next append continues it. If even the rollback fails, the store stops
+	/// using that file and the next append starts a new one; the next `fetch` salvages
+	/// the abandoned file's complete items.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let item = serde_json::to_vec(&data)?;
 
@@ -556,18 +596,16 @@ impl DataStore for DirectoryStore {
 		}
 		self.start_file_if_needed()?;
 
-		let writer = self
-			.writer
-			.as_mut()
-			.ok_or_else(|| io::Error::other("No active writer"))?;
+		// The separator and the item go out as one write, so a failure leaves nothing
+		// half-accounted between them.
+		let mut bytes = Vec::with_capacity(Self::SEPARATOR.len() + item.len());
 		if self.current_items > 0 {
-			writer.write_all(Self::SEPARATOR)?;
-			self.current_size += Self::SEPARATOR.len();
+			bytes.extend_from_slice(Self::SEPARATOR);
 		}
-		writer.write_all(&item)?;
-		writer.flush()?;
+		bytes.extend_from_slice(&item);
+		self.write_to_open_file(&bytes)?;
 
-		self.current_size += item.len();
+		self.current_size += bytes.len();
 		self.current_items += 1;
 		Ok(())
 	}
@@ -663,6 +701,7 @@ mod tests {
 	mod rejection;
 	mod salvage;
 	mod support;
+	mod write_failure;
 	mod write_key;
 
 	#[test]
