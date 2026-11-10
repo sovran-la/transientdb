@@ -13,6 +13,13 @@
 //! or power loss can leave a file ending partway through an item, or followed by zero
 //! bytes or garbage.
 //!
+//! A file that is a complete envelope is renamed as is, unless it is larger than
+//! `max_file_size` (it was written under an earlier, larger limit). Then it is cut down
+//! like a salvaged file: its leading complete items that fit once closed are kept, the
+//! rest are dropped, and it is closed again. If not even its first item fits, it is
+//! deleted. Only unfinished files are recovered; files already finished (`.temp`) by an
+//! earlier session are fetched as they are.
+//!
 //! A listed file that does not start with the store's opening (empty, cut inside the
 //! opening, or overwritten) is deleted. Its name makes it this store's file (see
 //! `files.rs`), the store never writes one that way, and it can never be read, so
@@ -62,16 +69,22 @@ impl DirectoryStore {
 	/// on any other finished file.
 	///
 	/// A file that is already a complete envelope, because the session ended after
-	/// closing it and before renaming it, is not closed a second time. Any other file is
-	/// salvaged (see [`salvage`]): cut back to its last complete item and closed. One
-	/// that does not start with the store's opening, or that has no complete item, is
-	/// deleted without reaching the validator. A failed delete is returned as an error,
-	/// so it is logged and the file is left, neither renamed nor fetched.
+	/// closing it and before renaming it, is not closed a second time: at or under
+	/// `max_file_size` it is renamed as is. One over it, written under an earlier, larger
+	/// `max_file_size`, is cut down by the same rule as any other file. Any other file is
+	/// salvaged (see [`salvage`]): cut back to its last complete item that fits under
+	/// `max_file_size` once closed, and closed. For a complete envelope, the closing
+	/// already on it is just what follows its last complete item, so it is cut too.
+	///
+	/// One that does not start with the store's opening, or that has no complete item
+	/// that fits, is deleted without reaching the validator. A failed delete is returned
+	/// as an error, so it is logged and the file is left, neither renamed nor fetched.
 	pub(super) fn recover_file(&self, path: &Path) -> Result<()> {
-		// Reads the whole file: the store never writes one larger than max_file_size,
-		// so this is bounded by the configured limit.
+		// Reads the whole file, which is bounded by the max_file_size of the session
+		// that wrote it: the store never writes a file larger than its own limit.
 		let content = fs::read(path)?;
-		if Self::is_complete_envelope(&content) {
+		let complete = Self::is_complete_envelope(&content);
+		if complete && content.len() <= self.config.max_file_size {
 			return self.mark_finished(path);
 		}
 		let max_len = self.config.max_file_size - self.closing_len;
@@ -83,18 +96,38 @@ impl DirectoryStore {
 				);
 				self.remove_leftover(path)
 			}
+			Salvage::Empty if complete => {
+				eprintln!(
+					"Deleting {:?}: it is {} bytes, over max_file_size = {} bytes, and not even its first item fits",
+					path,
+					content.len(),
+					self.config.max_file_size
+				);
+				self.remove_leftover(path)
+			}
 			Salvage::Empty => {
 				eprintln!("Deleting {:?}: it holds no complete item", path);
 				self.remove_leftover(path)
 			}
 			Salvage::Keep(len) => {
+				// A complete envelope always loses at least its closing here.
 				if len < content.len() {
-					eprintln!(
-						"Salvaging {:?}: keeping its first {} of {} bytes, up to its last complete item",
-						path,
-						len,
-						content.len()
-					);
+					if complete {
+						eprintln!(
+							"Cutting {:?} down to max_file_size = {} bytes: keeping its first {} of {} bytes, the leading items that fit",
+							path,
+							self.config.max_file_size,
+							len,
+							content.len()
+						);
+					} else {
+						eprintln!(
+							"Salvaging {:?}: keeping its first {} of {} bytes, up to its last complete item",
+							path,
+							len,
+							content.len()
+						);
+					}
 					OpenOptions::new()
 						.write(true)
 						.open(path)?

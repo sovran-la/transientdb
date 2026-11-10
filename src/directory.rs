@@ -77,6 +77,11 @@ pub struct DirectoryConfig {
 	///
 	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once
 	/// the envelope is counted (the envelope grows with `write_key`'s length).
+	///
+	/// An unfinished file an earlier session left under a larger limit, even one it had
+	/// already closed, is cut down when recovered to the leading items that fit under
+	/// this one, and deleted if not even its first item fits. Files already finished
+	/// (`.temp`) by an earlier session are fetched as they are.
 	pub max_file_size: usize,
 	/// Maximum number of items in an individual data file.
 	/// Once a file holds this many items, the next append starts a new file.
@@ -718,6 +723,7 @@ mod tests {
 	mod index_limit;
 	mod lifecycle;
 	mod oversized;
+	mod oversized_leftover;
 	mod ownership;
 	mod recovery;
 	mod rejection;
