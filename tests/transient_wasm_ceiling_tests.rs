@@ -1,22 +1,19 @@
-//! Byte-ceiling behavior through the TransientDB wrapper with the WebStore backend.
+//! Size limits through the TransientDB wrapper with the WebStore backend.
 
 #![cfg(target_arch = "wasm32")]
 
 use serde_json::{json, Value};
-use std::io::ErrorKind;
-use transientdb::{Envelope, TransientDB, WebConfig, WebStore};
+use transientdb::{Error, TransientDB, WebConfig, WebStore};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-async fn web_db(db_name: &str, max_fetch_size: usize) -> TransientDB<Value> {
+async fn web_db(db_name: &str, max_item_size: usize) -> TransientDB {
 	let db = TransientDB::new(
 		WebStore::new(WebConfig {
-			envelope: Envelope::default(),
 			database_name: db_name.to_string(),
-			max_items: Some(10_000),
-			max_fetch_size,
-			max_fetch_items: None,
+			max_item_size,
+			max_items: 10_000,
 		})
 		.await,
 	);
@@ -25,15 +22,18 @@ async fn web_db(db_name: &str, max_fetch_size: usize) -> TransientDB<Value> {
 	db
 }
 
-/// Fetches and removes batches until empty, checking each is within `max` bytes.
-fn drain(db: &TransientDB<Value>, max: usize) -> Vec<Value> {
+/// Fetches and removes until empty, checking each fetch is within `max_bytes`.
+fn drain(db: &TransientDB, max_bytes: usize) -> Vec<Value> {
 	let mut items = Vec::new();
-	while let Some(result) = db.fetch(None, None).unwrap() {
-		let batch = result.data.unwrap();
-		let len = serde_json::to_string(&batch).unwrap().len();
-		assert!(len <= max, "batch is {len} bytes, over {max}");
-		items.extend(batch["items"].as_array().unwrap().iter().cloned());
-		db.remove(&result.removable.unwrap()).unwrap();
+	while let Some(fetched) = db.fetch(usize::MAX, max_bytes).unwrap() {
+		assert!(
+			fetched.byte_len() <= max_bytes,
+			"{} bytes",
+			fetched.byte_len()
+		);
+		assert_eq!(fetched.json().len(), fetched.byte_len() + fetched.len() + 1);
+		items.extend(fetched.values());
+		db.remove(fetched).unwrap();
 	}
 	assert!(!db.has_data());
 	items
@@ -44,8 +44,16 @@ async fn test_web_oversized_append_through_transientdb() {
 	let db = web_db("test-transient-ceiling-oversized", 200).await;
 	db.append(json!({"i": 0})).unwrap();
 	let err = db.append(json!({"big": "x".repeat(500)})).unwrap_err();
-	assert_eq!(err.kind(), ErrorKind::InvalidInput);
-	assert!(err.to_string().contains("max_fetch_size"), "{err}");
+	assert!(
+		matches!(
+			err,
+			Error::ItemTooLarge {
+				size: 510,
+				max: 200
+			}
+		),
+		"{err:?}"
+	);
 
 	let mut expected = vec![json!({"i": 0})];
 	for i in 1..20 {
@@ -57,15 +65,15 @@ async fn test_web_oversized_append_through_transientdb() {
 }
 
 #[wasm_bindgen_test]
-async fn test_web_mixed_sizes_respect_ceiling_through_transientdb() {
-	let db = web_db("test-transient-ceiling-mixed", 300).await;
+async fn test_web_mixed_sizes_respect_limits_through_transientdb() {
+	let db = web_db("test-transient-ceiling-mixed", 230).await;
 	let mut expected = Vec::new();
 	for i in 0..100 {
-		// Up to 79 crabs (316 bytes): those over 230 bytes cannot fit under 300.
+		// Up to 79 crabs (316 bytes): those over 230 bytes are refused.
 		let item = json!({"i": i, "s": "🦀".repeat(i % 80)});
 		match db.append(item.clone()) {
 			Ok(()) => expected.push(item),
-			Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
+			Err(e) => assert!(matches!(e, Error::ItemTooLarge { max: 230, .. })),
 		}
 	}
 	assert!(expected.len() < 100, "some items should be too large");

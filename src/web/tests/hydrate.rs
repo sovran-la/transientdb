@@ -1,0 +1,164 @@
+//! Opening a store over what an earlier one stored: records this store would not have
+//! accepted are discarded, deleted from IndexedDB and logged, and if more items are stored
+//! than `max_items` allows, the oldest are dropped. Nothing else is touched.
+
+use super::schema::add_raw;
+use super::*;
+use crate::item_samples::assert_exact;
+use crate::serialize::{nested, Shape, MAX_ITEM_DEPTH};
+use contract::{append_all, item_of_len, tagged};
+
+/// Writes `items` through a roomy store on a fresh `db_name`, then waits for IndexedDB.
+/// `None`, after logging, when IndexedDB is unavailable.
+async fn written(db_name: &str, items: &[Value]) -> Option<()> {
+	let mut store = persisted(db_name, 1 << 20, 1 << 20).await?;
+	append_all(&mut store, items);
+	settle().await;
+	Some(())
+}
+
+/// Every record IndexedDB holds for `db_name`, read through a roomy store's connection.
+async fn records(db_name: &str) -> Vec<Value> {
+	let store = WebStore::new(config(db_name, 1 << 20, 1 << 20)).await;
+	idb::read_all(store.db.as_ref().unwrap()).await.unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn test_lowered_max_items_drops_the_oldest_at_open() {
+	let db_name = "test-hydrate-lowered-max-items";
+	if written(db_name, &tagged(0..10)).await.is_none() {
+		return;
+	}
+	let mut store = WebStore::new(config(db_name, 4096, 3)).await;
+	assert_eq!(queued(&store), tagged(7..10));
+	// The drop reached IndexedDB.
+	assert_eq!(flushed(&store).await, stored(&store));
+	assert_eq!(hydrated(db_name).await, tagged(7..10));
+	// From then on the store holds at most 3, as usual.
+	store.append(json!({"i": 10})).unwrap();
+	assert_eq!(queued(&store), tagged(8..11));
+	store.reset();
+	settle().await;
+}
+
+#[wasm_bindgen_test]
+async fn test_raised_max_items_keeps_everything() {
+	let db_name = "test-hydrate-raised-max-items";
+	if written(db_name, &tagged(0..10)).await.is_none() {
+		return;
+	}
+	let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert_eq!(queued(&store), tagged(0..10));
+	append_all(&mut store, &tagged(10..20));
+	assert_eq!(hydrated(db_name).await, tagged(0..20));
+	store.reset();
+	settle().await;
+}
+
+#[wasm_bindgen_test]
+async fn test_items_over_a_smaller_max_item_size_are_discarded_at_open() {
+	let db_name = "test-hydrate-smaller-max-item-size";
+	let items = [
+		item_of_len(100, 0),
+		json!("a"),
+		item_of_len(51, 1),
+		item_of_len(50, 2),
+		item_of_len(500, 3),
+		json!("b"),
+	];
+	if written(db_name, &items).await.is_none() {
+		return;
+	}
+	let mut store = WebStore::new(config(db_name, 50, 1000)).await;
+	let kept = vec![json!("a"), item_of_len(50, 2), json!("b")];
+	assert_eq!(queued(&store), kept);
+	assert_eq!(flushed(&store).await, stored(&store));
+	assert_eq!(hydrated(db_name).await, kept);
+	// Every item left can be fetched under the new limit.
+	let all = store.fetch(10, 1000).unwrap().unwrap();
+	assert_eq!(all.values(), kept);
+	drop(all);
+	store.reset();
+	settle().await;
+}
+
+#[wasm_bindgen_test]
+async fn test_both_limits_lowered_at_once() {
+	let db_name = "test-hydrate-both-lowered";
+	let items: Vec<Value> = (0..8)
+		.map(|i| item_of_len(if i % 2 == 0 { 40 } else { 10 }, i))
+		.collect();
+	if written(db_name, &items).await.is_none() {
+		return;
+	}
+	// The oversized ones go first, then the oldest of the rest beyond max_items.
+	let store = WebStore::new(config(db_name, 20, 2)).await;
+	assert_eq!(queued(&store), vec![items[5].clone(), items[7].clone()]);
+	assert_eq!(
+		hydrated(db_name).await,
+		vec![items[5].clone(), items[7].clone()]
+	);
+	let mut store = store;
+	store.reset();
+	settle().await;
+}
+
+#[wasm_bindgen_test]
+async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reused() {
+	let db_name = "test-hydrate-not-items";
+	let Some(store) = persisted(db_name, 4096, 1000).await else {
+		return;
+	};
+	settle().await;
+	let db = store.db.clone().unwrap();
+	let too_deep = nested(MAX_ITEM_DEPTH + 1, Shape::Arrays, json!(0)).to_string();
+	add_raw(
+		&db,
+		&[
+			json!({"seq": 1, "text": json!({"n": u64::MAX}).to_string()}),
+			json!({"seq": 2, "text": 42}),
+			json!({"seq": 3, "text": {"event": "a JavaScript value"}}),
+			json!({"seq": 4, "text": null}),
+			json!({"seq": 5, "text": "not json"}),
+			json!({"seq": 6, "text": ""}),
+			json!({"seq": 7, "text": "{\"a\":1} trailing"}),
+			json!({"seq": 8, "text": "42.0"}),
+			json!({"seq": 9, "text": too_deep}),
+			json!({"seq": 10}),
+			json!({"seq": 0, "text": "\"zero is not a sequence number\""}),
+			json!({"seq": 12.5, "text": "\"fractional\""}),
+			json!({"seq": 9_007_199_254_740_992u64, "text": "\"past MAX_SEQ\""}),
+			json!({"seq": "text key", "text": "\"string key\""}),
+			json!({"seq": 30, "text": "[1,"}),
+		],
+	)
+	.await;
+
+	let mut reopened = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(reopened.is_persisted());
+	let valid = vec![json!({"n": u64::MAX}), json!(42.0)];
+	assert_exact(&queued(&reopened), &valid);
+	assert_eq!(
+		stored(&reopened)
+			.iter()
+			.map(|(seq, _)| *seq)
+			.collect::<Vec<_>>(),
+		[1, 8]
+	);
+	// A discarded record's sequence number still counts: 30 is never given out again.
+	assert_eq!(reopened.queue.next_seq, 31);
+	// Everything discarded was deleted.
+	assert_eq!(flushed(&reopened).await, stored(&reopened));
+	assert_eq!(records(db_name).await.len(), 2);
+
+	reopened.append(json!("new")).unwrap();
+	assert_eq!(reopened.queue.items.back().unwrap().seq, 31);
+	settle().await;
+	assert_exact(
+		&hydrated(db_name).await,
+		&[valid, vec![json!("new")]].concat(),
+	);
+	reopened.reset();
+	settle().await;
+	assert!(idb::read_all(&db).await.unwrap().is_empty());
+}

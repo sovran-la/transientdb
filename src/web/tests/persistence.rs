@@ -1,57 +1,29 @@
-//! Items persist under the key the store gave them, so what a later instance hydrates is
-//! exactly what this one still holds: any JSON value, unmodified, in append order.
+//! Items persist under the sequence number the store gave them, so what a later instance
+//! hydrates is exactly what this one still holds: any JSON value, unmodified, in append
+//! order, and every item available, whatever was pending.
 
-use super::support::*;
 use super::*;
+use contract::{append_all, tagged};
 
-/// A store on `db_name` emptied of anything a previous run left, or `None`, after
-/// logging, when IndexedDB is unavailable.
-async fn persisted(config: WebConfig) -> Option<WebStore> {
-	let store = fresh_store_with(config).await;
-	if !store.is_persisted() {
-		web_sys::console::log_1(&"Skipping persistence test - no persistence".into());
-		return None;
-	}
-	Some(store)
-}
-
-fn config_for(db_name: &str) -> WebConfig {
-	config(db_name, 4096, with_source(KEY))
-}
-
-fn tagged(range: std::ops::Range<i64>) -> Vec<Value> {
-	range.map(|i| json!({"i": i})).collect()
-}
-
-fn append_all(store: &mut WebStore, items: &[Value]) {
-	for item in items {
-		store.append(item.clone()).unwrap();
-	}
-}
-
-/// Fetches every queued item in one batch and removes those at `positions`.
+/// Fetches every queued item and removes those at `positions`, releasing the rest.
 fn remove_positions(store: &mut WebStore, positions: &[usize]) {
-	let result = store.fetch(None, None).unwrap().unwrap();
-	let chosen: Vec<Box<dyn Equivalent>> = result
-		.removable
-		.unwrap()
-		.into_iter()
-		.enumerate()
-		.filter(|(i, _)| positions.contains(i))
-		.map(|(_, removable)| removable)
-		.collect();
-	assert_eq!(chosen.len(), positions.len());
-	store.remove(&chosen).unwrap();
-}
-
-fn keys(store: &WebStore) -> Vec<u32> {
-	store.items.iter().map(|e| e.key).collect()
+	let all = store.fetch(usize::MAX, usize::MAX).unwrap().unwrap();
+	let values = all.values();
+	drop(all);
+	for (removed, &position) in positions.iter().enumerate() {
+		// Skip what comes before it (held, then released), take it, remove it.
+		let before = store.fetch(position - removed, usize::MAX).unwrap();
+		let target = store.fetch(1, usize::MAX).unwrap().unwrap();
+		assert_eq!(target.values(), vec![values[position].clone()]);
+		store.remove(target).unwrap();
+		drop(before);
+	}
 }
 
 #[wasm_bindgen_test]
 async fn test_every_json_type_round_trips_unchanged_in_order() {
 	let db_name = "test-persist-json-types";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	let items = vec![
@@ -70,42 +42,62 @@ async fn test_every_json_type_round_trips_unchanged_in_order() {
 		json!({}),
 		json!({"event": "e", "n": 1}),
 		json!({"a": {"b": {"c": [1, {"d": null}]}}}),
-		json!({"key": "not the record key"}),
-		json!({"key": 999_999}),
-		json!({"value": "not the record value"}),
-		json!({"key": 1, "value": 2}),
+		json!({"seq": "not the record key"}),
+		json!({"seq": 999_999}),
+		json!({"text": "not the record text"}),
+		json!({"seq": 1, "text": 2}),
 		json!({"_idb_key": 5, "other": "kept"}),
 	];
 	append_all(&mut store, &items);
 	settle().await;
 
-	assert_eq!(hydrated(db_name, 4096).await, items);
+	assert_eq!(hydrated(db_name).await, items);
 	store.reset();
 	settle().await;
 }
 
 #[wasm_bindgen_test]
-async fn test_memory_keys_are_the_indexeddb_keys() {
+async fn test_memory_and_indexeddb_hold_the_same_records() {
 	let db_name = "test-persist-keys-agree";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	append_all(&mut store, &tagged(0..5));
+	// The five items have the five sequence numbers before the next one.
+	let first_seq = store.queue.next_seq - 5;
 	remove_positions(&mut store, &[1]);
+	let expected: Vec<(u64, String)> = [0, 2, 3, 4]
+		.iter()
+		.map(|&i| (first_seq + i, format!("{{\"i\":{i}}}")))
+		.collect();
+	assert_eq!(stored(&store), expected);
+	assert_eq!(flushed(&store).await, expected);
+	store.reset();
 	settle().await;
+}
 
-	let db = store.db.clone().unwrap();
-	let records = idb::read_all(&db).await.unwrap();
-	let stored: Vec<(u32, Value)> = records
-		.iter()
-		.map(|r| (idb::record_key(r).unwrap(), idb::record_value(r).unwrap()))
-		.collect();
-	let in_memory: Vec<(u32, Value)> = store
-		.items
-		.iter()
-		.map(|e| (e.key, e.value.clone()))
-		.collect();
-	assert_eq!(stored, in_memory);
+#[wasm_bindgen_test]
+async fn test_pending_items_are_available_after_a_reload() {
+	let db_name = "test-persist-pending-reload";
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
+		return;
+	};
+	append_all(&mut store, &tagged(0..5));
+	let held = store.fetch(3, 4096).unwrap().unwrap();
+	assert_eq!(held.values(), tagged(0..3));
+	assert_eq!(available(&mut store), tagged(3..5));
+	// Fetching wrote nothing: IndexedDB holds every item as appended.
+	assert_eq!(flushed(&store).await, stored(&store));
+
+	let mut reloaded = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(reloaded.has_data());
+	let all = reloaded.fetch(10, 4096).unwrap().unwrap();
+	assert_eq!(all.values(), tagged(0..5));
+	// The first instance's fetch is still its own, and still pending there.
+	assert_eq!(available(&mut store), tagged(3..5));
+	held.release();
+	assert_eq!(flushed(&store).await, stored(&store));
+	drop(all);
 	store.reset();
 	settle().await;
 }
@@ -113,7 +105,7 @@ async fn test_memory_keys_are_the_indexeddb_keys() {
 #[wasm_bindgen_test]
 async fn test_removed_items_stay_removed_after_reopen() {
 	let db_name = "test-persist-remove-some";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	let items = tagged(0..6);
@@ -123,7 +115,7 @@ async fn test_removed_items_stay_removed_after_reopen() {
 	assert_eq!(queued(&store), expected);
 	settle().await;
 
-	assert_eq!(hydrated(db_name, 4096).await, expected);
+	assert_eq!(hydrated(db_name).await, expected);
 	store.reset();
 	settle().await;
 }
@@ -131,19 +123,19 @@ async fn test_removed_items_stay_removed_after_reopen() {
 #[wasm_bindgen_test]
 async fn test_append_then_immediate_remove_is_gone() {
 	let db_name = "test-persist-append-remove";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	// No await anywhere between these calls: the add must not land after the delete.
 	store.append(json!("short-lived")).unwrap();
-	let result = store.fetch(None, None).unwrap().unwrap();
-	store.remove(&result.removable.unwrap()).unwrap();
+	let items = store.fetch(10, 4096).unwrap().unwrap();
+	store.remove(items).unwrap();
 	store.append(json!("kept")).unwrap();
 	store.append(json!("also short-lived")).unwrap();
 	remove_positions(&mut store, &[1]);
 	settle().await;
 
-	assert_eq!(hydrated(db_name, 4096).await, vec![json!("kept")]);
+	assert_eq!(hydrated(db_name).await, vec![json!("kept")]);
 	store.reset();
 	settle().await;
 }
@@ -151,7 +143,7 @@ async fn test_append_then_immediate_remove_is_gone() {
 #[wasm_bindgen_test]
 async fn test_writes_are_ordered_before_the_next_instance_reads() {
 	let db_name = "test-persist-no-settle";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	// No settle before reopening: a new instance's read is ordered after every write
@@ -161,48 +153,47 @@ async fn test_writes_are_ordered_before_the_next_instance_reads() {
 	store.append(json!({"i": 4})).unwrap();
 
 	assert_eq!(
-		hydrated(db_name, 4096).await,
+		hydrated(db_name).await,
 		vec![json!({"i": 1}), json!({"i": 3}), json!({"i": 4})]
 	);
 	store.reset();
-	assert!(hydrated(db_name, 4096).await.is_empty());
+	assert!(hydrated(db_name).await.is_empty());
 }
 
 #[wasm_bindgen_test]
 async fn test_reset_of_this_sessions_items_persists() {
 	let db_name = "test-persist-reset";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	append_all(&mut store, &tagged(0..5));
 	store.reset();
 	settle().await;
-	assert!(hydrated(db_name, 4096).await.is_empty());
+	assert!(hydrated(db_name).await.is_empty());
 
 	// Appends right after a reset survive it.
 	append_all(&mut store, &tagged(5..7));
 	store.reset();
 	append_all(&mut store, &tagged(7..9));
 	settle().await;
-	assert_eq!(hydrated(db_name, 4096).await, tagged(7..9));
+	assert_eq!(hydrated(db_name).await, tagged(7..9));
 	store.reset();
 	settle().await;
 }
 
 #[wasm_bindgen_test]
-async fn test_drop_oldest_persists() {
+async fn test_drop_oldest_persists_also_for_pending_items() {
 	let db_name = "test-persist-drop-oldest";
-	let mut config = config_for(db_name);
-	config.max_items = Some(3);
-	let Some(mut store) = persisted(config).await else {
+	let Some(mut store) = persisted(db_name, 4096, 3).await else {
 		return;
 	};
-	let items = tagged(0..8);
-	append_all(&mut store, &items);
-	assert_eq!(queued(&store), items[5..]);
-	settle().await;
-
-	assert_eq!(hydrated(db_name, 4096).await, items[5..]);
+	append_all(&mut store, &tagged(0..3));
+	let held = store.fetch(2, 4096).unwrap().unwrap();
+	append_all(&mut store, &tagged(3..8));
+	assert_eq!(queued(&store), tagged(5..8));
+	store.remove(held).unwrap();
+	assert_eq!(flushed(&store).await, stored(&store));
+	assert_eq!(hydrated(db_name).await, tagged(5..8));
 	store.reset();
 	settle().await;
 }
@@ -210,49 +201,45 @@ async fn test_drop_oldest_persists() {
 #[wasm_bindgen_test]
 async fn test_identical_items_are_removed_one_at_a_time() {
 	let db_name = "test-persist-identical";
-	let Some(mut store) = persisted(config_for(db_name)).await else {
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	let same = json!({"event": "click"});
 	append_all(&mut store, &vec![same.clone(); 4]);
 
-	let result = store.fetch(Some(1), None).unwrap().unwrap();
-	assert_eq!(checked_batch(&result, 4096), vec![same.clone()]);
-	store.remove(&result.removable.unwrap()).unwrap();
+	let items = store.fetch(1, 4096).unwrap().unwrap();
+	assert_eq!(items.values(), vec![same.clone()]);
+	store.remove(items).unwrap();
 	assert_eq!(queued(&store), vec![same.clone(); 3]);
 	settle().await;
 
-	assert_eq!(hydrated(db_name, 4096).await, vec![same.clone(); 3]);
+	assert_eq!(hydrated(db_name).await, vec![same; 3]);
 	store.reset();
 	settle().await;
 }
 
 #[wasm_bindgen_test]
-async fn test_keys_keep_increasing_across_instances() {
-	let db_name = "test-persist-keys-increase";
-	let Some(mut first) = persisted(config_for(db_name)).await else {
+async fn test_sequence_numbers_keep_increasing_across_instances() {
+	let db_name = "test-persist-seqs-increase";
+	let Some(mut first) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	append_all(&mut first, &tagged(0..3));
 	settle().await;
 
-	let mut second = WebStore::new(config_for(db_name)).await;
+	let mut second = WebStore::new(config(db_name, 4096, 1000)).await;
 	assert_eq!(queued(&second), tagged(0..3));
 	append_all(&mut second, &tagged(3..6));
-	let second_keys = keys(&second);
-	assert!(
-		second_keys.windows(2).all(|w| w[0] < w[1]),
-		"{second_keys:?}"
-	);
+	let seqs: Vec<u64> = stored(&second).into_iter().map(|(seq, _)| seq).collect();
+	assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
 	settle().await;
 
-	let mut third = WebStore::new(config_for(db_name)).await;
-	assert_eq!(queued(&third), tagged(0..6));
-	assert_eq!(keys(&third), second_keys);
+	let mut third = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert_eq!(stored(&third), stored(&second));
 	append_all(&mut third, &tagged(6..8));
 	settle().await;
 
-	assert_eq!(hydrated(db_name, 4096).await, tagged(0..8));
+	assert_eq!(hydrated(db_name).await, tagged(0..8));
 	third.reset();
 	settle().await;
 }
@@ -260,13 +247,13 @@ async fn test_keys_keep_increasing_across_instances() {
 #[wasm_bindgen_test]
 async fn test_remove_works_on_hydrated_and_new_items_together() {
 	let db_name = "test-persist-mixed";
-	let Some(mut first) = persisted(config_for(db_name)).await else {
+	let Some(mut first) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
 	append_all(&mut first, &tagged(0..3));
 	settle().await;
 
-	let mut second = WebStore::new(config_for(db_name)).await;
+	let mut second = WebStore::new(config(db_name, 4096, 1000)).await;
 	append_all(&mut second, &tagged(3..5));
 	assert_eq!(queued(&second), tagged(0..5));
 	// One hydrated item, one appended this session.
@@ -275,14 +262,14 @@ async fn test_remove_works_on_hydrated_and_new_items_together() {
 	assert_eq!(queued(&second), expected);
 	settle().await;
 
-	assert_eq!(hydrated(db_name, 4096).await, expected);
+	assert_eq!(hydrated(db_name).await, expected);
 	second.reset();
 	settle().await;
 }
 
 #[wasm_bindgen_test]
 async fn test_memory_only_mode_keeps_working() {
-	let mut store = WebStore::new(config_for("test-persist-memory-only")).await;
+	let mut store = WebStore::new(config("test-persist-memory-only", 4096, 1000)).await;
 	// Simulate unavailable IndexedDB: no handle, so no writes are attempted.
 	store.db = None;
 	store.persistence_state = PersistenceState::MemoryOnly;
@@ -291,9 +278,13 @@ async fn test_memory_only_mode_keeps_working() {
 
 	let same = json!("dup");
 	append_all(&mut store, &[same.clone(), same.clone(), json!("x")]);
-	let result = store.fetch(Some(1), None).unwrap().unwrap();
-	store.remove(&result.removable.unwrap()).unwrap();
+	let items = store.fetch(1, 4096).unwrap().unwrap();
+	store.remove(items).unwrap();
 	assert_eq!(queued(&store), vec![same, json!("x")]);
+	let held = store.fetch(10, 4096).unwrap().unwrap();
+	assert!(!store.has_data());
+	drop(held);
+	assert!(store.has_data());
 	store.reset();
 	assert!(!store.has_data());
 }

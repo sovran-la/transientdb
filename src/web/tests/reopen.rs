@@ -1,56 +1,45 @@
 //! Hydration is WebStore's recovery step: reopening any number of times, and repeating a
 //! fetch, never changes or duplicates what is stored.
 
-use super::support::*;
 use super::*;
+use contract::{append_all, drain, item_of_len, tagged};
 
 #[wasm_bindgen_test]
 async fn test_repeated_reopening_changes_nothing() {
 	let db_name = "test-reopen-idempotent";
-	let mut store = fresh_store(db_name, 4096).await;
-	if !store.is_persisted() {
-		web_sys::console::log_1(&"Skipping reopen test - no persistence".into());
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
-	}
-	let appended: Vec<Value> = (0..4).map(|i| json!({"i": i})).collect();
-	for item in &appended {
-		store.append(item.clone()).unwrap();
-	}
-	let keys: Vec<u32> = store.items.iter().map(|e| e.key).collect();
+	};
+	append_all(&mut store, &tagged(0..4));
 	settle().await;
 
 	for _ in 0..4 {
-		let reopened = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
-		assert_eq!(queued(&reopened), appended);
-		assert_eq!(
-			reopened.items.iter().map(|e| e.key).collect::<Vec<_>>(),
-			keys
-		);
+		let reopened = WebStore::new(config(db_name, 4096, 1000)).await;
+		assert_eq!(stored(&reopened), stored(&store));
 		let db = reopened.db.clone().unwrap();
-		assert_eq!(idb::read_all(&db).await.unwrap().len(), appended.len());
+		assert_eq!(idb::read_all(&db).await.unwrap().len(), 4);
 	}
 	store.reset();
 	settle().await;
 }
 
 #[wasm_bindgen_test]
-async fn test_repeated_fetches_change_nothing() {
+async fn test_fetching_and_releasing_writes_nothing() {
 	let db_name = "test-reopen-repeat-fetch";
-	let mut store = fresh_store(db_name, 4096).await;
+	let mut store = fresh_store(db_name, 4096, 1000).await;
 	let appended: Vec<Value> = (0..5).map(|tag| item_of_len(20, tag)).collect();
-	for item in &appended {
-		store.append(item.clone()).unwrap();
-	}
+	append_all(&mut store, &appended);
 
 	for _ in 0..4 {
-		let result = store.fetch(None, None).unwrap().unwrap();
-		assert_eq!(checked_batch(&result, 4096), appended);
+		let fetched = store.fetch(100, 4096).unwrap().unwrap();
+		assert_eq!(fetched.values(), appended);
 		assert_eq!(queued(&store), appended);
+		fetched.release();
 	}
 	if store.is_persisted() {
-		settle().await;
-		assert_eq!(hydrated(db_name, 4096).await, appended);
+		assert_eq!(flushed(&store).await, stored(&store));
+		assert_eq!(hydrated(db_name).await, appended);
 	}
-	assert_eq!(drain(&mut store, None, None).concat(), appended);
+	assert_eq!(drain(&mut store, 100, 4096).concat(), appended);
 	settle().await;
 }

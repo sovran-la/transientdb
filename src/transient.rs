@@ -1,20 +1,19 @@
-use crate::{DataResult, DataStore, Equivalent};
+use crate::{DataStore, Items, Result};
 use serde_json::Value;
-use std::io::Result;
 use std::sync::Mutex;
 
-/// A thread-safe wrapper around a DataStore implementation that provides temporary data storage
-/// with batch processing capabilities.
+/// A thread-safe wrapper around a [`DataStore`], for queuing items such as events or
+/// logs from several threads at once.
 ///
-/// TransientDB uses interior mutability through a Mutex to allow concurrent access to the
-/// underlying data store. It's designed for scenarios where data needs to be temporarily
-/// stored and processed in batches, such as queuing events or logs.
-pub struct TransientDB<T> {
+/// Every call locks the store for its duration. An [`Items`] never needs that lock: it
+/// can be removed through this wrapper from any thread, and dropping or releasing it
+/// works anywhere, even while another thread is inside a call.
+pub struct TransientDB {
 	#[cfg(not(target_arch = "wasm32"))]
-	store: Mutex<Box<dyn DataStore<Output = T> + Send>>,
+	store: Mutex<Box<dyn DataStore + Send>>,
 
 	#[cfg(target_arch = "wasm32")]
-	store: Mutex<Box<dyn DataStore<Output = T>>>,
+	store: Mutex<Box<dyn DataStore>>,
 }
 
 // SAFETY: On WASM32, there are no threads. Send and Sync are vacuously satisfied
@@ -28,85 +27,137 @@ pub struct TransientDB<T> {
 // this will need to be revisited. However, that would likely be a different
 // compilation target requiring explicit opt-in.
 #[cfg(target_arch = "wasm32")]
-unsafe impl<T> Send for TransientDB<T> {}
+unsafe impl Send for TransientDB {}
 
 #[cfg(target_arch = "wasm32")]
-unsafe impl<T> Sync for TransientDB<T> {}
+unsafe impl Sync for TransientDB {}
 
-impl<T> TransientDB<T> {
-	/// Creates a new TransientDB instance with the provided data store implementation.
-	///
-	/// # Arguments
-	/// * `store` - Any implementation of DataStore that is Send + 'static (on native)
-	///   or just DataStore + 'static (on WASM)
+// Shared between threads on native targets.
+#[cfg(not(target_arch = "wasm32"))]
+const _: () = {
+	const fn assert_send_sync<T: Send + Sync>() {}
+	assert_send_sync::<TransientDB>();
+};
+
+impl TransientDB {
+	/// Creates a new TransientDB around `store`.
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryConfig, MemoryStore};
+	/// use transientdb::{MemoryConfig, MemoryStore, TransientDB};
 	///
-	/// let config = MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(1000),
-	///     max_fetch_size: 1024 * 1024, // 1MB
-	///     max_fetch_items: None,
-	/// };
-	/// let store = MemoryStore::new(config);
+	/// let store = MemoryStore::new(MemoryConfig {
+	///     max_item_size: 8 * 1024,
+	///     max_items: 1000,
+	/// });
 	/// let db = TransientDB::new(store);
 	/// ```
 	#[cfg(not(target_arch = "wasm32"))]
-	pub fn new(store: impl DataStore<Output = T> + Send + 'static) -> Self {
+	pub fn new(store: impl DataStore + Send + 'static) -> Self {
 		Self {
 			store: Mutex::new(Box::new(store)),
 		}
 	}
 
-	/// Creates a new TransientDB instance with the provided data store implementation.
+	/// Creates a new TransientDB around `store`.
 	#[cfg(target_arch = "wasm32")]
-	pub fn new(store: impl DataStore<Output = T> + 'static) -> Self {
+	pub fn new(store: impl DataStore + 'static) -> Self {
 		Self {
 			store: Mutex::new(Box::new(store)),
 		}
 	}
 
-	/// Checks if the store contains any data that can be fetched.
+	/// Appends an item; see [`DataStore::append`].
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{Error, MemoryConfig, MemoryStore, TransientDB};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(100),
-	///     max_fetch_size: 1024,
-	///     max_fetch_items: None,
+	///     max_item_size: 64,
+	///     max_items: 100,
 	/// }));
 	///
-	/// assert!(!db.has_data());
-	/// db.append(json!({"test": "data"})).unwrap();
-	/// assert!(db.has_data());
+	/// db.append(json!({"event": "user_login", "user_id": 123})).unwrap();
+	///
+	/// // Larger than max_item_size: never stored.
+	/// let err = db.append(json!({"note": "x".repeat(100)})).unwrap_err();
+	/// assert!(matches!(err, Error::ItemTooLarge { max: 64, .. }));
 	/// ```
-	pub fn has_data(&self) -> bool {
-		self.store.lock().unwrap().has_data()
+	pub fn append(&self, data: Value) -> Result<()> {
+		self.store.lock().unwrap().append(data)
 	}
 
-	/// Removes all data from the store and resets it to initial state.
+	/// Hands out the oldest items, at most `count` of them totalling at most
+	/// `max_bytes` bytes of item text; see [`DataStore::fetch`].
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{MemoryConfig, MemoryStore, TransientDB};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(100),
-	///     max_fetch_size: 1024,
-	///     max_fetch_items: None,
+	///     max_item_size: 1024,
+	///     max_items: 100,
 	/// }));
+	/// for i in 0..5 {
+	///     db.append(json!({"index": i})).unwrap();
+	/// }
 	///
+	/// let first = db.fetch(3, 64 * 1024).unwrap().unwrap();
+	/// assert_eq!(first.json(), r#"[{"index":0},{"index":1},{"index":2}]"#);
+	///
+	/// // The first three are held by `first`, so the next fetch gets the rest.
+	/// let second = db.fetch(3, 64 * 1024).unwrap().unwrap();
+	/// assert_eq!(second.json(), r#"[{"index":3},{"index":4}]"#);
+	/// assert!(db.fetch(3, 64 * 1024).unwrap().is_none());
+	///
+	/// db.remove(first).unwrap();
+	/// // Dropping `second` releases it: its items are fetched again.
+	/// drop(second);
+	/// let again = db.fetch(10, 64 * 1024).unwrap().unwrap();
+	/// assert_eq!(again.json(), r#"[{"index":3},{"index":4}]"#);
+	/// ```
+	pub fn fetch(&self, count: usize, max_bytes: usize) -> Result<Option<Items>> {
+		self.store.lock().unwrap().fetch(count, max_bytes)
+	}
+
+	/// Deletes the items in an `Items` fetched from this TransientDB's store; see
+	/// [`DataStore::remove`].
+	///
+	/// # Examples
+	/// ```
+	/// use transientdb::{MemoryConfig, MemoryStore, TransientDB};
+	/// use serde_json::json;
+	///
+	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
+	///     max_item_size: 1024,
+	///     max_items: 100,
+	/// }));
 	/// db.append(json!({"test": "data"})).unwrap();
-	/// assert!(db.has_data());
 	///
+	/// let items = db.fetch(10, 4096).unwrap().unwrap();
+	/// // ... deliver the items, then:
+	/// db.remove(items).unwrap();
+	/// assert!(!db.has_data());
+	/// ```
+	pub fn remove(&self, items: Items) -> Result<()> {
+		self.store.lock().unwrap().remove(items)
+	}
+
+	/// Deletes every item, fetched or not; see [`DataStore::reset`].
+	///
+	/// # Examples
+	/// ```
+	/// use transientdb::{MemoryConfig, MemoryStore, TransientDB};
+	/// use serde_json::json;
+	///
+	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
+	///     max_item_size: 1024,
+	///     max_items: 100,
+	/// }));
+	/// db.append(json!({"test": "data"})).unwrap();
 	/// db.reset();
 	/// assert!(!db.has_data());
 	/// ```
@@ -114,158 +165,28 @@ impl<T> TransientDB<T> {
 		self.store.lock().unwrap().reset();
 	}
 
-	/// Appends a new item to the store.
-	///
-	/// # Arguments
-	/// * `data` - JSON value to store
+	/// Whether a fetch could return something; see [`DataStore::has_data`].
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{MemoryConfig, MemoryStore, TransientDB};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(100),
-	///     max_fetch_size: 1024,
-	///     max_fetch_items: None,
+	///     max_item_size: 1024,
+	///     max_items: 100,
 	/// }));
-	///
-	/// // Append a single value
-	/// db.append(json!({"event": "user_login", "user_id": 123})).unwrap();
-	///
-	/// // Append structured data
-	/// db.append(json!({
-	///     "event": "purchase",
-	///     "details": {
-	///         "item_id": "ABC123",
-	///         "amount": 99.99,
-	///         "currency": "USD"
-	///     }
-	/// })).unwrap();
-	/// ```
-	pub fn append(&self, data: Value) -> Result<()> {
-		self.store.lock().unwrap().append(data)
-	}
-
-	/// Fetches a batch of data from the store, respecting optional count and size limits.
-	///
-	/// Fetching removes nothing: the data stays in the store until the returned
-	/// `removable` items are passed to [`remove`](Self::remove).
-	///
-	/// # Arguments
-	/// * `count` - Optional maximum number of items to fetch
-	/// * `max_bytes` - Optional maximum total size in bytes to fetch
-	///
-	/// # Examples
-	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
-	/// use serde_json::json;
-	///
-	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(100),
-	///     max_fetch_size: 1024,
-	///     max_fetch_items: None,
-	/// }));
-	///
-	/// // Add some data
-	/// for i in 0..5 {
-	///     db.append(json!({"index": i})).unwrap();
-	/// }
-	///
-	/// // Fetch up to 3 items
-	/// if let Ok(Some(result)) = db.fetch(Some(3), None) {
-	///     // Process the data
-	///     if let Some(data) = result.data {
-	///         println!("Fetched data: {:?}", data);
-	///     }
-	///
-	///     // Clean up the fetched items
-	///     if let Some(removable) = result.removable {
-	///         db.remove(&removable).unwrap();
-	///     }
-	/// }
-	///
-	/// // Fetch items with size limit (1KB)
-	/// let result = db.fetch(None, Some(1024));
-	/// ```
-	pub fn fetch(
-		&self,
-		count: Option<usize>,
-		max_bytes: Option<usize>,
-	) -> Result<Option<DataResult<T>>> {
-		self.store.lock().unwrap().fetch(count, max_bytes)
-	}
-
-	/// Removes previously fetched data from the store.
-	///
-	/// # Arguments
-	/// * `data` - Slice of removable items from a previous fetch operation
-	///
-	/// # Examples
-	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
-	/// use serde_json::json;
-	///
-	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(100),
-	///     max_fetch_size: 1024,
-	///     max_fetch_items: None,
-	/// }));
-	///
-	/// // Add and fetch data
+	/// assert!(!db.has_data());
 	/// db.append(json!({"test": "data"})).unwrap();
+	/// assert!(db.has_data());
 	///
-	/// if let Ok(Some(result)) = db.fetch(None, None) {
-	///     // Process the data...
-	///
-	///     // Then remove the processed items
-	///     if let Some(removable) = result.removable {
-	///         db.remove(&removable).unwrap();
-	///     }
-	/// }
+	/// // Everything stored is held by an unreleased fetch: nothing to fetch now.
+	/// let items = db.fetch(10, 4096).unwrap().unwrap();
+	/// assert!(!db.has_data());
+	/// items.release();
+	/// assert!(db.has_data());
 	/// ```
-	pub fn remove(&self, data: &[Box<dyn Equivalent>]) -> Result<()> {
-		self.store.lock().unwrap().remove(data)
-	}
-
-	/// Ends the current batch: items appended before this call and items appended after
-	/// it are never returned in the same batch, in any store. A batch is one file for
-	/// `DirectoryStore` and one fetched `Value` for `MemoryStore` and `WebStore`, whose
-	/// `fetch` stops at the boundary and so can return fewer items than asked for.
-	///
-	/// With nothing appended since the store was created, since the last `end_batch`, or
-	/// since everything was removed or reset, this does nothing and returns `Ok(())`;
-	/// calling it several times in a row is the same as calling it once. It never creates
-	/// an empty batch, and it fetches, returns and removes nothing.
-	///
-	/// # Examples
-	/// ```
-	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
-	/// use serde_json::json;
-	///
-	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     envelope: Envelope::default(),
-	///     max_items: Some(100),
-	///     max_fetch_size: 1024,
-	///     max_fetch_items: None,
-	/// }));
-	///
-	/// db.append(json!({"user": "a", "event": "logout"})).unwrap();
-	/// db.end_batch().unwrap(); // the user changes: never send these events together
-	/// db.append(json!({"user": "b", "event": "login"})).unwrap();
-	///
-	/// // The first fetch stops at the boundary, though more items are stored.
-	/// let first = db.fetch(Some(100), None).unwrap().unwrap();
-	/// assert_eq!(first.data.unwrap()["items"], json!([{"user": "a", "event": "logout"}]));
-	/// db.remove(&first.removable.unwrap()).unwrap();
-	///
-	/// let second = db.fetch(Some(100), None).unwrap().unwrap();
-	/// assert_eq!(second.data.unwrap()["items"], json!([{"user": "b", "event": "login"}]));
-	/// ```
-	pub fn end_batch(&self) -> Result<()> {
-		self.store.lock().unwrap().end_batch()
+	pub fn has_data(&self) -> bool {
+		self.store.lock().unwrap().has_data()
 	}
 }

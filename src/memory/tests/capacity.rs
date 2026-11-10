@@ -1,117 +1,74 @@
-//! `max_items`: `None` never drops an item for capacity; `Some(n)` keeps the newest `n`.
+//! `max_items`: the store keeps the newest `max_items` items, and only removal, a full
+//! store or a reset ever deletes one.
 
-use super::support::*;
 use super::*;
+use contract::{append_all, drain, tagged};
 use std::collections::VecDeque;
 
-fn store_capped(
-	max_items: Option<usize>,
-	max_fetch_size: usize,
-	max_fetch_items: Option<usize>,
-) -> MemoryStore {
-	MemoryStore::new(MemoryConfig {
-		envelope: with_source(KEY),
-		max_items,
-		max_fetch_size,
-		max_fetch_items,
-	})
-}
-
-fn tagged(range: std::ops::Range<usize>) -> Vec<Value> {
-	range.map(|i| json!({"i": i})).collect()
-}
-
-fn append_all(store: &mut MemoryStore, items: &[Value]) -> Result<()> {
-	items.iter().try_for_each(|item| store.append(item.clone()))
-}
-
-fn queued(store: &MemoryStore) -> Vec<Value> {
-	store.items.iter().map(|item| item.value.clone()).collect()
-}
-
 #[test]
-fn test_unbounded_never_drops() -> Result<()> {
-	let mut store = store_capped(None, 8 * 1024, None);
-	let appended = tagged(0..5000);
-	append_all(&mut store, &appended)?;
-	assert_eq!(store.items.len(), 5000);
-
-	let batches = drain(&mut store, None, None)?;
-	assert!(batches.len() > 1, "expected several batches");
-	assert_eq!(batches.concat(), appended);
-	Ok(())
-}
-
-#[test]
-fn test_unbounded_batches_still_limited_by_item_limit() -> Result<()> {
-	let mut store = store_capped(None, 64 * 1024, Some(8));
-	let appended: Vec<Value> = (0..2000).map(|tag| item_of_len(20, tag)).collect();
-	append_all(&mut store, &appended)?;
-
-	let batches = drain(&mut store, None, None)?;
-	assert_eq!(batches.len(), 250);
-	assert!(batches.iter().all(|batch| batch.len() == 8));
-	assert_eq!(batches.concat(), appended);
-	Ok(())
-}
-
-#[test]
-fn test_unbounded_batches_still_limited_by_bytes() -> Result<()> {
-	// Room for 5 items of 20 bytes and their separators, with 15 bytes to spare, not 6.
-	let max_fetch_size = envelope(KEY) + 5 * 20 + 4 + 15;
-	let mut store = store_capped(None, max_fetch_size, Some(8));
-	let appended: Vec<Value> = (0..2000).map(|tag| item_of_len(20, tag)).collect();
-	append_all(&mut store, &appended)?;
-
-	// `drain` checks every batch against the ceiling.
-	let batches = drain(&mut store, None, None)?;
-	assert!(batches.iter().all(|batch| batch.len() == 5));
-	assert_eq!(batches.concat(), appended);
-
-	// A smaller per-call ceiling still applies too.
-	append_all(&mut store, &appended)?;
-	let per_call = envelope(KEY) + 2 * 20 + 1 + 15;
-	let batches = drain(&mut store, None, Some(per_call))?;
-	assert!(batches.iter().all(|batch| batch.len() == 2));
-	assert_eq!(batches.concat(), appended);
-	Ok(())
-}
-
-#[test]
-fn test_cap_of_one_holds_only_the_newest_item() -> Result<()> {
-	let mut store = store_capped(Some(1), 1024, None);
+fn test_cap_of_one_holds_only_the_newest_item() {
+	let mut store = store(1024, 1);
 	for item in tagged(0..5) {
-		store.append(item.clone())?;
+		store.append(item.clone()).unwrap();
 		assert_eq!(queued(&store), vec![item]);
 	}
-	assert_eq!(drain(&mut store, None, None)?.concat(), tagged(4..5));
-	Ok(())
+	assert_eq!(drain(&mut store, 10, 1024).concat(), tagged(4..5));
 }
 
 #[test]
-fn test_unbounded_append_remove_cycles_keep_counters_and_contents() -> Result<()> {
-	let mut store = store_capped(None, 64 * 1024, None);
+fn test_below_the_cap_nothing_is_dropped() {
+	let mut store = store(1024, 5000);
+	let appended = tagged(0..5000);
+	append_all(&mut store, &appended);
+	assert_eq!(store.queue.items.len(), 5000);
+	let batches = drain(&mut store, 100, 64 * 1024);
+	assert_eq!(batches.len(), 50);
+	assert_eq!(batches.concat(), appended);
+}
+
+#[test]
+fn test_append_remove_cycles_keep_counters_and_contents() {
+	let mut store = store(1024, 100_000);
 	let mut expected: VecDeque<Value> = VecDeque::new();
 	let mut next = 0;
 	for cycle in 0..50 {
 		let items = tagged(next..next + 100);
 		next += 100;
-		append_all(&mut store, &items)?;
+		append_all(&mut store, &items);
 		expected.extend(items);
 
 		// Remove fewer than were appended, so the store keeps growing.
-		let result = store.fetch(Some(60 + cycle % 7), None)?.unwrap();
-		let fetched = checked_batch(&result, 64 * 1024);
+		let fetched = store.fetch(60 + cycle % 7, 64 * 1024).unwrap().unwrap();
 		let oldest: Vec<Value> = expected.drain(..fetched.len()).collect();
-		assert_eq!(fetched, oldest);
-		store.remove(&result.removable.unwrap())?;
+		assert_eq!(fetched.values(), oldest);
+		store.remove(fetched).unwrap();
 
 		assert_eq!(queued(&store), Vec::from(expected.clone()));
-		assert_eq!(store.next_seq, next as u64);
-		let seqs: Vec<u64> = store.items.iter().map(|item| item.seq).collect();
+		assert_eq!(store.queue.next_seq, next as u64 + 1);
+		let seqs: Vec<u64> = store.queue.items.iter().map(|item| item.seq).collect();
 		assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
 	}
-	assert!(store.items.len() > 1000, "the store should have grown");
-	assert_eq!(drain(&mut store, None, None)?.concat(), Vec::from(expected));
-	Ok(())
+	assert!(
+		store.queue.items.len() > 1000,
+		"the store should have grown"
+	);
+	assert_eq!(
+		drain(&mut store, 1000, 1 << 20).concat(),
+		Vec::from(expected)
+	);
+}
+
+#[test]
+fn test_dropping_for_capacity_forgets_the_pending_mark() {
+	let mut store = store(1024, 2);
+	append_all(&mut store, &tagged(0..2));
+	let held = store.fetch(2, 1024).unwrap().unwrap();
+	assert_eq!(store.queue.ledger.lock().pending_count(), 2);
+	append_all(&mut store, &tagged(2..4));
+	// Both pending items were dropped; nothing is left marked for them.
+	assert_eq!(store.queue.ledger.lock().pending_count(), 0);
+	assert_eq!(queued(&store), tagged(2..4));
+	assert!(store.has_data());
+	drop(held);
+	assert_eq!(drain(&mut store, 10, 1024).concat(), tagged(2..4));
 }

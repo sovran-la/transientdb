@@ -1,19 +1,17 @@
 //! IndexedDB plumbing for `WebStore`: the database schema, its record format, and the
 //! requests the store issues.
 //!
-//! Every record wraps one queued item as `{ "key": <u32>, "value": "<item>", "batch": <u32> }`
-//! in the object store [`STORE_NAME`], whose key path is `key` with no auto-increment.
-//! The store assigns every key itself, so memory and IndexedDB always agree on an item's
-//! key. `value` is the item serialized compactly with `serde_json`, as a string, and
-//! hydration parses it back with `serde_json`: stored as a JavaScript value, an integer
-//! above 2^53 would lose precision and `42.0` would come back as `42`. `batch` is the
-//! batch number the item was appended under, so `end_batch` boundaries survive a reload.
-//! `key` and `batch` are `u32`, which a JavaScript number holds exactly.
+//! Every record holds one stored item as `{ "seq": <number>, "text": "<item>" }` in the
+//! object store [`STORE_NAME`], whose key path is `seq` with no auto-increment. `seq` is
+//! the item's sequence number, assigned by the store, so memory and IndexedDB always
+//! agree on it; `text` is the item's compact `serde_json` text, kept as a string so that
+//! an integer above 2^53 or a float such as `42.0` comes back exactly. Nothing else is
+//! stored: fetched items are pending in memory only.
 //!
-//! One more record may exist, `{ "key": "boundary", "batch": <u32> }`: the batch number
-//! the store moved to at its last `end_batch`. It keeps a boundary set after the last
-//! append across a reload, when no item carries the new number yet. Its string key sorts
-//! after every numeric key, so reading the object store returns it after the items.
+//! An IndexedDB number key is a JavaScript number, an `f64`. Sequence numbers are `u64`,
+//! so the store gives out only `1..=`[`MAX_SEQ`], every one of which an `f64` holds
+//! exactly; a key outside that range, or not a whole number, is not a sequence number.
+//! At one append per microsecond, the range lasts more than 285 years.
 //!
 //! Writes are issued synchronously by the caller and only their outcome is awaited
 //! in the background. IndexedDB runs read/write transactions on the same object store
@@ -32,53 +30,46 @@ use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransa
 /// Version 1 stored items in-line under an auto-incremented `_idb_key`. Version 2
 /// stores wrapper records keyed by the store's own counter. Version 3 adds each item's
 /// batch number, and the boundary record. Version 4 stores each item as JSON text.
-pub(super) const DB_VERSION: u32 = 4;
+/// Version 5 stores `{seq, text}` and nothing about batches.
+pub(super) const DB_VERSION: u32 = 5;
 pub(super) const STORE_NAME: &str = "events";
-const KEY_PATH: &str = "key";
-const VALUE_FIELD: &str = "value";
-const BATCH_FIELD: &str = "batch";
-/// The key of the boundary record; every item's key is a number.
-pub(super) const BOUNDARY_KEY: &str = "boundary";
+const KEY_PATH: &str = "seq";
+const TEXT_FIELD: &str = "text";
+/// The last sequence number the store gives out: `Number.MAX_SAFE_INTEGER`, 2^53 - 1.
+pub(super) const MAX_SEQ: u64 = (1 << 53) - 1;
 
 fn js_error(what: &str, e: JsValue) -> Error {
 	Error::other(format!("{what}: {e:?}"))
 }
 
-/// The record stored for the item `value` under `key`, appended under `batch`: the item
-/// is held as its compact JSON text.
-pub(super) fn record(key: u32, batch: u32, value: &Value) -> Value {
-	json!({ (KEY_PATH): key, (VALUE_FIELD): value.to_string(), (BATCH_FIELD): batch })
+/// The record stored for the item `text` under `seq`.
+pub(super) fn record(seq: u64, text: &str) -> Value {
+	json!({ (KEY_PATH): seq, (TEXT_FIELD): text })
 }
 
-/// The key of a record, if it has one this store could have assigned.
-pub(super) fn record_key(record: &Value) -> Option<u32> {
-	let key = record.get(KEY_PATH)?.as_u64()?;
-	u32::try_from(key).ok()
+/// The sequence number of a record, if its key is one the store could have given out.
+pub(super) fn record_seq(record: &Value) -> Option<u64> {
+	let seq = record.get(KEY_PATH)?.as_u64()?;
+	(1..=MAX_SEQ).contains(&seq).then_some(seq)
 }
 
-/// The batch number of a record, if it has one this store could have assigned.
-pub(super) fn record_batch(record: &Value) -> Option<u32> {
-	let batch = record.get(BATCH_FIELD)?.as_u64()?;
-	u32::try_from(batch).ok()
+/// The sequence number and text of a record, if it has the record shape: a sequence
+/// number and a string. Whether the text is a fit item is the store's to check.
+pub(super) fn parse_record(record: &Value) -> Option<(u64, String)> {
+	let seq = record_seq(record)?;
+	let text = record.get(TEXT_FIELD)?.as_str()?;
+	Some((seq, text.to_owned()))
 }
 
-/// The item a record wraps, if the record has the wrapper shape: a key, a batch number
-/// and a value that is a string holding JSON text.
-pub(super) fn record_value(record: &Value) -> Option<Value> {
-	record_key(record)?;
-	record_batch(record)?;
-	serde_json::from_str(record.get(VALUE_FIELD)?.as_str()?).ok()
-}
-
-/// Whether a record is the boundary record, valid or not.
-pub(super) fn is_boundary(record: &Value) -> bool {
-	record.get(KEY_PATH).and_then(Value::as_str) == Some(BOUNDARY_KEY)
+/// The key a record is stored under, whatever it is, for deleting the record.
+pub(super) fn record_key(record: &Value) -> Option<JsValue> {
+	js_sys::JSON::parse(&record.get(KEY_PATH)?.to_string()).ok()
 }
 
 /// Opens (or creates, or upgrades) the database `name` at [`DB_VERSION`].
 ///
-/// Upgrading from an older version deletes its object store and creates the new one
-/// empty: old records are discarded, not migrated.
+/// Upgrading from an older version deletes every object store it has and creates the
+/// current one empty: old records are discarded, not migrated.
 pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 	let window = web_sys::window().ok_or_else(|| Error::other("No window object"))?;
 	let factory = window
@@ -107,11 +98,13 @@ pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 	await_request::<IdbDatabase>(&open_request).await
 }
 
-/// Replaces whatever object store an older version left with an empty current one.
+/// Replaces whatever object stores an older version left with an empty current one.
 fn create_schema(request: &IdbRequest) -> std::result::Result<(), JsValue> {
 	let db: IdbDatabase = request.result()?.unchecked_into();
-	if db.object_store_names().contains(STORE_NAME) {
-		db.delete_object_store(STORE_NAME)?;
+	let names = db.object_store_names();
+	let old: Vec<String> = (0..names.length()).filter_map(|i| names.item(i)).collect();
+	for name in old {
+		db.delete_object_store(&name)?;
 	}
 	let params = web_sys::IdbObjectStoreParameters::new();
 	params.set_key_path(&JsValue::from_str(KEY_PATH));
@@ -158,34 +151,32 @@ fn begin_write(db: &IdbDatabase) -> Result<(IdbTransaction, IdbObjectStore)> {
 }
 
 fn to_js(record: &Value) -> Result<JsValue> {
-	let json =
-		serde_json::to_string(record).map_err(|e| Error::other(format!("JSON error: {e:?}")))?;
-	js_sys::JSON::parse(&json).map_err(|e| js_error("JS JSON parse error", e))
+	js_sys::JSON::parse(&record.to_string()).map_err(|e| js_error("JS JSON parse error", e))
 }
 
-/// Issues the add of `value` under `key`, appended under `batch`.
-pub(super) fn add(db: &IdbDatabase, key: u32, batch: u32, value: &Value) -> Result<IdbTransaction> {
+/// Issues the add of the item `text` under `seq`.
+pub(super) fn add(db: &IdbDatabase, seq: u64, text: &str) -> Result<IdbTransaction> {
 	let (transaction, store) = begin_write(db)?;
-	let js_value = to_js(&record(key, batch, value))?;
-	store.add(&js_value).map_err(|e| js_error("Add error", e))?;
+	store
+		.add(&to_js(&record(seq, text))?)
+		.map_err(|e| js_error("Add error", e))?;
 	Ok(transaction)
 }
 
-/// Issues the write of the boundary record, replacing any earlier one.
-pub(super) fn put_boundary(db: &IdbDatabase, batch: u32) -> Result<IdbTransaction> {
-	let (transaction, store) = begin_write(db)?;
-	let js_value = to_js(&json!({ (KEY_PATH): BOUNDARY_KEY, (BATCH_FIELD): batch }))?;
-	store.put(&js_value).map_err(|e| js_error("Put error", e))?;
-	Ok(transaction)
+/// Issues the deletes of the records under `seqs`, in one transaction.
+pub(super) fn delete(db: &IdbDatabase, seqs: &[u64]) -> Result<IdbTransaction> {
+	let keys: Vec<JsValue> = seqs
+		.iter()
+		.map(|&seq| JsValue::from_f64(seq as f64))
+		.collect();
+	delete_keys(db, &keys)
 }
 
-/// Issues the deletes of `keys`, in one transaction.
-pub(super) fn delete(db: &IdbDatabase, keys: &[u32]) -> Result<IdbTransaction> {
+/// Issues the deletes of the records under `keys`, whatever they are, in one transaction.
+pub(super) fn delete_keys(db: &IdbDatabase, keys: &[JsValue]) -> Result<IdbTransaction> {
 	let (transaction, store) = begin_write(db)?;
-	for &key in keys {
-		store
-			.delete(&JsValue::from(key))
-			.map_err(|e| js_error("Delete error", e))?;
+	for key in keys {
+		store.delete(key).map_err(|e| js_error("Delete error", e))?;
 	}
 	Ok(transaction)
 }
