@@ -1,11 +1,16 @@
-use crate::{DataResult, DataStore, Equivalent};
-use chrono::Utc;
+use crate::{batch, DataResult, DataStore, Equivalent};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::any::Any;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Result, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+
+mod data_file;
+mod files;
+mod recovery;
+
+use data_file::DataFile;
 
 impl Equivalent for PathBuf {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
@@ -49,11 +54,29 @@ pub struct DirectoryConfig {
 	pub storage_location: PathBuf,
 	/// Base name for generated files.
 	/// Files will be created with the pattern: "{index}-{base_filename}"
-	/// where index is an auto-incrementing number.
+	/// where index is an auto-incrementing number. A finished file has `.temp` appended
+	/// to that whole name ("5-events.json" becomes "5-events.json.temp"), so
+	/// `base_filename` must not itself end in `.temp`.
+	///
+	/// It must be a plain file name: not empty, not `.` or `..`, and without `/`, `\` or
+	/// a NUL byte (both separators are refused on every platform). Dots, spaces, hyphens,
+	/// digits and non-ASCII characters are fine. `DirectoryStore::new` panics otherwise.
+	///
+	/// The store owns exactly the files with those two names and ignores everything else
+	/// in `storage_location`, so stores with different `base_filename`s can share one
+	/// directory without seeing, counting, finishing, fetching or deleting each other's
+	/// files.
 	pub base_filename: String,
-	/// Maximum size in bytes for individual data files.
-	/// Once a file reaches this size, a new file will be created.
-	/// Must be at least 100 bytes.
+	/// Maximum size in bytes of a finished data file on disk.
+	///
+	/// This is a hard ceiling: the whole finished file, including the JSON envelope
+	/// (`batch` opening, `sentAt`, `writeKey`) and the commas between items, is never
+	/// larger than this. When the next item would push the finished file past it, the
+	/// open file is finished first and the item starts a new one. An item too large to
+	/// fit even alone in a file is rejected by `append` with `ErrorKind::InvalidInput`.
+	///
+	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once
+	/// the envelope is counted (the envelope grows with `write_key`'s length).
 	pub max_file_size: usize,
 	/// Maximum number of items in an individual data file.
 	/// Once a file holds this many items, the next append starts a new file.
@@ -62,36 +85,75 @@ pub struct DirectoryConfig {
 	pub max_file_items: Option<usize>,
 }
 
-/// Type alias for the file validator function
+/// Type alias for the file validator function.
+///
+/// The validator is given the path of each finished data file before it is renamed with
+/// `.temp`. Returning `Ok(())` accepts the file. Returning an error rejects it: the store
+/// deletes the file and every item in it, and the operation that finished the file
+/// carries on and succeeds. A rejection is never reported through `append` or `fetch`,
+/// so the validator is the one place to observe it; see
+/// [`DirectoryStore::set_file_validator`].
 pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 
 /// A data store that persists items to files in a directory.
 ///
 /// Files are created with incrementing numerical prefixes and contain batched JSON data.
-/// When a file reaches the configured size limit or item limit, a new file is created.
-/// Completed files are marked with a .temp extension to indicate they are ready for processing.
+/// Before each append the store checks whether the item fits in the open file; if the
+/// finished file would exceed `max_file_size` bytes or hold more than `max_file_items`
+/// items, the open file is finished and the item starts a new one. So no finished file
+/// is ever larger than `max_file_size`, envelope included. Items too large for any file
+/// are rejected with `ErrorKind::InvalidInput`.
+/// Completed files are marked by appending a .temp extension to their name, to indicate
+/// they are ready for processing. Only files named for this store's `base_filename` are
+/// ever read, finished, fetched or removed; see [`DirectoryConfig::base_filename`].
 ///
 /// Each file contains a JSON object with:
 /// - A `batch` array containing the stored items
 /// - A `sentAt` timestamp in RFC3339 format
 /// - The store's `writeKey`
+///
+/// # Durability
+/// Files are not fsynced, so durability across a power loss or OS crash is not
+/// guaranteed: an append that returned `Ok` may not survive one. What was written is
+/// salvaged by the next session's first `fetch`: a file cut short keeps every complete
+/// item and loses what follows the last one. A write that fails while the store is
+/// running (disk full, an I/O error) is rolled back, so it never leaves a partial item
+/// in a file.
 pub struct DirectoryStore {
 	config: DirectoryConfig,
-	writer: Option<BufWriter<File>>,
+	writer: Option<BufWriter<DataFile>>,
 	current_size: usize,
 	current_items: usize,
 	current_path: Option<PathBuf>,
+	/// Length in bytes of `closing()`, which is the same for every timestamp.
+	closing_len: usize,
 	file_validator: Option<FileValidator>,
-	next_index: AtomicU32,
+	/// The index the next new file gets, or `None` once an index of `u32::MAX` is taken
+	/// and no higher one exists.
+	next_index: Option<u32>,
+	/// Unfinished files for the next `fetch` to recover, each listed once: those an
+	/// earlier session left behind, listed by `new`, and any this session abandoned after
+	/// a failed write or failed to finish. Every fetch recovers and clears the list.
+	leftovers: Vec<PathBuf>,
+	/// Failures to inject into the data files this store opens.
+	#[cfg(test)]
+	faults: std::sync::Arc<std::sync::Mutex<data_file::Faults>>,
 }
 
 impl DirectoryStore {
 	const TEMP_EXTENSION: &'static str = "temp";
+	const SEPARATOR: &'static [u8] = b",";
 
 	/// Creates a new DirectoryStore with the specified configuration.
 	///
 	/// Creates the storage directory if it doesn't exist. The store will initialize
-	/// its file index by scanning existing files in the directory.
+	/// its file index by scanning its existing files in the directory.
+	///
+	/// `new` modifies no file. It notes which of this store's files an earlier session
+	/// left unfinished (without `.temp`); the first [`fetch`](DataStore::fetch) recovers
+	/// them, so a validator set with [`set_file_validator`](Self::set_file_validator)
+	/// after `new` runs on each of them. Until then they still count for
+	/// [`has_data`](DataStore::has_data).
 	///
 	/// # Arguments
 	/// * `config` - Configuration options for the store
@@ -104,6 +166,12 @@ impl DirectoryStore {
 	/// # Panics
 	/// * If max_file_size is less than 100 bytes
 	/// * If max_file_items is `Some(0)`
+	/// * If max_file_size leaves no room for even a 1-byte item once the file's
+	///   envelope (which grows with `write_key`) is counted
+	/// * If base_filename is empty, is `.` or `..`, or contains `/`, `\` or a NUL byte:
+	///   the store's file names would escape the storage directory or not be names
+	/// * If base_filename ends in `.temp`: its open files would carry the name another
+	///   store's finished files have, so ownership could not be told from the name
 	pub fn new(config: DirectoryConfig) -> Result<Self> {
 		if config.max_file_size < 100 {
 			panic!("Seriously? max_file_size < 100 bytes? What exactly do you expect to store in there?");
@@ -111,30 +179,61 @@ impl DirectoryStore {
 		if config.max_file_items == Some(0) {
 			panic!("max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory.");
 		}
+		Self::validate_base_filename(&config.base_filename);
 
-		fs::create_dir_all(&config.storage_location)?;
-
-		let store = DirectoryStore {
+		let mut store = DirectoryStore {
 			config,
 			writer: None,
 			current_size: 0,
 			current_items: 0,
 			current_path: None,
+			closing_len: 0,
 			file_validator: None,
-			next_index: AtomicU32::new(0),
+			next_index: None,
+			leftovers: Vec::new(),
+			#[cfg(test)]
+			faults: Default::default(),
 		};
+		store.closing_len = store.closing(Utc::now()).len();
+		if store.opening().len() + store.closing_len + 1 > store.config.max_file_size {
+			panic!("max_file_size is all envelope and no room for an item? That's packaging, not storage.");
+		}
 
-		// Initialize directory and get max index
-		let max_index = store.initialize_directory()?;
-		store.next_index.store(max_index + 1, Ordering::SeqCst);
+		fs::create_dir_all(&store.config.storage_location)?;
+
+		// Get the max index and the leftovers to recover at the first fetch
+		let (max_index, leftovers) = store.initialize_directory()?;
+		store.next_index = max_index.checked_add(1);
+		store.leftovers = leftovers;
 
 		Ok(store)
 	}
 
 	/// Sets a validator function that will be called before finalizing each data file.
 	///
-	/// The validator is called just before a file is marked as complete (renamed with .temp extension).
-	/// If the validator returns an error, the file will not be finalized and the error will be propagated.
+	/// The validator is called just before a file is marked as complete (renamed with
+	/// .temp extension), with the file's path. It runs:
+	/// - when `append` finishes the open file because the next item would not fit
+	///   (rotation),
+	/// - when `fetch` finishes the open file,
+	/// - when the first `fetch` of a session recovers or salvages the files an earlier
+	///   session left unfinished. Those are recovered by that fetch, not by `new`, so a
+	///   validator set before it sees them.
+	/// - when a later `fetch` recovers a file this session failed to finish or
+	///   abandoned. A file whose rename failed after the validator accepted it is
+	///   validated again then.
+	///
+	/// Returning `Ok(())` accepts the file. **Returning an error means "delete this file
+	/// and every item in it".** The store deletes it, and the operation that triggered
+	/// validation continues and succeeds: `append` still writes its item, to a fresh
+	/// file, and `fetch` returns the other finished files, or `Ok(None)`. Nothing about
+	/// the rejection is reported through the return value of `append` or `fetch`.
+	///
+	/// The validator is the caller's own code, and it is the one place to observe a
+	/// rejection. A caller that wants to record, count, report, or keep a copy of a
+	/// rejected file must do so inside the validator, before returning the error; once
+	/// it returns, the file is gone. The store's own notice is a single line on stderr,
+	/// which many targets (mobile apps in particular) never surface, so do not rely on it.
 	///
 	/// # Arguments
 	/// * `validator` - Function that takes a file path and returns Ok(()) if the file is valid
@@ -170,6 +269,51 @@ impl DirectoryStore {
 	/// });
 	/// # Ok::<(), std::io::Error>(())
 	/// ```
+	///
+	/// Recording a rejection, and keeping a copy of the file, before it is deleted:
+	/// ```
+	/// use std::fs;
+	/// use std::io;
+	/// use std::sync::atomic::{AtomicUsize, Ordering};
+	/// use std::sync::Arc;
+	/// use serde_json::json;
+	/// use transientdb::{DataStore, DirectoryConfig, DirectoryStore};
+	///
+	/// let dir = std::env::temp_dir().join("transientdb-doc-rejections");
+	/// # let _ = fs::remove_dir_all(&dir);
+	/// let quarantine = dir.join("quarantine");
+	/// fs::create_dir_all(&quarantine)?;
+	///
+	/// let mut store = DirectoryStore::new(DirectoryConfig {
+	///     write_key: "test".into(),
+	///     storage_location: dir.clone(),
+	///     base_filename: "events".into(),
+	///     max_file_size: 1024,
+	///     max_file_items: None,
+	/// })?;
+	///
+	/// let rejected = Arc::new(AtomicUsize::new(0));
+	/// let counter = rejected.clone();
+	/// let keep = quarantine.clone();
+	/// store.set_file_validator(move |path| {
+	///     if fs::read_to_string(path)?.contains("\"debug\":true") {
+	///         // Observe the rejection here: afterwards the file is deleted.
+	///         counter.fetch_add(1, Ordering::SeqCst);
+	///         fs::copy(path, keep.join(path.file_name().unwrap()))?;
+	///         return Err(io::Error::other("debug events are not uploaded"));
+	///     }
+	///     Ok(())
+	/// });
+	///
+	/// store.append(json!({"event": "test", "debug": true}))?;
+	/// // The rejection is not an error of the fetch; there is just nothing to return.
+	/// assert!(store.fetch(None, None)?.is_none());
+	/// assert_eq!(rejected.load(Ordering::SeqCst), 1);
+	/// assert_eq!(fs::read_dir(&quarantine)?.count(), 1);
+	/// assert!(!store.has_data());
+	/// # fs::remove_dir_all(&dir)?;
+	/// # Ok::<(), std::io::Error>(())
+	/// ```
 	pub fn set_file_validator<F>(&mut self, validator: F)
 	where
 		F: Fn(&Path) -> Result<()> + 'static + Send + Sync,
@@ -177,16 +321,53 @@ impl DirectoryStore {
 		self.file_validator = Some(Box::new(validator));
 	}
 
-	fn next_index(&self) -> u32 {
-		self.next_index.fetch_add(1, Ordering::SeqCst)
+	/// Bytes written at the start of every data file.
+	fn opening(&self) -> &'static [u8] {
+		b"{ \"batch\": ["
 	}
 
-	fn start_file_if_needed(&mut self) -> Result<bool> {
+	/// Bytes written at the end of every data file when it is finished.
+	///
+	/// Its length does not depend on `sent_at`: the timestamp format is fixed-width.
+	/// `write_key` is written as a JSON string, escaped as needed.
+	fn closing(&self, sent_at: DateTime<Utc>) -> Vec<u8> {
+		let write_key =
+			serde_json::to_string(&self.config.write_key).expect("a string always serializes");
+		format!(
+			"],\"sentAt\":\"{}\",\"writeKey\":{}}}",
+			sent_at.format("%Y-%m-%dT%H:%M:%S.%3fZ"),
+			write_key
+		)
+		.into_bytes()
+	}
+
+	/// The largest serialized item that fits alone in a file.
+	fn max_item_size(&self) -> usize {
+		self.config.max_file_size - self.opening().len() - self.closing_len
+	}
+
+	/// Whether an item of `item_len` bytes can go into the open file without the
+	/// finished file exceeding `max_file_size` or holding more than `max_file_items`.
+	fn fits_in_open_file(&self, item_len: usize) -> bool {
+		let item_limit_reached = self
+			.config
+			.max_file_items
+			.is_some_and(|max| self.current_items >= max);
+		let separator = if self.current_items > 0 {
+			Self::SEPARATOR.len()
+		} else {
+			0
+		};
+		let finished_size = self.current_size + separator + item_len + self.closing_len;
+		!item_limit_reached && finished_size <= self.config.max_file_size
+	}
+
+	fn start_file_if_needed(&mut self) -> Result<()> {
 		if self.writer.is_some() {
-			return Ok(false);
+			return Ok(());
 		}
 
-		let mut index = self.next_index();
+		let mut index = self.take_index()?;
 		let mut attempts = 0;
 		const MAX_ATTEMPTS: u32 = 1000; // Safeguard against infinite loops
 
@@ -194,7 +375,7 @@ impl DirectoryStore {
 			let file_path = self
 				.config
 				.storage_location
-				.join(format!("{}-{}", index, self.config.base_filename));
+				.join(self.unfinished_name(index));
 
 			match OpenOptions::new()
 				.write(true)
@@ -202,22 +383,37 @@ impl DirectoryStore {
 				.open(&file_path)
 			{
 				Ok(file) => {
-					let mut writer = BufWriter::new(file);
-					self.current_path = Some(file_path);
-
-					if self.current_size == 0 {
-						writer.write_all(b"{ \"batch\": [")?;
-						self.current_size = "{ \"batch\": [".len();
-						self.writer = Some(writer);
-						return Ok(true);
+					let mut writer = BufWriter::new(DataFile::new(
+						file,
+						#[cfg(test)]
+						self.faults.clone(),
+					));
+					// Flushed now, so the opening is known to be on disk before any item
+					// is written and a rollback never has to restore it.
+					if let Err(e) = writer
+						.write_all(self.opening())
+						.and_then(|()| writer.flush())
+					{
+						// Discard the buffer without flushing; the file holds no item, so
+						// remove it rather than keep a file the store cannot use.
+						drop(writer.into_parts());
+						if let Err(remove) = fs::remove_file(&file_path) {
+							eprintln!(
+								"Failed to remove {:?} after failing to start it: {}",
+								file_path, remove
+							);
+						}
+						return Err(e);
 					}
-
+					self.current_path = Some(file_path);
+					self.current_size = self.opening().len();
+					self.current_items = 0;
 					self.writer = Some(writer);
-					return Ok(false);
+					return Ok(());
 				}
 				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
 					// File exists, try next index
-					index = self.next_index();
+					index = self.take_index()?;
 					attempts += 1;
 
 					if attempts >= MAX_ATTEMPTS {
@@ -231,105 +427,90 @@ impl DirectoryStore {
 		}
 	}
 
-	/// Scans the directory for existing files, finalizes unfinished ones, and returns the highest index found
-	fn initialize_directory(&self) -> Result<u32> {
-		let entries = fs::read_dir(&self.config.storage_location)?;
-		let mut max_index = 0;
-
-		for entry in entries {
-			let entry = entry?;
-			let path = entry.path();
-
-			if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-				// Extract index from filename
-				if let Some(index_str) = file_name.split('-').next() {
-					if let Ok(index) = index_str.parse::<u32>() {
-						max_index = max_index.max(index);
-
-						// If file doesn't have .temp extension, it's unfinished
-						if path.extension().and_then(|ext| ext.to_str())
-							!= Some(Self::TEMP_EXTENSION)
-						{
-							// Attempt to finalize the file
-							if let Err(e) = self.finalize_file(&path) {
-								eprintln!("Failed to finalize file {:?}: {}", path, e);
-								// Continue processing other files even if this one fails
-							}
-						}
-					}
-				}
-			}
-		}
-
-		Ok(max_index)
+	/// Scans the directory for this store's files without modifying any. Returns the
+	/// highest index found and the unfinished files, lowest index first.
+	fn initialize_directory(&self) -> Result<(u32, Vec<PathBuf>)> {
+		let files = self.owned_files()?;
+		let max_index = files.iter().map(|f| f.index).max().unwrap_or(0);
+		let unfinished = files
+			.into_iter()
+			.filter(|f| !f.finished)
+			.map(|f| f.path)
+			.collect();
+		Ok((max_index, unfinished))
 	}
 
-	/// Finalizes a file by completing the JSON structure and renaming with .temp extension
-	fn finalize_file(&self, path: &Path) -> Result<()> {
-		{
-			let mut file = OpenOptions::new().append(true).open(path)?;
-			write!(
-				file,
-				"],\"sentAt\":\"{}\",\"writeKey\":\"{}\"}}",
-				Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ"),
-				self.config.write_key
-			)?;
-			file.flush()?;
-		}
-
-		// Run validation if configured
+	/// Validates a closed file, if a validator is set, and renames it with the .temp
+	/// extension.
+	///
+	/// A file the validator rejects is deleted instead, with every item in it. That is
+	/// logged and is not an error: the caller carries on. Failing to delete it is logged
+	/// too; the file is still never renamed, so it is never fetched.
+	fn mark_finished(&self, path: &Path) -> Result<()> {
 		if let Some(validator) = &self.file_validator {
-			validator(path)?;
+			if let Err(e) = validator(path) {
+				eprintln!("File validator rejected {:?}, deleting it: {}", path, e);
+				if let Err(e) = fs::remove_file(path) {
+					eprintln!("Failed to delete rejected file {:?}: {}", path, e);
+				}
+				return Ok(());
+			}
 		}
 
 		// Rename to .temp to mark as complete
-		let new_path = path.with_extension(Self::TEMP_EXTENSION);
-		fs::rename(path, new_path)?;
+		fs::rename(path, Self::finished_path(path))?;
 
 		Ok(())
 	}
 
+	/// Closes the open file, writing the closing through its writer, and marks it
+	/// finished (see [`mark_finished`](Self::mark_finished)).
+	///
+	/// If writing or flushing the closing, or renaming the file, fails, the error is
+	/// returned and the file is listed for the next `fetch` to recover, which salvages
+	/// its complete items, or renames it as is if the closing made it whole. A validator
+	/// rejection is not a failure: the file is deleted and nothing is listed.
 	fn finish_file(&mut self) -> Result<()> {
-		let writer = match self.writer.take() {
-			Some(mut writer) => {
-				writer.flush()?;
-				writer
-			}
-			None => return Ok(()),
+		let Some(mut writer) = self.writer.take() else {
+			return Ok(());
 		};
+		let current_path = self.current_path.take();
 
-		// Drop the writer to close the file
-		drop(writer);
-
-		// Use the stored path
-		if let Some(current_path) = self.current_path.take() {
-			self.finalize_file(&current_path)?;
-		}
-
+		// The file is closed from here on, even if flushing or finalizing it fails,
+		// so the next append must start a fresh file with fresh accounting.
 		self.current_size = 0;
 		self.current_items = 0;
+
+		let closing = self.closing(Utc::now());
+		debug_assert_eq!(closing.len(), self.closing_len);
+		let closed = writer.write_all(&closing).and_then(|()| writer.flush());
+		// Close the file without flushing again on drop: after a failure, bytes still
+		// buffered stay unwritten, and recovery cuts any partial closing off.
+		drop(writer.into_parts());
+
+		let Some(path) = current_path else {
+			return closed;
+		};
+		if let Err(e) = closed.and_then(|()| self.mark_finished(&path)) {
+			eprintln!(
+				"Failed to finish {:?}, listing it for the next fetch to recover: {}",
+				path, e
+			);
+			self.list_leftover(path);
+			return Err(e);
+		}
 		Ok(())
 	}
 
+	/// This store's files, oldest first: by numeric index, so "10-events" sorts after
+	/// "9-events". Only finished files unless `include_unfinished`.
 	fn sorted_files(&self, include_unfinished: bool) -> Result<Vec<PathBuf>> {
-		let mut files: Vec<PathBuf> = fs::read_dir(&self.config.storage_location)?
-			.filter_map(Result::ok)
-			.map(|e| e.path())
-			.filter(|p| {
-				if include_unfinished {
-					true
-				} else {
-					p.extension().and_then(|ext| ext.to_str()) == Some(Self::TEMP_EXTENSION)
-				}
-			})
-			.collect();
-
-		files.sort_by(|a, b| {
-			a.file_name()
-				.unwrap_or_default()
-				.cmp(b.file_name().unwrap_or_default())
-		});
-		Ok(files)
+		Ok(self
+			.owned_files()?
+			.into_iter()
+			.filter(|f| include_unfinished || f.finished)
+			.map(|f| f.path)
+			.collect())
 	}
 
 	fn up_to_size(&self, max_bytes: usize, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -361,31 +542,16 @@ impl DataStore for DirectoryStore {
 			return true;
 		}
 
-		// Check directory for any files matching our base filename pattern
-		fs::read_dir(&self.config.storage_location)
-			.map(|entries| {
-				entries.filter_map(Result::ok).any(|e| {
-					let path = e.path();
-					if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-						// Check if filename starts with a number and contains our base_filename
-						let is_our_file = file_name
-							.split('-')
-							.next()
-							.and_then(|s| s.parse::<u32>().ok())
-							.is_some() && file_name
-							.contains(&self.config.base_filename);
-						return is_our_file;
-					}
-					false
-				})
-			})
-			.unwrap_or(false)
+		// Any of this store's files, finished or not, is data
+		self.owned_files().is_ok_and(|files| !files.is_empty())
 	}
 
 	fn reset(&mut self) {
 		// The open file is about to be deleted, so discard it rather than finalizing it.
 		// Otherwise later appends land in an unlinked file and the next fetch fails.
 		self.writer = None;
+		// Leftovers are deleted with everything else; there is nothing left to recover.
+		self.leftovers.clear();
 		self.current_path = None;
 		self.current_size = 0;
 		self.current_items = 0;
@@ -400,34 +566,90 @@ impl DataStore for DirectoryStore {
 		}
 	}
 
+	/// Appends an item to the open file, rotating first if the item would not fit.
+	///
+	/// A finished file is never larger than `max_file_size` bytes, envelope and
+	/// separators included, and never holds more than `max_file_items` items.
+	///
+	/// If the file validator rejects the file finished by rotation, that file is
+	/// deleted with every item in it, and the append still succeeds: the new item goes
+	/// into a fresh file. The rejection is not reported here; see
+	/// [`set_file_validator`](DirectoryStore::set_file_validator).
+	///
+	/// # Errors
+	/// Returns an `InvalidInput` error, without touching any file, if the serialized
+	/// item is too large to fit even alone in a fresh file. Also propagates IO errors
+	/// from finishing the previous file, and from writing the item. A failed write
+	/// stores nothing of the item: the open file is rolled back to the items before it,
+	/// and the next append continues it. If even the rollback fails, the store stops
+	/// using that file and the next append starts a new one; the next `fetch` salvages
+	/// the abandoned file's complete items. If finishing the previous file fails, the
+	/// item is not stored, and the next `fetch` recovers that file with all its items.
+	///
+	/// File indexes never wrap. If the item needs a new file and index `u32::MAX` is
+	/// already taken, the append fails and creates nothing; no existing file is reused.
+	/// The files already there can still be fetched, and once they are removed, a store
+	/// opened again starts over from index 1.
 	fn append(&mut self, data: Value) -> Result<()> {
-		let started = self.start_file_if_needed()?;
-		let writer = self
-			.writer
-			.as_mut()
-			.ok_or_else(|| io::Error::other("No active writer"))?;
+		let item = serde_json::to_vec(&data)?;
 
-		// The open file is full by size or by item count; rotate before writing.
-		let item_limit_reached = self
-			.config
-			.max_file_items
-			.is_some_and(|max| self.current_items >= max);
-		if self.current_size >= self.config.max_file_size || item_limit_reached {
+		// Reject before touching anything: an item that cannot fit in any file must not
+		// rotate the open file or create a new one.
+		let max_item_size = self.max_item_size();
+		if item.len() > max_item_size {
+			return Err(batch::item_too_large(
+				item.len(),
+				max_item_size,
+				"max_file_size",
+				self.config.max_file_size,
+			));
+		}
+
+		if self.writer.is_some() && !self.fits_in_open_file(item.len()) {
 			self.finish_file()?;
-			return self.append(data);
 		}
+		self.start_file_if_needed()?;
 
-		if !started {
-			writer.write_all(b",")?;
+		// The separator and the item go out as one write, so a failure leaves nothing
+		// half-accounted between them.
+		let mut bytes = Vec::with_capacity(Self::SEPARATOR.len() + item.len());
+		if self.current_items > 0 {
+			bytes.extend_from_slice(Self::SEPARATOR);
 		}
-		serde_json::to_writer(&mut *writer, &data)?;
-		writer.flush()?;
+		bytes.extend_from_slice(&item);
+		self.write_to_open_file(&bytes)?;
 
-		self.current_size += data.to_string().len();
+		self.current_size += bytes.len();
 		self.current_items += 1;
 		Ok(())
 	}
 
+	/// Finishes the open file, then returns the oldest finished files.
+	///
+	/// The first fetch of a session also recovers the files an earlier session left
+	/// unfinished, after finishing the open file and before choosing what to return, so
+	/// they come back from that same fetch in index order. The validator runs on each.
+	/// Each such file is recovered once per session. A file this session fails to
+	/// finish, or abandons after a failed write, is recovered the same way by the next
+	/// fetch, whether or not a fetch has run before. A file cut short partway through an
+	/// item (the process was killed, or the machine lost power) is salvaged: it keeps
+	/// every complete item, in order and byte for byte, and loses what follows the last
+	/// one.
+	/// A file with no complete item is deleted, and so is one that does not start like a
+	/// data file: its name makes it this store's, and nothing in it can be read. Files
+	/// of other names are never touched. A recovered file that fails for a reason other
+	/// than the validator is logged with `eprintln!`, is not returned, and does not fail
+	/// the fetch or stop the other files from being recovered.
+	///
+	/// Any file the validator rejects, the open one or a recovered one, is deleted with
+	/// every item in it, and the fetch carries on: it returns the other finished files,
+	/// or `Ok(None)` if there are none. The rejection is not reported here; see
+	/// [`set_file_validator`](DirectoryStore::set_file_validator).
+	///
+	/// # Errors
+	/// Propagates IO errors from finishing the open file, and IO errors listing the
+	/// directory. A file that failed to finish (here, or on rotation in `append`) is
+	/// recovered by the next fetch, like any leftover, with all its items.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
@@ -436,6 +658,9 @@ impl DataStore for DirectoryStore {
 		if self.writer.is_some() {
 			self.finish_file()?;
 		}
+		// After finishing the open file and before listing, so recovered files can be
+		// returned by this fetch, in index order with everything else.
+		self.recover_leftovers();
 
 		let mut files = self.sorted_files(false)?;
 
@@ -484,6 +709,23 @@ mod tests {
 	use std::io;
 	use std::io::Result;
 	use tempfile::TempDir;
+
+	mod base_filename;
+	mod ceiling;
+	mod deferred;
+	mod duplicates;
+	mod finish_failure;
+	mod index_limit;
+	mod lifecycle;
+	mod oversized;
+	mod ownership;
+	mod recovery;
+	mod rejection;
+	mod salvage;
+	mod support;
+	mod unreadable;
+	mod write_failure;
+	mod write_key;
 
 	#[test]
 	fn test_directory_store_basic_operations() -> Result<()> {
@@ -603,7 +845,8 @@ mod tests {
 			write_key: "test-key".to_string(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
-			max_file_size: 100, // Small size to force rotation
+			// Each 79 byte item plus the 72 byte envelope: two items fit per file, not three.
+			max_file_size: 250,
 			max_file_items: None,
 		};
 
@@ -623,9 +866,11 @@ mod tests {
 		if let Some(result) = store.fetch(None, None)? {
 			let files = result.data.unwrap();
 			assert!(files.len() > 1, "Expected multiple files due to size limit");
+			assert_eq!(files.len(), 3);
 
 			// Verify each file is properly formatted
 			for file in &files {
+				assert!(fs::metadata(file)?.len() <= 250, "File over max_file_size");
 				let content = fs::read_to_string(file)?.trim().to_string();
 				assert!(content.starts_with("{ \"batch\": ["));
 				assert!(content.ends_with("}"));
@@ -755,7 +1000,9 @@ mod tests {
 			write_key: "test-key".to_string(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
-			max_file_size: 100, // Small size to force multiple files
+			// Small size to force multiple files: one 72 byte item plus the 72 byte
+			// envelope per file.
+			max_file_size: 150,
 			max_file_items: None,
 		};
 
@@ -971,11 +1218,12 @@ mod tests {
 	fn test_size_limit_trips_before_item_limit() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let mut config = item_limit_config(&temp_dir, Some(8));
-		config.max_file_size = 100;
+		config.max_file_size = 200;
 		let mut store = DirectoryStore::new(config)?;
 
-		// Each item is ~60 bytes, so the 100 byte size check rotates after 2 items,
-		// long before the item limit of 8 is reached.
+		// Each item is 53 bytes and the envelope 72, so two items (179 bytes with the
+		// separator) fit under 200 and a third (233) does not, long before the item
+		// limit of 8 is reached.
 		for i in 0..9 {
 			store.append(json!({"index": i, "data": "padding to reach the size limit."}))?;
 		}
@@ -1123,14 +1371,25 @@ mod tests {
 	}
 
 	#[test]
-	fn test_validator_failure_on_item_limit_rotation_propagates() -> Result<()> {
+	fn test_validator_rejection_on_item_limit_rotation_deletes_the_file() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let mut store = DirectoryStore::new(item_limit_config(&temp_dir, Some(2)))?;
 		store.set_file_validator(|_| Err(io::Error::other("rejected")));
 
 		append_indexed(&mut store, 0..2)?;
-		let err = store.append(json!({"index": 2})).unwrap_err();
-		assert_eq!(err.to_string(), "rejected");
+		let full = store.current_path.clone().unwrap();
+		// Rotation's rejection deletes the full file; item 2 goes into a fresh one.
+		store.append(json!({"index": 2}))?;
+		assert!(!full.exists());
+		assert_eq!(store.current_items, 1);
+		assert_eq!(
+			store.sorted_files(true)?,
+			vec![store.current_path.clone().unwrap()]
+		);
+		// The fetch rejects that one too: nothing is left, and nothing is returned.
+		assert!(store.fetch(None, None)?.is_none());
+		assert!(store.sorted_files(true)?.is_empty());
+		assert!(!store.has_data());
 		Ok(())
 	}
 

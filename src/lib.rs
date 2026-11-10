@@ -1,3 +1,4 @@
+mod batch;
 mod directory;
 mod memory;
 mod transient;
@@ -52,6 +53,11 @@ pub trait DataStore {
 	///
 	/// # Arguments
 	/// * `data` - JSON value to store
+	///
+	/// # Errors
+	/// The built-in stores return `ErrorKind::InvalidInput`, and store nothing, for an
+	/// item too large to fit by itself under the store's configured byte limit, envelope
+	/// included. Such an item could never be delivered.
 	fn append(&mut self, data: Value) -> Result<()>;
 
 	/// Fetches a batch of data from the store, respecting optional count and size limits.
@@ -60,7 +66,14 @@ pub trait DataStore {
 	/// * `count` - Optional maximum number of items to fetch
 	/// * `max_bytes` - Optional maximum total size in bytes to fetch
 	///
+	/// In the built-in stores byte limits are hard ceilings on the whole batch, envelope
+	/// and separators included. `MemoryStore` and `WebStore` apply `max_bytes` (or their
+	/// configured `max_fetch_size`) to the returned batch; `DirectoryStore` applies it to
+	/// the total size of the returned files, each of which is at most `max_file_size`.
+	///
 	/// Returns the fetched data along with items that can be passed to `remove()`.
+	/// Fetching removes nothing: the data stays in the store, and a later fetch returns it
+	/// again, until those items are passed to `remove()`.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,

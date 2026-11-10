@@ -64,6 +64,11 @@ The core interface that storage implementations must provide:
 - `has_data()`: Check if data is available
 - `reset()`: Clear all stored data
 
+`fetch()` never removes anything, in any store: it returns the batch and its `removable`
+items, and the data stays in the store until you pass `removable` to `remove()`. Fetching
+again before removing returns the same items. Remove a batch only once it has been
+processed (for example, after the upload succeeded), so a failure never loses data.
+
 ## Usage
 
 ### Memory Store Example
@@ -99,6 +104,10 @@ if let Some(result) = db.fetch(Some(100), None)? {
                 println!("Processing event: {}", item["event"]);
             }
         }
+    }
+    // The items stay in the store until removed
+    if let Some(removable) = result.removable {
+        db.remove(&removable)?;
     }
 }
 ```
@@ -165,6 +174,58 @@ if let Some(result) = db.fetch(None, None)? {
 }
 ```
 
+### File Validation (DirectoryStore)
+
+A validator set with `set_file_validator` is your own code. It is given the path of each
+finished file before the file is marked ready (renamed with `.temp`), and it runs:
+
+- when `append` finishes the open file because the next item would not fit (rotation),
+- when `fetch` finishes the open file,
+- when the first `fetch` of a session recovers or salvages files an earlier session left
+  unfinished. Recovery happens there, not in `DirectoryStore::new`, so a validator set
+  right after `new` sees those files too.
+
+Returning `Ok(())` accepts the file. **Returning an error means "delete this file and
+every item in it".** The store deletes it, and the operation that triggered validation
+continues and succeeds: `append` still writes its item, to a fresh file, and `fetch`
+returns the other finished files, or nothing. A rejection is never reported through the
+return value of `append` or `fetch`.
+
+The validator is therefore the one place to observe a rejection. If you want to record,
+count, report, or keep a copy of a rejected file, do it inside the validator, before you
+return the error: once it returns, the file is gone. The store's own notice is a single
+line on stderr, which many targets (mobile apps in particular) never surface, so do not
+rely on it.
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+let rejected = Arc::new(AtomicUsize::new(0));
+let counter = rejected.clone();
+store.set_file_validator(move |path| {
+    let content = std::fs::read_to_string(path)?;
+    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+        counter.fetch_add(1, Ordering::SeqCst); // record it now; the file is about to go
+        return Err(std::io::Error::other("not valid JSON"));
+    }
+    Ok(())
+});
+```
+
+### Durability (DirectoryStore)
+
+Files are not fsynced, so durability across a power loss or OS crash is not guaranteed.
+What was written is salvaged by the next session's first `fetch`: a file cut short keeps
+every complete item, byte for byte and in order, and loses whatever follows the last one.
+A leftover with no complete item is deleted, and so is one of the store's files that does
+not even start like a data file (empty, or cut inside its opening): nothing in it can be
+read, so it could never be delivered. Files not named for the store are never touched. A
+write that fails while the store is running (disk full, an I/O error) is rolled back, so
+the failed item leaves nothing behind and the next append continues the same file. If
+finishing a file fails (writing its closing, or renaming it), the `append` or `fetch` that
+tried returns the error, and the next `fetch` recovers that file with all its items.
+
 ### Web Store Example (WASM)
 
 ```rust
@@ -230,11 +291,11 @@ if let Some(result) = db.fetch(Some(100), None)? {
 - Automatically removes old items when max_items is reached
 - Returns data as serde_json::Value
 - Ideal for high-throughput, temporary data storage
-- No cleanup required (fetch automatically removes returned items)
+- Requires explicit cleanup via remove(); fetch does not remove returned items
 
 ### DirectoryStore
 - Stores data in rotating files in a specified directory
-- Automatic file management and rotation
+- Automatic file management and rotation; no finished file exceeds `max_file_size` bytes
 - Returns paths to completed files
 - Supports custom file validation
 - Requires explicit cleanup via remove()
@@ -244,7 +305,12 @@ if let Some(result) = db.fetch(Some(100), None)? {
 - Browser-based storage using IndexedDB
 - Async construction, sync operations (fire-and-forget persistence)
 - Graceful fallback to memory-only if IndexedDB unavailable
-- Automatic hydration from IndexedDB on startup
+- Automatic hydration from IndexedDB on startup, in append order
+- Stores any JSON value (objects, arrays, strings, numbers, booleans, null) unmodified
+- IndexedDB writes are issued in call order, so a `remove()` or `reset()` right after an
+  `append()` is never undone by the append landing late
+- A database written by transientdb 0.2.x uses an older record format; it is emptied the
+  first time this version opens it (old records are discarded, not migrated)
 - Ideal for web applications and browser-based analytics
 - Requires the `web` feature flag
 
@@ -259,22 +325,61 @@ When in memory-only mode, consider increasing flush frequency to minimize data l
 ### MemoryConfig
 - `write_key`: Identifier for the data source
 - `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
-- `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
+- `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
 
 ### DirectoryConfig
 - `write_key`: Identifier for the data source
 - `storage_location`: Directory path for storing files
-- `base_filename`: Base name for generated files
-- `max_file_size`: Maximum size in bytes for individual files (must be ≥ 100)
+- `base_filename`: Base name for generated files, which are named `{index}-{base_filename}`. Must be a plain file name: not empty, not `.` or `..`, no `/`, `\` or NUL byte (on every platform), and not ending in `.temp`. Dots, spaces, hyphens, digits and non-ASCII characters are fine. The index counts up from one above the highest index on disk and never wraps: if index 4294967295 is taken, an `append` that needs a new file returns an error, and the existing files can still be fetched
+- `max_file_size`: Hard ceiling in bytes on each finished file, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_file_items`: Maximum number of items in one file, or `None` for no limit (must not be `Some(0)`)
 
 ### WebConfig
 - `write_key`: Identifier for the data source
 - `database_name`: Name of the IndexedDB database (use unique names per store)
 - `max_items`: Total store capacity; oldest items are dropped beyond this (must be > 0)
-- `max_fetch_size`: Maximum size in bytes for a single fetch operation (must be ≥ 100)
+- `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
 - `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
+
+### Byte limits
+
+Some consumers send each batch as one request body to an API that rejects bodies over a
+fixed size. Every store's byte limit is a hard ceiling on what it hands back, measured in
+bytes (not characters) and counting the whole JSON batch: the envelope (`batch`, `sentAt`,
+`writeKey`), every item, and the commas between items. An exact fit is allowed.
+
+- **DirectoryStore**: no finished file is ever larger than `max_file_size` on disk. Before
+  each `append` the store computes the size the open file would have once finished with the
+  item in it; if that exceeds `max_file_size`, it finishes the open file and the item starts
+  a new one. A file also rotates when it holds `max_file_items` items, whichever comes first.
+- **MemoryStore and WebStore**: the batch one `fetch` returns, serialized with
+  `serde_json::to_string`, is never longer than `max_bytes` if given, otherwise
+  `max_fetch_size`. A `max_bytes` too small for the oldest item returns `Ok(None)`; a fetch at
+  the configured `max_fetch_size` always returns it. The fetch also stops at `count` or
+  `max_fetch_items` items.
+
+An item too large to fit by itself under the configured limit (`max_file_size` or
+`max_fetch_size`) can never be delivered, so `append` rejects it with
+`std::io::ErrorKind::InvalidInput` and a message giving the item's size and the largest size
+that fits. The rejected item is not stored, and the store is otherwise unchanged:
+DirectoryStore does not rotate or create a file, and WebStore issues no IndexedDB write.
+
+```rust
+match db.append(event) {
+    Ok(()) => {}
+    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => eprintln!("dropped event: {e}"),
+    Err(e) => return Err(e),
+}
+```
+
+WebStore may hold items persisted under a larger `max_fetch_size`. Hydration loads them as usual; when one reaches the head of the queue and
+cannot fit under `max_fetch_size`, `fetch` drops it, deletes it from IndexedDB, logs a
+`console.warn`, and continues with the next item.
+
+Because the envelope counts, the limit must leave room for at least a 1-byte item after it;
+the envelope grows with `write_key`'s length. Constructing a store whose envelope alone fills
+the limit panics.
 
 ### Item limits per batch
 
@@ -297,7 +402,7 @@ Each store can enforce one:
 
 - `MemoryConfig::max_fetch_items` and `WebConfig::max_fetch_items` cap the items returned by
   one `fetch`. If `fetch` is also given a `count`, the smaller of the two applies; a larger
-  `count` is clamped silently. The byte limit still applies. This is separate from
+  `count` is clamped silently. The [byte limit](#byte-limits) still applies. This is separate from
   `max_items`, which is the store's total capacity.
 
   ```rust
