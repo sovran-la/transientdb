@@ -377,6 +377,14 @@ WebStore may hold items persisted under a larger `max_fetch_size`. Hydration loa
 cannot fit under `max_fetch_size`, `fetch` drops it, deletes it from IndexedDB, logs a
 `console.warn`, and continues with the next item.
 
+DirectoryStore may likewise find unfinished files left by a session with a larger
+`max_file_size`. Recovery cuts each one down to the leading complete items that fit under
+the current `max_file_size` once closed, dropping the rest (with one line on stderr giving
+the bytes kept of the total), and deletes it if not even its first item fits. That holds
+for a file the earlier session had already closed but not renamed, too: one at or under the
+current limit is renamed untouched. Files an earlier session already finished (`.temp`) are
+fetched as they are.
+
 Because the envelope counts, the limit must leave room for at least a 1-byte item after it;
 the envelope grows with `write_key`'s length. Constructing a store whose envelope alone fills
 the limit panics.
