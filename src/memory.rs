@@ -239,7 +239,9 @@ impl DataStore for MemoryStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store unchanged, if the serialized
-	/// item cannot fit in a batch by itself under `max_fetch_size`.
+	/// item cannot fit in a batch by itself under `max_fetch_size`. Returns an error,
+	/// leaving the store unchanged, if sequence numbers are exhausted: they never wrap,
+	/// so no two items can share one.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let item_size = Self::get_item_size(&data);
 		if item_size > self.max_item_size {
@@ -250,12 +252,16 @@ impl DataStore for MemoryStore {
 				self.config.max_fetch_size,
 			));
 		}
+		let next_seq = self
+			.next_seq
+			.checked_add(1)
+			.ok_or_else(|| std::io::Error::other("MemoryStore sequence numbers exhausted"))?;
 
 		self.items.push_back(QueuedItem {
 			seq: self.next_seq,
 			value: data,
 		});
-		self.next_seq += 1;
+		self.next_seq = next_seq;
 
 		while self.items.len() > self.config.max_items {
 			self.items.pop_front();

@@ -152,3 +152,67 @@ async fn test_records_without_wrapper_shape_are_skipped() {
 	settle().await;
 	assert!(idb::read_all(&db).await.unwrap().is_empty());
 }
+
+/// Keys never wrap: the last key is `u32::MAX - 1`, after which `append` fails and
+/// changes nothing, so no new item can take a key already in use.
+#[wasm_bindgen_test]
+async fn test_keys_stop_before_wrapping() {
+	let db_name = "test-schema-key-limit";
+	let mut store = fresh_store(db_name, 4096).await;
+	if !store.is_persisted() {
+		web_sys::console::log_1(&"Skipping schema test - no persistence".into());
+		return;
+	}
+	store.next_key = u32::MAX - 1;
+	store.append(json!("last")).unwrap();
+	assert_eq!(store.items.back().unwrap().key, u32::MAX - 1);
+	for _ in 0..3 {
+		let err = store.append(json!("one too many")).unwrap_err();
+		assert!(err.to_string().contains("keys exhausted"), "{err}");
+	}
+	assert_eq!(queued(&store), vec![json!("last")]);
+	settle().await;
+	assert_eq!(hydrated(db_name, 4096).await, vec![json!("last")]);
+	let result = store.fetch(None, None).unwrap().unwrap();
+	assert_eq!(checked_batch(&result, 4096), vec![json!("last")]);
+	store.reset();
+	settle().await;
+}
+
+/// A record already at key `u32::MAX` leaves no key to give: the reopened store
+/// delivers it and refuses new items rather than reuse a key.
+#[wasm_bindgen_test]
+async fn test_record_at_the_last_key_is_kept_and_never_reused() {
+	let db_name = "test-schema-last-key";
+	let store = fresh_store(db_name, 4096).await;
+	if !store.is_persisted() {
+		web_sys::console::log_1(&"Skipping schema test - no persistence".into());
+		return;
+	}
+	settle().await;
+	let db = store.db.clone().unwrap();
+	add_raw(&db, &[json!({"key": u32::MAX, "value": "at the end"})]).await;
+
+	let mut reopened = WebStore::new(config(db_name, 4096, KEY)).await;
+	assert_eq!(queued(&reopened), vec![json!("at the end")]);
+	assert_eq!(reopened.next_key, u32::MAX);
+	assert!(reopened.append(json!("new")).is_err());
+	assert_eq!(queued(&reopened), vec![json!("at the end")]);
+	settle().await;
+	assert_eq!(
+		idb::read_all(&db).await.unwrap(),
+		vec![json!({"key": u32::MAX, "value": "at the end"})]
+	);
+
+	let result = reopened.fetch(None, None).unwrap().unwrap();
+	assert_eq!(checked_batch(&result, 4096), vec![json!("at the end")]);
+	reopened.remove(&result.removable.unwrap()).unwrap();
+	settle().await;
+	assert!(idb::read_all(&db).await.unwrap().is_empty());
+	// Once it is gone, a store opened again starts over.
+	let mut again = WebStore::new(config(db_name, 4096, KEY)).await;
+	assert_eq!(again.next_key, 0);
+	again.append(json!("fresh")).unwrap();
+	again.reset();
+	settle().await;
+}

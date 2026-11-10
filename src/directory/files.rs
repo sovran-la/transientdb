@@ -7,11 +7,15 @@
 //! regular files count. Every listing of the directory goes through
 //! [`DirectoryStore::owned_files`], so a store never reads, closes, renames, counts or
 //! deletes anything else in the directory, including another store's files.
+//!
+//! Indexes only grow. A new file takes the next index above every one in use, and
+//! once `u32::MAX` is taken there is no next index: starting a file fails rather than
+//! wrapping around to an index that would be fetched out of order.
 
 use super::DirectoryStore;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Result;
+use std::io::{self, Result};
 use std::path::{Path, PathBuf};
 
 /// One of a store's files on disk.
@@ -24,6 +28,18 @@ pub(super) struct OwnedFile {
 }
 
 impl DirectoryStore {
+	/// Takes the next index for a new file, or fails if `u32::MAX` is already taken.
+	pub(super) fn take_index(&mut self) -> Result<u32> {
+		let index = self.next_index.ok_or_else(|| {
+			io::Error::other(format!(
+				"No file index left: index {} is taken and indexes never wrap. Fetch and remove this store's files, then open it again.",
+				u32::MAX
+			))
+		})?;
+		self.next_index = index.checked_add(1);
+		Ok(index)
+	}
+
 	/// Panics unless `base_filename` names files inside the storage directory that the
 	/// ownership rule can tell apart: not empty, not `.` or `..`, no `/`, `\` or NUL, and
 	/// not ending in `.temp`. Both separators are refused on every platform, so the same

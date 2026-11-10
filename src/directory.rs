@@ -5,7 +5,6 @@ use std::any::Any;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Result, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 mod data_file;
 mod files;
@@ -129,7 +128,9 @@ pub struct DirectoryStore {
 	/// Length in bytes of `closing()`, which is the same for every timestamp.
 	closing_len: usize,
 	file_validator: Option<FileValidator>,
-	next_index: AtomicU32,
+	/// The index the next new file gets, or `None` once an index of `u32::MAX` is taken
+	/// and no higher one exists.
+	next_index: Option<u32>,
 	/// Unfinished files for the next `fetch` to recover, each listed once: those an
 	/// earlier session left behind, listed by `new`, and any this session abandoned after
 	/// a failed write or failed to finish. Every fetch recovers and clears the list.
@@ -188,7 +189,7 @@ impl DirectoryStore {
 			current_path: None,
 			closing_len: 0,
 			file_validator: None,
-			next_index: AtomicU32::new(0),
+			next_index: None,
 			leftovers: Vec::new(),
 			#[cfg(test)]
 			faults: Default::default(),
@@ -202,7 +203,7 @@ impl DirectoryStore {
 
 		// Get the max index and the leftovers to recover at the first fetch
 		let (max_index, leftovers) = store.initialize_directory()?;
-		store.next_index.store(max_index + 1, Ordering::SeqCst);
+		store.next_index = max_index.checked_add(1);
 		store.leftovers = leftovers;
 
 		Ok(store)
@@ -320,10 +321,6 @@ impl DirectoryStore {
 		self.file_validator = Some(Box::new(validator));
 	}
 
-	fn next_index(&self) -> u32 {
-		self.next_index.fetch_add(1, Ordering::SeqCst)
-	}
-
 	/// Bytes written at the start of every data file.
 	fn opening(&self) -> &'static [u8] {
 		b"{ \"batch\": ["
@@ -370,7 +367,7 @@ impl DirectoryStore {
 			return Ok(());
 		}
 
-		let mut index = self.next_index();
+		let mut index = self.take_index()?;
 		let mut attempts = 0;
 		const MAX_ATTEMPTS: u32 = 1000; // Safeguard against infinite loops
 
@@ -416,7 +413,7 @@ impl DirectoryStore {
 				}
 				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
 					// File exists, try next index
-					index = self.next_index();
+					index = self.take_index()?;
 					attempts += 1;
 
 					if attempts >= MAX_ATTEMPTS {
@@ -588,6 +585,11 @@ impl DataStore for DirectoryStore {
 	/// using that file and the next append starts a new one; the next `fetch` salvages
 	/// the abandoned file's complete items. If finishing the previous file fails, the
 	/// item is not stored, and the next `fetch` recovers that file with all its items.
+	///
+	/// File indexes never wrap. If the item needs a new file and index `u32::MAX` is
+	/// already taken, the append fails and creates nothing; no existing file is reused.
+	/// The files already there can still be fetched, and once they are removed, a store
+	/// opened again starts over from index 1.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let item = serde_json::to_vec(&data)?;
 
@@ -713,6 +715,7 @@ mod tests {
 	mod deferred;
 	mod duplicates;
 	mod finish_failure;
+	mod index_limit;
 	mod lifecycle;
 	mod oversized;
 	mod ownership;
