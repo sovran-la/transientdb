@@ -15,8 +15,8 @@ fn fetch_one_file(store: &mut DirectoryStore) -> Result<Vec<Value>> {
 	let files = store.fetch(None, None)?.unwrap().data.unwrap();
 	assert_eq!(files.len(), 1);
 	let json: Value = serde_json::from_slice(&fs::read(&files[0])?)?;
-	assert_eq!(json["writeKey"], KEY);
-	Ok(json["batch"].as_array().unwrap().clone())
+	assert_eq!(json["source"], KEY);
+	Ok(json["items"].as_array().unwrap().clone())
 }
 
 fn assert_too_deep(err: &io::Error) {

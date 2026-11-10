@@ -35,7 +35,7 @@ fn test_largest_item_accepted_and_fetchable_alone() -> Result<()> {
 	for max in [100usize, 101, 512, 4096] {
 		let mut store = store(max);
 		let largest = store.max_item_size;
-		assert_eq!(largest, max - MemoryStore::widest_envelope_len(KEY));
+		assert_eq!(largest, max - envelope(KEY));
 
 		assert_invalid_input(&store.append(item_of_len(largest + 1, 0)).unwrap_err());
 		store.append(item_of_len(largest, 1))?;
@@ -91,7 +91,7 @@ fn test_small_per_call_max_bytes_returns_none_without_wedging() -> Result<()> {
 #[test]
 fn test_rejected_item_does_not_trigger_drop_oldest() -> Result<()> {
 	let mut store = MemoryStore::new(MemoryConfig {
-		write_key: KEY.to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(3),
 		max_fetch_size: 200,
 		max_fetch_items: None,
@@ -145,15 +145,13 @@ fn test_reset_after_rejection() -> Result<()> {
 	expected = "max_fetch_size is all envelope and no room for an item? That's packaging, not a batch."
 )]
 fn test_rejects_envelope_that_leaves_no_room() {
-	let envelope = MemoryStore::widest_envelope_len("");
-	// The widest envelope with this key is exactly 100 bytes.
-	let _ = store_with(100, &"k".repeat(100 - envelope));
+	// The envelope with this source is exactly 100 bytes.
+	let _ = store_with(100, with_source(&"k".repeat(100 - envelope(""))));
 }
 
 #[test]
 fn test_envelope_leaving_one_byte_is_accepted() -> Result<()> {
-	let envelope = MemoryStore::widest_envelope_len("");
-	let mut store = store_with(100, &"k".repeat(99 - envelope));
+	let mut store = store_with(100, with_source(&"k".repeat(99 - envelope(""))));
 	assert_eq!(store.max_item_size, 1);
 	assert_invalid_input(&store.append(json!(10)).unwrap_err());
 	store.append(json!(7))?;

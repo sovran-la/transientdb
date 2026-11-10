@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use tempfile::TempDir;
 use transientdb::TransientDB;
-use transientdb::{DirectoryConfig, DirectoryStore};
+use transientdb::{DirectoryConfig, DirectoryStore, Envelope};
 use transientdb::{MemoryConfig, MemoryStore};
 
 /// Executes a comprehensive stress test of the MemoryStore implementation under heavy concurrent load.
@@ -62,7 +62,7 @@ fn test_memory_store_stress() -> Result<()> {
 	use std::time::{Duration, Instant};
 
 	let config = MemoryConfig {
-		write_key: "test-key-mem".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(10_000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
@@ -223,7 +223,7 @@ fn test_directory_store_stress() -> Result<()> {
 
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key-dir".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 2, // 2KB files to force frequent rotation

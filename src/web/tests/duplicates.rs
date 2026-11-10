@@ -62,7 +62,7 @@ async fn test_removing_twice_is_a_noop() {
 #[wasm_bindgen_test]
 async fn test_removing_an_item_evicted_since_fetch_is_a_noop() {
 	let db_name = "test-dup-evicted";
-	let mut config = config(db_name, 4096, KEY);
+	let mut config = config(db_name, 4096, with_source(KEY));
 	config.max_items = Some(3);
 	let mut store = fresh_store_with(config).await;
 	let (a, b, c) = (json!("a"), json!("b"), json!("c"));

@@ -16,7 +16,7 @@ async fn persisted(config: WebConfig) -> Option<WebStore> {
 }
 
 fn config_for(db_name: &str) -> WebConfig {
-	config(db_name, 4096, KEY)
+	config(db_name, 4096, with_source(KEY))
 }
 
 fn tagged(range: std::ops::Range<i64>) -> Vec<Value> {

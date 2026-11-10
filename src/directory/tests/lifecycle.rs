@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 fn limited_store(dir: &TempDir, max_file_size: usize, items: usize) -> Result<DirectoryStore> {
-	let mut config = config(dir, max_file_size, KEY);
+	let mut config = config(dir, max_file_size, with_source(KEY));
 	config.max_file_items = Some(items);
 	DirectoryStore::new(config)
 }
@@ -32,7 +32,7 @@ fn test_item_limit_trips_before_byte_ceiling() -> Result<()> {
 fn test_byte_ceiling_trips_before_item_limit() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = limited_store(&temp_dir, 200, 5)?;
-	// 72 + 41n - 1 <= 200 allows 3 items of 40 bytes, below the item limit of 5.
+	// 68 + 41n - 1 <= 200 allows 3 items of 40 bytes, below the item limit of 5.
 	let items: Vec<Value> = (0..10).map(|_| item_of_len(40)).collect();
 	append_all(&mut store, &items)?;
 
@@ -67,13 +67,13 @@ fn test_no_empty_or_envelope_only_files() -> Result<()> {
 	let mut accepted = Vec::new();
 	for i in 0..40 {
 		if i % 4 == 0 {
-			assert_invalid_input(&store.append(item_of_len(79)).unwrap_err());
+			assert_invalid_input(&store.append(item_of_len(150 - ENVELOPE + 1)).unwrap_err());
 		}
 		let item = item_of_len(2 + (i * 13) % 60);
 		store.append(item.clone())?;
 		accepted.push(item);
 	}
-	assert_invalid_input(&store.append(item_of_len(79)).unwrap_err());
+	assert_invalid_input(&store.append(item_of_len(150 - ENVELOPE + 1)).unwrap_err());
 
 	let on_disk = store.sorted_files(true)?;
 	// finished_files asserts every batch is non-empty.
@@ -100,7 +100,7 @@ fn test_fetch_orders_files_by_numeric_index() -> Result<()> {
 	let oldest = store.fetch(Some(3), None)?.unwrap().data.unwrap();
 	let indexes: Vec<Value> = oldest
 		.iter()
-		.map(|f| read_finished(f, KEY).map(|f| f.batch()[0]["i"].clone()))
+		.map(|f| read_finished(f, &with_source(KEY)).map(|f| f.batch()[0]["i"].clone()))
 		.collect::<Result<_>>()?;
 	assert_eq!(indexes, vec![json!(0), json!(1), json!(2)]);
 	Ok(())
@@ -127,7 +127,7 @@ fn test_recovered_file_respects_ceiling() -> Result<()> {
 		let mut store = store(&temp_dir, 200)?;
 		// Fills the open file to exactly 200 bytes once closed; dropped unfinished.
 		store.append(item_of_len(60))?;
-		store.append(item_of_len(67))?;
+		store.append(item_of_len(FILLER))?;
 	}
 
 	let mut store = store(&temp_dir, 200)?;
@@ -182,21 +182,27 @@ fn test_validator_rejection_on_byte_ceiling_rotation_deletes_the_file() -> Resul
 	Ok(())
 }
 
+/// A `source` value whose envelope is exactly 100 bytes: the envelope is `ENVELOPE`
+/// bytes with `KEY` as the source, and grows byte for byte with it.
+fn filling_source() -> String {
+	"k".repeat(100 - (ENVELOPE - KEY.len()))
+}
+
 #[test]
 #[should_panic(
 	expected = "max_file_size is all envelope and no room for an item? That's packaging, not storage."
 )]
 fn test_rejects_envelope_that_leaves_no_room() {
 	let temp_dir = TempDir::new().unwrap();
-	// 12 + (52 + 36) = 100: the envelope alone fills the file.
-	let _ = DirectoryStore::new(config(&temp_dir, 100, &"k".repeat(36)));
+	// The envelope alone fills the file.
+	let _ = DirectoryStore::new(config(&temp_dir, 100, with_source(&filling_source())));
 }
 
 #[test]
 fn test_envelope_leaving_one_byte_is_accepted() -> Result<()> {
 	let temp_dir = TempDir::new()?;
-	let key = "k".repeat(35);
-	let mut store = DirectoryStore::new(config(&temp_dir, 100, &key))?;
+	let source = "k".repeat(filling_source().len() - 1);
+	let mut store = DirectoryStore::new(config(&temp_dir, 100, with_source(&source)))?;
 	assert_eq!(store.max_item_size(), 1);
 	assert_invalid_input(&store.append(json!(10)).unwrap_err());
 	store.append(json!(7))?;
@@ -211,7 +217,7 @@ fn test_envelope_leaving_one_byte_is_accepted() -> Result<()> {
 fn test_rejected_envelope_config_creates_no_directory() {
 	let temp_dir = TempDir::new().unwrap();
 	let location = temp_dir.path().join("never-created");
-	let mut config = config(&temp_dir, 100, &"k".repeat(36));
+	let mut config = config(&temp_dir, 100, with_source(&filling_source()));
 	config.storage_location = location.clone();
 	let result = std::panic::catch_unwind(|| DirectoryStore::new(config));
 	assert!(result.is_err());

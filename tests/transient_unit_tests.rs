@@ -14,12 +14,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, thread};
 use tempfile::TempDir;
-use transientdb::{DirectoryConfig, DirectoryStore, MemoryConfig, MemoryStore, TransientDB};
+use transientdb::{
+	DirectoryConfig, DirectoryStore, Envelope, MemoryConfig, MemoryStore, TransientDB,
+};
 
 #[test]
 fn test_concurrent_appends() -> Result<()> {
 	let config = MemoryConfig {
-		write_key: "test-key-concurrent-appends".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(10000),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
@@ -74,7 +76,7 @@ fn test_concurrent_appends() -> Result<()> {
 #[test]
 fn test_concurrent_append_and_fetch() -> Result<()> {
 	let config = MemoryConfig {
-		write_key: "test-key-append-and-fetch".to_string(), // Unique key
+		envelope: Envelope::default(),
 		max_items: Some(1000),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
@@ -100,7 +102,7 @@ fn test_concurrent_append_and_fetch() -> Result<()> {
 		while total_fetched < 100 {
 			if let Ok(Some(result)) = db_fetch.fetch(Some(10), None) {
 				let batch: Value = result.data.unwrap();
-				let items = batch["batch"].as_array().unwrap();
+				let items = batch["items"].as_array().unwrap();
 				total_fetched += items.len();
 			}
 			thread::sleep(std::time::Duration::from_millis(1));
@@ -122,7 +124,7 @@ fn test_concurrent_append_and_fetch() -> Result<()> {
 #[test]
 fn test_concurrent_reset() -> Result<()> {
 	let config = MemoryConfig {
-		write_key: "test-key-reset".to_string(), // Unique key
+		envelope: Envelope::default(),
 		max_items: Some(1000),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
@@ -162,7 +164,7 @@ fn test_concurrent_reset() -> Result<()> {
 		for _ in 0..10 {
 			if let Ok(Some(result)) = db_fetch.fetch(None, None) {
 				let batch: Value = result.data.unwrap();
-				let items = batch["batch"].as_array().unwrap();
+				let items = batch["items"].as_array().unwrap();
 				_fetch_count += items.len();
 			}
 			thread::sleep(std::time::Duration::from_millis(10));
@@ -185,7 +187,7 @@ fn test_concurrent_reset() -> Result<()> {
 fn test_concurrent_directory_store() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key-directory".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 200, // Small size to force rotation
@@ -259,7 +261,7 @@ fn test_concurrent_directory_store() -> Result<()> {
 fn test_directory_store_stress() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 10, // 10KB files to force lots of rotation
@@ -336,7 +338,7 @@ fn test_directory_store_stress() -> Result<()> {
 #[test]
 fn test_memory_store_chaos() -> Result<()> {
 	let config = MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(100_000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
@@ -457,7 +459,7 @@ fn test_memory_store_chaos() -> Result<()> {
 fn test_directory_store_chaos() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 2, // Tiny 2KB files for maximum pain
@@ -560,7 +562,7 @@ fn test_directory_store_chaos() -> Result<()> {
 fn test_directory_store_malformed_files() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024,
@@ -599,7 +601,7 @@ fn test_directory_store_malformed_files() -> Result<()> {
 				.iter()
 				.filter(|f| {
 					if let Ok(content) = std::fs::read_to_string(f) {
-						content.starts_with("{ \"batch\": [")
+						content.starts_with("{\"items\":[")
 					} else {
 						false
 					}
@@ -618,7 +620,7 @@ fn test_transient_db_panic_recovery() -> Result<()> {
 	use std::panic::{catch_unwind, AssertUnwindSafe};
 
 	let config = MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(100),
 		max_fetch_size: 1024,
 		max_fetch_items: None,
@@ -646,7 +648,7 @@ fn test_transient_db_panic_recovery() -> Result<()> {
 fn test_directory_store_concurrent_validation() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 256, // Small size to force more file rotations
@@ -758,7 +760,7 @@ fn test_directory_store_concurrent_validation() -> Result<()> {
 			for file in &files {
 				let content = fs::read_to_string(file)?;
 				let value: Value = serde_json::from_str(&content)?;
-				if let Some(batch) = value["batch"].as_array() {
+				if let Some(batch) = value["items"].as_array() {
 					for event in batch {
 						if let (Some(thread_id), Some(index)) =
 							(event["thread"].as_i64(), event["index"].as_i64())
@@ -791,7 +793,7 @@ fn test_directory_store_concurrent_validation() -> Result<()> {
 #[test]
 fn test_heavy_concurrent_load() -> Result<()> {
 	let config = MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(100_000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: None,
@@ -828,7 +830,7 @@ fn test_heavy_concurrent_load() -> Result<()> {
 				// Reduced from 10_000 to 1_000
 				if let Ok(Some(result)) = db.fetch(Some(100), None) {
 					let batch: Value = result.data.unwrap();
-					let items = batch["batch"].as_array().unwrap();
+					let items = batch["items"].as_array().unwrap();
 					total_items += items.len();
 				}
 				thread::sleep(Duration::from_micros(100));
@@ -861,7 +863,7 @@ fn drain_memory_batches(db: &TransientDB<Value>) -> Result<(Vec<usize>, Vec<i64>
 	let mut seen = Vec::new();
 	while let Some(result) = db.fetch(None, None)? {
 		let batch = result.data.unwrap();
-		let items = batch["batch"].as_array().unwrap();
+		let items = batch["items"].as_array().unwrap();
 		let removable = result.removable.unwrap();
 		assert_eq!(items.len(), removable.len());
 		sizes.push(items.len());
@@ -874,7 +876,7 @@ fn drain_memory_batches(db: &TransientDB<Value>) -> Result<(Vec<usize>, Vec<i64>
 #[test]
 fn test_memory_fetch_item_limit_through_transientdb() -> Result<()> {
 	let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(1000),
 		max_fetch_size: 1024 * 1024,
 		max_fetch_items: Some(8),
@@ -885,9 +887,9 @@ fn test_memory_fetch_item_limit_through_transientdb() -> Result<()> {
 
 	// A count above the limit is clamped, below it wins.
 	let batch = db.fetch(Some(100), None)?.unwrap().data.unwrap();
-	assert_eq!(batch["batch"].as_array().unwrap().len(), 8);
+	assert_eq!(batch["items"].as_array().unwrap().len(), 8);
 	let batch = db.fetch(Some(3), None)?.unwrap().data.unwrap();
-	assert_eq!(batch["batch"].as_array().unwrap().len(), 3);
+	assert_eq!(batch["items"].as_array().unwrap().len(), 3);
 
 	let (sizes, seen) = drain_memory_batches(&db)?;
 	assert_eq!(sizes, vec![8, 8, 4]);
@@ -900,7 +902,9 @@ fn test_memory_fetch_item_limit_through_transientdb() -> Result<()> {
 fn test_directory_file_item_limit_through_transientdb() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let db = TransientDB::new(DirectoryStore::new(DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::new("items")
+			.field("source", "test-key")
+			.timestamp("sentAt"),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 1024,
@@ -917,8 +921,8 @@ fn test_directory_file_item_limit_through_transientdb() -> Result<()> {
 	for file in &files {
 		let parsed: Value = serde_json::from_str(&fs::read_to_string(file)?)?;
 		assert!(parsed["sentAt"].is_string());
-		assert_eq!(parsed["writeKey"], "test-key");
-		let batch = parsed["batch"].as_array().unwrap();
+		assert_eq!(parsed["source"], "test-key");
+		let batch = parsed["items"].as_array().unwrap();
 		counts.push(batch.len());
 		seen.extend(batch.iter().map(|v| v["index"].as_i64().unwrap()));
 	}
@@ -934,7 +938,7 @@ fn test_directory_file_item_limit_through_transientdb() -> Result<()> {
 fn test_directory_file_item_limit_concurrent_appends() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let db = Arc::new(TransientDB::new(DirectoryStore::new(DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 1024,
@@ -960,7 +964,7 @@ fn test_directory_file_item_limit_concurrent_appends() -> Result<()> {
 	let mut seen = HashSet::new();
 	for file in &files {
 		let parsed: Value = serde_json::from_str(&fs::read_to_string(file)?)?;
-		let batch = parsed["batch"].as_array().unwrap();
+		let batch = parsed["items"].as_array().unwrap();
 		assert!(
 			!batch.is_empty() && batch.len() <= 8,
 			"bad batch size {}",
@@ -980,7 +984,7 @@ fn test_directory_file_item_limit_concurrent_appends() -> Result<()> {
 #[test]
 fn test_removables_pass_through_to_the_one_wrapped_store() -> Result<()> {
 	let config = MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(100),
 		max_fetch_size: 4096,
 		max_fetch_items: None,
@@ -994,7 +998,7 @@ fn test_removables_pass_through_to_the_one_wrapped_store() -> Result<()> {
 		b.append(json!({"i": i}))?;
 	}
 	let batch = |db: &TransientDB<Value>| -> Result<Vec<Value>> {
-		Ok(db.fetch(None, None)?.unwrap().data.unwrap()["batch"]
+		Ok(db.fetch(None, None)?.unwrap().data.unwrap()["items"]
 			.as_array()
 			.unwrap()
 			.clone())
@@ -1014,7 +1018,7 @@ fn test_removables_pass_through_to_the_one_wrapped_store() -> Result<()> {
 #[test]
 fn test_unbounded_memory_store_never_drops_under_concurrent_appends() -> Result<()> {
 	let store = MemoryStore::new(MemoryConfig {
-		write_key: "test-key-unbounded".to_string(),
+		envelope: Envelope::default(),
 		max_items: None,
 		max_fetch_size: 16 * 1024,
 		max_fetch_items: None,
@@ -1043,7 +1047,7 @@ fn test_unbounded_memory_store_never_drops_under_concurrent_appends() -> Result<
 	let mut total = 0;
 	while let Some(result) = db.fetch(None, None)? {
 		let batch: Value = result.data.unwrap();
-		for item in batch["batch"].as_array().unwrap() {
+		for item in batch["items"].as_array().unwrap() {
 			let t = item["t"].as_u64().unwrap() as usize;
 			assert_eq!(item["n"].as_u64().unwrap() as usize, next[t], "{item}");
 			next[t] += 1;

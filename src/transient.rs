@@ -42,10 +42,10 @@ impl<T> TransientDB<T> {
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{TransientDB, MemoryConfig, MemoryStore};
+	/// use transientdb::{Envelope, TransientDB, MemoryConfig, MemoryStore};
 	///
 	/// let config = MemoryConfig {
-	///     write_key: "my-store".into(),
+	///     envelope: Envelope::default(),
 	///     max_items: Some(1000),
 	///     max_fetch_size: 1024 * 1024, // 1MB
 	///     max_fetch_items: None,
@@ -72,11 +72,11 @@ impl<T> TransientDB<T> {
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
@@ -94,11 +94,11 @@ impl<T> TransientDB<T> {
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
@@ -121,11 +121,11 @@ impl<T> TransientDB<T> {
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
@@ -159,11 +159,11 @@ impl<T> TransientDB<T> {
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,
@@ -205,11 +205,11 @@ impl<T> TransientDB<T> {
 	///
 	/// # Examples
 	/// ```
-	/// use transientdb::{TransientDB, MemoryStore, MemoryConfig};
+	/// use transientdb::{Envelope, TransientDB, MemoryStore, MemoryConfig};
 	/// use serde_json::json;
 	///
 	/// let db = TransientDB::new(MemoryStore::new(MemoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     max_items: Some(100),
 	///     max_fetch_size: 1024,
 	///     max_fetch_items: None,

@@ -20,7 +20,7 @@ async fn test_repeated_reopening_changes_nothing() {
 	settle().await;
 
 	for _ in 0..4 {
-		let reopened = WebStore::new(config(db_name, 4096, KEY)).await;
+		let reopened = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 		assert_eq!(queued(&reopened), appended);
 		assert_eq!(
 			reopened.items.iter().map(|e| e.key).collect::<Vec<_>>(),

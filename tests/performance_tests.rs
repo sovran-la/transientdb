@@ -6,7 +6,7 @@ use std::io::Result;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use transientdb::TransientDB;
-use transientdb::{DirectoryConfig, DirectoryStore};
+use transientdb::{DirectoryConfig, DirectoryStore, Envelope};
 use transientdb::{MemoryConfig, MemoryStore};
 
 /* run these tests locally with:
@@ -58,7 +58,7 @@ fn benchmark_memory_store() -> Result<()> {
 	println!("\n=== Memory Store Performance Test ===");
 
 	let config = MemoryConfig {
-		write_key: "bench-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(2_000_000),       // 2M to avoid FIFO cleanup during test
 		max_fetch_size: 1024 * 1024 * 10, // 10MB
 		max_fetch_items: None,
@@ -120,7 +120,7 @@ fn benchmark_memory_store() -> Result<()> {
 			let op_start = Instant::now();
 			if let Ok(Some(result)) = db.fetch(Some(batch_size), None) {
 				let batch: serde_json::Value = result.data.unwrap();
-				let items = batch["batch"].as_array().unwrap();
+				let items = batch["items"].as_array().unwrap();
 				total_events += items.len();
 				read_latencies.add(op_start.elapsed());
 			} else {
@@ -151,7 +151,7 @@ fn benchmark_directory_store() -> Result<()> {
 
 	let temp_dir = TempDir::new()?;
 	let config = DirectoryConfig {
-		write_key: "bench-key".to_string(),
+		envelope: Envelope::default(),
 		storage_location: temp_dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size: 1024 * 1024, // 1MB files

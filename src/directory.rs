@@ -1,5 +1,5 @@
-use crate::{batch, DataResult, DataStore, Equivalent};
-use chrono::{DateTime, Utc};
+use crate::{batch, DataResult, DataStore, Envelope, Equivalent};
+use chrono::Utc;
 use serde_json::Value;
 use std::any::Any;
 use std::fs::{self, OpenOptions};
@@ -34,10 +34,10 @@ impl Equivalent for PathBuf {
 /// # Examples
 /// ```
 /// use std::path::PathBuf;
-/// use transientdb::DirectoryConfig;
+/// use transientdb::{DirectoryConfig, Envelope};
 ///
 /// let config = DirectoryConfig {
-///     write_key: "my-store".into(),
+///     envelope: Envelope::new("events").field("source", "sensor-7").timestamp("sentAt"),
 ///     storage_location: PathBuf::from("/tmp/data"),
 ///     base_filename: "events".into(),
 ///     max_file_size: 1024 * 1024, // 1MB
@@ -46,9 +46,10 @@ impl Equivalent for PathBuf {
 /// ```
 #[derive(Clone)]
 pub struct DirectoryConfig {
-	/// Key used to identify writes to this store.
-	/// This is included in the metadata of each data file created by the store.
-	pub write_key: String,
+	/// The JSON object each data file wraps its items in. A finished file is, byte for
+	/// byte, the envelope's opening (`{"items":[` by default), the items separated by
+	/// commas, and its closing (`]}` by default); see [`Envelope`].
+	pub envelope: Envelope,
 	/// Directory where data files will be stored.
 	/// The store will create this directory if it doesn't exist.
 	pub storage_location: PathBuf,
@@ -69,14 +70,14 @@ pub struct DirectoryConfig {
 	pub base_filename: String,
 	/// Maximum size in bytes of a finished data file on disk.
 	///
-	/// This is a hard ceiling: the whole finished file, including the JSON envelope
-	/// (`batch` opening, `sentAt`, `writeKey`) and the commas between items, is never
+	/// This is a hard ceiling: the whole finished file, including the envelope (its
+	/// opening and its closing) and the commas between items, is never
 	/// larger than this. When the next item would push the finished file past it, the
 	/// open file is finished first and the item starts a new one. An item too large to
 	/// fit even alone in a file is rejected by `append` with `ErrorKind::InvalidInput`.
 	///
 	/// Must be at least 100 bytes, and must leave room for at least a 1-byte item once
-	/// the envelope is counted (the envelope grows with `write_key`'s length).
+	/// the envelope is counted.
 	///
 	/// An unfinished file an earlier session left under a larger limit, even one it had
 	/// already closed, is cut down when recovered to the leading items that fit under
@@ -112,10 +113,8 @@ pub type FileValidator = Box<dyn Fn(&Path) -> Result<()> + Send + Sync>;
 /// they are ready for processing. Only files named for this store's `base_filename` are
 /// ever read, finished, fetched or removed; see [`DirectoryConfig::base_filename`].
 ///
-/// Each file contains a JSON object with:
-/// - A `batch` array containing the stored items
-/// - A `sentAt` timestamp in RFC3339 format
-/// - The store's `writeKey`
+/// Each file contains one JSON object, shaped by [`DirectoryConfig::envelope`]: the items
+/// in an array under its items key, then its fields, then its timestamp if it has one.
 ///
 /// # Durability
 /// Files are not fsynced, so durability across a power loss or OS crash is not
@@ -130,6 +129,8 @@ pub struct DirectoryStore {
 	current_size: usize,
 	current_items: usize,
 	current_path: Option<PathBuf>,
+	/// The configured envelope's opening, written at the start of every file.
+	opening: Vec<u8>,
 	/// Length in bytes of `closing()`, which is the same for every timestamp.
 	closing_len: usize,
 	file_validator: Option<FileValidator>,
@@ -172,7 +173,9 @@ impl DirectoryStore {
 	/// * If max_file_size is less than 100 bytes
 	/// * If max_file_items is `Some(0)`
 	/// * If max_file_size leaves no room for even a 1-byte item once the file's
-	///   envelope (which grows with `write_key`) is counted
+	///   envelope is counted
+	/// * If the envelope has an empty key, uses a key twice, or does not read back as
+	///   JSON (see [`Envelope`])
 	/// * If base_filename is empty, is `.` or `..`, or contains `/`, `\` or a NUL byte:
 	///   the store's file names would escape the storage directory or not be names
 	/// * If base_filename ends in `.temp`: its open files would carry the name another
@@ -185,6 +188,9 @@ impl DirectoryStore {
 			panic!("max_file_items = Some(0)? A file that holds nothing is just a very expensive empty directory.");
 		}
 		Self::validate_base_filename(&config.base_filename);
+		config.envelope.validate();
+		let opening = config.envelope.opening();
+		let closing_len = config.envelope.closing(Utc::now()).len();
 
 		let mut store = DirectoryStore {
 			config,
@@ -192,14 +198,14 @@ impl DirectoryStore {
 			current_size: 0,
 			current_items: 0,
 			current_path: None,
-			closing_len: 0,
+			opening,
+			closing_len,
 			file_validator: None,
 			next_index: None,
 			leftovers: Vec::new(),
 			#[cfg(test)]
 			faults: Default::default(),
 		};
-		store.closing_len = store.closing(Utc::now()).len();
 		if store.opening().len() + store.closing_len + 1 > store.config.max_file_size {
 			panic!("max_file_size is all envelope and no room for an item? That's packaging, not storage.");
 		}
@@ -248,10 +254,10 @@ impl DirectoryStore {
 	/// use std::path::PathBuf;
 	/// use std::fs;
 	/// use std::io;
-	/// use transientdb::{DirectoryConfig, DirectoryStore};
+	/// use transientdb::{DirectoryConfig, DirectoryStore, Envelope};
 	///
 	/// let mut store = DirectoryStore::new(DirectoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     storage_location: PathBuf::from("/tmp/data"),
 	///     base_filename: "events".into(),
 	///     max_file_size: 1024,
@@ -282,7 +288,7 @@ impl DirectoryStore {
 	/// use std::sync::atomic::{AtomicUsize, Ordering};
 	/// use std::sync::Arc;
 	/// use serde_json::json;
-	/// use transientdb::{DataStore, DirectoryConfig, DirectoryStore};
+	/// use transientdb::{DataStore, DirectoryConfig, DirectoryStore, Envelope};
 	///
 	/// let dir = std::env::temp_dir().join("transientdb-doc-rejections");
 	/// # let _ = fs::remove_dir_all(&dir);
@@ -290,7 +296,7 @@ impl DirectoryStore {
 	/// fs::create_dir_all(&quarantine)?;
 	///
 	/// let mut store = DirectoryStore::new(DirectoryConfig {
-	///     write_key: "test".into(),
+	///     envelope: Envelope::default(),
 	///     storage_location: dir.clone(),
 	///     base_filename: "events".into(),
 	///     max_file_size: 1024,
@@ -326,24 +332,16 @@ impl DirectoryStore {
 		self.file_validator = Some(Box::new(validator));
 	}
 
-	/// Bytes written at the start of every data file.
-	fn opening(&self) -> &'static [u8] {
-		b"{ \"batch\": ["
+	/// Bytes written at the start of every data file: the envelope's opening.
+	fn opening(&self) -> &[u8] {
+		&self.opening
 	}
 
-	/// Bytes written at the end of every data file when it is finished.
-	///
-	/// Its length does not depend on `sent_at`: the timestamp format is fixed-width.
-	/// `write_key` is written as a JSON string, escaped as needed.
-	fn closing(&self, sent_at: DateTime<Utc>) -> Vec<u8> {
-		let write_key =
-			serde_json::to_string(&self.config.write_key).expect("a string always serializes");
-		format!(
-			"],\"sentAt\":\"{}\",\"writeKey\":{}}}",
-			sent_at.format("%Y-%m-%dT%H:%M:%S.%3fZ"),
-			write_key
-		)
-		.into_bytes()
+	/// Bytes written at the end of every data file when it is finished, now: the
+	/// envelope's closing. Its length is always `closing_len`; the timestamp is
+	/// fixed-width.
+	fn closing(&self) -> Vec<u8> {
+		self.config.envelope.closing(Utc::now())
 	}
 
 	/// The largest serialized item that fits alone in a file.
@@ -486,7 +484,7 @@ impl DirectoryStore {
 		self.current_size = 0;
 		self.current_items = 0;
 
-		let closing = self.closing(Utc::now());
+		let closing = self.closing();
 		debug_assert_eq!(closing.len(), self.closing_len);
 		let closed = writer.write_all(&closing).and_then(|()| writer.flush());
 		// Close the file without flushing again on drop: after a failure, bytes still
@@ -727,7 +725,7 @@ impl DataStore for DirectoryStore {
 #[cfg(test)]
 mod tests {
 	use super::{DirectoryConfig, DirectoryStore};
-	use crate::DataStore;
+	use crate::{DataStore, Envelope};
 	use serde_json::json;
 	use serde_json::Value;
 	use std::fs;
@@ -735,12 +733,15 @@ mod tests {
 	use std::io::Result;
 	use tempfile::TempDir;
 
+	mod awkward_envelope;
 	mod base_filename;
 	mod capacity;
 	mod ceiling;
 	mod deferred;
 	mod depth;
 	mod duplicates;
+	mod envelope;
+	mod envelope_recovery;
 	mod finish_failure;
 	mod foreign_removables;
 	mod index_limit;
@@ -751,17 +752,18 @@ mod tests {
 	mod recovery;
 	mod rejection;
 	mod salvage;
+	mod salvage_rule;
+	mod salvage_support;
 	mod support;
 	mod unreadable;
 	mod write_failure;
-	mod write_key;
 
 	#[test]
 	fn test_directory_store_basic_operations() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: support::with_source("test-key"),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024,
@@ -789,7 +791,7 @@ mod tests {
 			// Verify file content
 			let content = fs::read_to_string(&files[0])?;
 			assert!(content.contains("\"event\":\"test\""));
-			assert!(content.contains("\"writeKey\":\"test-key\""));
+			assert!(content.contains("\"source\":\"test-key\""));
 		} else {
 			panic!("Expected data but got none");
 		}
@@ -803,7 +805,7 @@ mod tests {
 
 		// Create initial store instance
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: support::with_source("test-key"),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024,
@@ -842,12 +844,12 @@ mod tests {
 				let json: Value = serde_json::from_str(&content)?;
 
 				// Verify structure
-				assert!(json.get("batch").is_some(), "Should have batch field");
+				assert!(json.get("items").is_some(), "Should have items field");
 				assert!(json.get("sentAt").is_some(), "Should have sentAt field");
 				assert_eq!(
-					json.get("writeKey").and_then(Value::as_str),
+					json.get("source").and_then(Value::as_str),
 					Some("test-key"),
-					"Should have correct writeKey"
+					"Should have correct source"
 				);
 
 				// All files should have .temp extension now
@@ -871,10 +873,10 @@ mod tests {
 		let temp_dir = TempDir::new()?;
 
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: support::with_source("test-key"),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
-			// Each 79 byte item plus the 72 byte envelope: two items fit per file, not three.
+			// Each 79 byte item plus the 68 byte envelope: two items fit per file, not three.
 			max_file_size: 250,
 			max_file_items: None,
 		};
@@ -901,14 +903,14 @@ mod tests {
 			for file in &files {
 				assert!(fs::metadata(file)?.len() <= 250, "File over max_file_size");
 				let content = fs::read_to_string(file)?.trim().to_string();
-				assert!(content.starts_with("{ \"batch\": ["));
+				assert!(content.starts_with("{\"items\":["));
 				assert!(content.ends_with("}"));
-				assert!(content.contains("\"writeKey\":\"test-key\""));
+				assert!(content.contains("\"source\":\"test-key\""));
 
 				// Validate JSON structure
 				let parsed: serde_json::Value = serde_json::from_str(&content)?;
-				assert!(parsed.get("batch").is_some(), "Missing 'batch' field");
-				assert!(parsed.get("writeKey").is_some(), "Missing 'writeKey' field");
+				assert!(parsed.get("items").is_some(), "Missing 'items' field");
+				assert!(parsed.get("source").is_some(), "Missing 'source' field");
 				assert!(parsed.get("sentAt").is_some(), "Missing 'sentAt' field");
 			}
 		} else {
@@ -922,7 +924,7 @@ mod tests {
 	fn test_fetch_with_size_limit() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 200,
@@ -955,7 +957,7 @@ mod tests {
 	fn test_file_cleanup() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 200,
@@ -994,7 +996,7 @@ mod tests {
 	fn test_file_validator() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024,
@@ -1026,11 +1028,11 @@ mod tests {
 	fn test_fetch_limits() -> Result<()> {
 		let temp_dir = TempDir::new()?;
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
-			// Small size to force multiple files: one 72 byte item plus the 72 byte
-			// envelope per file.
+			// Small size to force multiple files: one 72 byte item plus the 12 byte
+			// default envelope per file; two would be 157 bytes.
 			max_file_size: 150,
 			max_file_items: None,
 		};
@@ -1085,7 +1087,7 @@ mod tests {
 	fn test_rejects_tiny_max_file_size() {
 		let temp_dir = TempDir::new().unwrap();
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 50, // Try to use a ridiculously small size
@@ -1103,7 +1105,7 @@ mod tests {
 	fn test_rejects_zero_max_file_size() {
 		let temp_dir = TempDir::new().unwrap();
 		let config = DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: Envelope::default(),
 			storage_location: temp_dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 0, // Try to use zero
@@ -1116,7 +1118,7 @@ mod tests {
 
 	fn item_limit_config(dir: &TempDir, max_file_items: Option<usize>) -> DirectoryConfig {
 		DirectoryConfig {
-			write_key: "test-key".to_string(),
+			envelope: support::with_source("test-key"),
 			storage_location: dir.path().to_owned(),
 			base_filename: "events".to_string(),
 			max_file_size: 1024 * 1024,
@@ -1124,11 +1126,11 @@ mod tests {
 		}
 	}
 
-	/// Parses a finished file, checks the envelope, and returns its `batch` array.
+	/// Parses a finished file, checks the envelope, and returns its items array.
 	fn read_batch(path: &std::path::Path) -> Result<Vec<Value>> {
 		let content = fs::read_to_string(path)?;
 		assert!(
-			content.starts_with("{ \"batch\": ["),
+			content.starts_with("{\"items\":["),
 			"Bad envelope start: {content}"
 		);
 		assert!(!content.contains("[,"), "Leading comma: {content}");
@@ -1136,10 +1138,10 @@ mod tests {
 		let parsed: Value = serde_json::from_str(&content)?;
 		assert!(parsed.get("sentAt").and_then(Value::as_str).is_some());
 		assert_eq!(
-			parsed.get("writeKey").and_then(Value::as_str),
+			parsed.get("source").and_then(Value::as_str),
 			Some("test-key")
 		);
-		Ok(parsed["batch"].as_array().expect("batch array").clone())
+		Ok(parsed["items"].as_array().expect("items array").clone())
 	}
 
 	/// Fetches every finished file and returns the item count of each, in file order.
@@ -1250,8 +1252,8 @@ mod tests {
 		config.max_file_size = 200;
 		let mut store = DirectoryStore::new(config)?;
 
-		// Each item is 53 bytes and the envelope 72, so two items (179 bytes with the
-		// separator) fit under 200 and a third (233) does not, long before the item
+		// Each item is 53 bytes and the envelope 68, so two items (175 bytes with the
+		// separator) fit under 200 and a third (229) does not, long before the item
 		// limit of 8 is reached.
 		for i in 0..9 {
 			store.append(json!({"index": i, "data": "padding to reach the size limit."}))?;

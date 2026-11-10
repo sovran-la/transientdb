@@ -5,7 +5,7 @@ use crate::Equivalent;
 
 fn store_of(max_items: usize) -> MemoryStore {
 	MemoryStore::new(MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(max_items),
 		max_fetch_size: 4096,
 		max_fetch_items: None,
@@ -25,7 +25,7 @@ type Removables = Vec<Box<dyn Equivalent>>;
 /// Fetches up to `count` items; returns them and their removables.
 fn fetch(store: &mut MemoryStore, count: usize) -> Result<(Vec<Value>, Removables)> {
 	let result = store.fetch(Some(count), None)?.expect("data");
-	let items = result.data.unwrap()["batch"].as_array().unwrap().clone();
+	let items = result.data.unwrap()["items"].as_array().unwrap().clone();
 	Ok((items, result.removable.unwrap()))
 }
 
@@ -64,7 +64,7 @@ fn test_walking_the_store_returns_every_duplicate() -> Result<()> {
 
 	let mut seen = Vec::new();
 	while let Some(result) = store.fetch(Some(2), None)? {
-		seen.extend(result.data.unwrap()["batch"].as_array().unwrap().clone());
+		seen.extend(result.data.unwrap()["items"].as_array().unwrap().clone());
 		store.remove(&result.removable.unwrap())?;
 	}
 	assert_eq!(seen, appended);

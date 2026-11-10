@@ -32,7 +32,7 @@ fn open_items(store: &DirectoryStore) -> Vec<Value> {
 			String::from_utf8_lossy(&bytes)
 		)
 	});
-	let items = json["batch"].as_array().unwrap().clone();
+	let items = json["items"].as_array().unwrap().clone();
 	assert_eq!(items.len(), store.current_items);
 	assert_eq!(bytes, unclosed(&items));
 	items
@@ -146,7 +146,7 @@ fn test_failure_writing_the_opening_of_a_new_file() -> Result<()> {
 	// The same on rotation: the finished file is unharmed. The closing of the finished
 	// file goes through the same writer, so the budget lets all of it through.
 	let temp_dir = TempDir::new()?;
-	let mut config = config(&temp_dir, 4096, KEY);
+	let mut config = config(&temp_dir, 4096, with_source(KEY));
 	config.max_file_items = Some(1);
 	let mut store = DirectoryStore::new(config)?;
 	store.append(json!("a"))?;
@@ -168,7 +168,7 @@ fn test_failure_writing_the_opening_of_a_new_file() -> Result<()> {
 fn test_failures_interleaved_with_successes() -> Result<()> {
 	let max = 400;
 	let temp_dir = TempDir::new()?;
-	let mut config = config(&temp_dir, max, KEY);
+	let mut config = config(&temp_dir, max, with_source(KEY));
 	config.max_file_items = Some(4);
 	let mut store = DirectoryStore::new(config)?;
 	let validated = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
@@ -281,7 +281,7 @@ fn test_rollback_failure_on_a_files_first_item_deletes_it_at_fetch() -> Result<(
 #[test]
 fn test_failed_append_does_not_advance_the_item_limit() -> Result<()> {
 	let temp_dir = TempDir::new()?;
-	let mut config = config(&temp_dir, 4096, KEY);
+	let mut config = config(&temp_dir, 4096, with_source(KEY));
 	config.max_file_items = Some(2);
 	let mut store = DirectoryStore::new(config)?;
 	store.append(json!("a"))?;
@@ -314,17 +314,17 @@ fn test_failed_append_does_not_advance_the_byte_ceiling() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 200)?;
 	store.append(item_of_len(60))?;
-	// 12 + 60 + 1 + 67 + 60 = 200: the 67 byte item fills the file exactly, so it only
+	// 10 + 60 + 1 + 71 + 58 = 200: the FILLER item fills the file exactly, so it only
 	// fits in the same file if the failed attempts left current_size alone.
-	// The write is 68 bytes with its comma; every budget stops it short.
-	for budget in [5, 40, 67] {
+	// The write is FILLER + 1 bytes with its comma; every budget stops it short.
+	for budget in [5, 40, FILLER] {
 		fail_after(&store, budget);
-		assert!(store.append(item_of_len(67)).is_err());
+		assert!(store.append(item_of_len(FILLER)).is_err());
 		heal(&store);
 		assert_eq!(store.current_size, OPENING + 60);
 	}
 	let first = store.current_path.clone();
-	store.append(item_of_len(67))?;
+	store.append(item_of_len(FILLER))?;
 	assert_eq!(store.current_path, first);
 	let files = finished_files(&mut store)?;
 	assert_eq!(batch_counts(&files), vec![2]);

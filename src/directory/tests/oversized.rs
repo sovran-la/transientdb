@@ -7,7 +7,7 @@ use super::*;
 fn test_oversized_item_into_empty_store() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let mut store = store(&temp_dir, 100)?;
-	let err = store.append(item_of_len(29)).unwrap_err();
+	let err = store.append(item_of_len(100 - ENVELOPE + 1)).unwrap_err();
 	assert_invalid_input(&err);
 
 	assert!(files_on_disk(&temp_dir)?.is_empty());
@@ -30,7 +30,7 @@ fn test_oversized_item_leaves_open_file_untouched() -> Result<()> {
 	let (size, items) = (store.current_size, store.current_items);
 	let bytes = fs::read(&path)?;
 
-	let err = store.append(item_of_len(129)).unwrap_err();
+	let err = store.append(item_of_len(200 - ENVELOPE + 1)).unwrap_err();
 	assert_invalid_input(&err);
 	assert_eq!(store.current_path.as_ref(), Some(&path));
 	assert_eq!((store.current_size, store.current_items), (size, items));
@@ -105,7 +105,10 @@ fn test_oversized_error_message_states_sizes() -> Result<()> {
 	let err = store.append(item_of_len(1234)).unwrap_err();
 	let message = err.to_string();
 	assert!(message.contains("1234 bytes"), "{message}");
-	assert!(message.contains("28 bytes"), "{message}");
+	assert!(
+		message.contains(&format!("{} bytes", 100 - ENVELOPE)),
+		"{message}"
+	);
 	assert!(message.contains("100 bytes"), "{message}");
 	Ok(())
 }

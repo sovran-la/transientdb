@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const CLOSING_START: &str = "],\"sentAt\":";
+const CLOSING_START: &str = "],\"source\":";
 
 fn closings(path: &Path) -> Result<usize> {
 	Ok(fs::read_to_string(path)?.matches(CLOSING_START).count())
@@ -154,7 +154,7 @@ fn test_unfinished_file_still_gets_its_closing() -> Result<()> {
 fn test_recovered_closed_file_respects_max_file_size() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	// Two items that fill a 200 byte file exactly once closed.
-	let items = vec![item_of_len(60), item_of_len(67)];
+	let items = vec![item_of_len(60), item_of_len(FILLER)];
 	let path = closed_file(&temp_dir, 1, &items)?;
 	assert_eq!(fs::metadata(&path)?.len(), 200);
 
@@ -200,7 +200,7 @@ fn test_appends_and_fetches_after_a_rejection_behave_normally() -> Result<()> {
 	drop(store);
 
 	// The next session has nothing to recover; the accepted file is closed once.
-	let mut store = DirectoryStore::new(config(&temp_dir, 1024, KEY))?;
+	let mut store = DirectoryStore::new(config(&temp_dir, 1024, with_source(KEY)))?;
 	assert!(store.leftovers.is_empty());
 	let files = finished_files(&mut store)?;
 	assert_eq!(assert_ceiling(&files, 1024), second);

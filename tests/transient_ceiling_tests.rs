@@ -9,11 +9,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, thread};
 use tempfile::TempDir;
-use transientdb::{DirectoryConfig, DirectoryStore, MemoryConfig, MemoryStore, TransientDB};
+use transientdb::{
+	DirectoryConfig, DirectoryStore, Envelope, MemoryConfig, MemoryStore, TransientDB,
+};
 
 fn directory_db(dir: &TempDir, max_file_size: usize) -> Result<TransientDB<Vec<PathBuf>>> {
 	Ok(TransientDB::new(DirectoryStore::new(DirectoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::new("items")
+			.field("source", "test-key")
+			.timestamp("sentAt"),
 		storage_location: dir.path().to_owned(),
 		base_filename: "events".to_string(),
 		max_file_size,
@@ -23,7 +27,7 @@ fn directory_db(dir: &TempDir, max_file_size: usize) -> Result<TransientDB<Vec<P
 
 fn memory_db(max_fetch_size: usize) -> TransientDB<Value> {
 	TransientDB::new(MemoryStore::new(MemoryConfig {
-		write_key: "test-key".to_string(),
+		envelope: Envelope::default(),
 		max_items: Some(100_000),
 		max_fetch_size,
 		max_fetch_items: None,
@@ -42,8 +46,8 @@ fn directory_items(db: &TransientDB<Vec<PathBuf>>, max: usize) -> Result<Vec<Val
 		assert!(len <= max as u64, "{file:?} is {len} bytes, over {max}");
 		let parsed: Value = serde_json::from_str(&fs::read_to_string(&file)?)?;
 		assert!(parsed["sentAt"].is_string());
-		assert_eq!(parsed["writeKey"], "test-key");
-		let batch = parsed["batch"].as_array().unwrap();
+		assert_eq!(parsed["source"], "test-key");
+		let batch = parsed["items"].as_array().unwrap();
 		assert!(!batch.is_empty());
 		items.extend(batch.iter().cloned());
 	}
@@ -58,7 +62,7 @@ fn memory_items(db: &TransientDB<Value>, max: usize) -> Result<Vec<Value>> {
 		let batch = result.data.unwrap();
 		let len = serde_json::to_string(&batch)?.len();
 		assert!(len <= max, "batch is {len} bytes, over {max}");
-		items.extend(batch["batch"].as_array().unwrap().iter().cloned());
+		items.extend(batch["items"].as_array().unwrap().iter().cloned());
 		db.remove(&result.removable.unwrap())?;
 	}
 	assert!(!db.has_data());

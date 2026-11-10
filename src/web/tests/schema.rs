@@ -69,7 +69,7 @@ async fn test_version_1_database_is_replaced_empty() {
 	// An open version 1 connection would block the upgrade.
 	old.close();
 
-	let mut store = WebStore::new(config(db_name, 4096, KEY)).await;
+	let mut store = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	assert_eq!(store.persistence_state(), PersistenceState::Persisted);
 	assert!(!store.has_data());
 	assert_eq!(store.next_key, 0);
@@ -99,7 +99,7 @@ async fn test_new_database_is_created_at_current_version() {
 		return;
 	}
 	delete_database(db_name).await;
-	let store = WebStore::new(config(db_name, 4096, KEY)).await;
+	let store = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	if !store.is_persisted() {
 		web_sys::console::log_1(&"Skipping schema test - no persistence".into());
 		return;
@@ -133,7 +133,7 @@ async fn test_records_without_wrapper_shape_are_skipped() {
 	)
 	.await;
 
-	let mut reopened = WebStore::new(config(db_name, 4096, KEY)).await;
+	let mut reopened = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	assert!(reopened.is_persisted());
 	assert_eq!(queued(&reopened), vec![json!("ok"), json!(null)]);
 	// Key 10 has no item, but a new item must not take it.
@@ -193,7 +193,7 @@ async fn test_record_at_the_last_key_is_kept_and_never_reused() {
 	let db = store.db.clone().unwrap();
 	add_raw(&db, &[json!({"key": u32::MAX, "value": "at the end"})]).await;
 
-	let mut reopened = WebStore::new(config(db_name, 4096, KEY)).await;
+	let mut reopened = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	assert_eq!(queued(&reopened), vec![json!("at the end")]);
 	assert_eq!(reopened.next_key, u32::MAX);
 	assert!(reopened.append(json!("new")).is_err());
@@ -210,7 +210,7 @@ async fn test_record_at_the_last_key_is_kept_and_never_reused() {
 	settle().await;
 	assert!(idb::read_all(&db).await.unwrap().is_empty());
 	// Once it is gone, a store opened again starts over.
-	let mut again = WebStore::new(config(db_name, 4096, KEY)).await;
+	let mut again = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	assert_eq!(again.next_key, 0);
 	again.append(json!("fresh")).unwrap();
 	again.reset();

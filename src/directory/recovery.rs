@@ -20,13 +20,18 @@
 //! deleted. Only unfinished files are recovered; files already finished (`.temp`) by an
 //! earlier session are fetched as they are.
 //!
+//! Both follow the configured envelope. A complete envelope is a JSON object whose
+//! configured items key holds a non-empty array, whatever its other keys; it is renamed
+//! byte for byte. Salvage looks for the configured opening and closes with the
+//! configured closing. A file written under another items key does not start with the
+//! opening, so it is deleted, as below. A changed envelope gets no other handling.
+//!
 //! A listed file that does not start with the store's opening (empty, cut inside the
 //! opening, or overwritten) is deleted. Its name makes it this store's file (see
 //! `files.rs`), the store never writes one that way, and it can never be read, so
 //! keeping it would only leave it undeliverable forever.
 
 use super::DirectoryStore;
-use chrono::Utc;
 use serde::de::IgnoredAny;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
@@ -83,7 +88,7 @@ impl DirectoryStore {
 		// Reads the whole file, which is bounded by the max_file_size of the session
 		// that wrote it: the store never writes a file larger than its own limit.
 		let content = fs::read(path)?;
-		let complete = Self::is_complete_envelope(&content);
+		let complete = self.is_complete_envelope(&content);
 		if complete && content.len() <= self.config.max_file_size {
 			return self.mark_finished(path);
 		}
@@ -142,7 +147,7 @@ impl DirectoryStore {
 	fn finalize_file(&self, path: &Path) -> Result<()> {
 		{
 			let mut file = OpenOptions::new().append(true).open(path)?;
-			let closing = self.closing(Utc::now());
+			let closing = self.closing();
 			debug_assert_eq!(closing.len(), self.closing_len);
 			file.write_all(&closing)?;
 			file.flush()?;
@@ -159,15 +164,15 @@ impl DirectoryStore {
 		fs::remove_file(path)
 	}
 
-	/// Whether `content` already parses as a finished data file with at least one item.
-	/// An envelope with an empty `batch` is not delivered; salvage deletes it.
-	fn is_complete_envelope(content: &[u8]) -> bool {
+	/// Whether `content` already parses as a finished data file with at least one item:
+	/// a JSON object whose configured items key holds a non-empty array. Its other keys
+	/// are not examined. An unfinished file never parses, so this tells the two apart. An
+	/// envelope with an empty items array is not delivered; salvage deletes it.
+	fn is_complete_envelope(&self, content: &[u8]) -> bool {
 		serde_json::from_slice::<Value>(content).is_ok_and(|json| {
-			json["batch"]
+			json[&self.config.envelope.items_key]
 				.as_array()
-				.is_some_and(|batch| !batch.is_empty())
-				&& json["sentAt"].is_string()
-				&& json["writeKey"].is_string()
+				.is_some_and(|items| !items.is_empty())
 		})
 	}
 }

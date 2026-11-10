@@ -6,28 +6,25 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 fn named(dir: &TempDir, base_filename: &str) -> DirectoryConfig {
-	let mut config = config(dir, 1024, KEY);
+	let mut config = config(dir, 1024, with_source(KEY));
 	config.base_filename = base_filename.to_string();
 	config
 }
 
 /// Files that are not the "events" store's, including near misses of its names.
 const FOREIGN: [(&str, &str); 12] = [
-	("7-other", "{ \"batch\": [1"),
-	(
-		"7-other.temp",
-		"{\"batch\":[1],\"sentAt\":\"s\",\"writeKey\":\"k\"}",
-	),
+	("7-other", "{\"items\":[1"),
+	("7-other.temp", "{\"items\":[1],\"source\":\"k\"}"),
 	("notes.txt", "not data"),
-	("12-eventsX", "{ \"batch\": [2"),
-	("12-events.json", "{ \"batch\": [3"),
-	("12-events.temp.bak", "{ \"batch\": [4"),
-	("12-events.tmp", "{ \"batch\": [5"),
-	("012-events", "{ \"batch\": [6"),
-	("+12-events", "{ \"batch\": [7"),
-	("-12-events", "{ \"batch\": [8"),
-	("99999999999-events", "{ \"batch\": [9"),
-	("events", "{ \"batch\": [10"),
+	("12-eventsX", "{\"items\":[2"),
+	("12-events.json", "{\"items\":[3"),
+	("12-events.temp.bak", "{\"items\":[4"),
+	("12-events.tmp", "{\"items\":[5"),
+	("012-events", "{\"items\":[6"),
+	("+12-events", "{\"items\":[7"),
+	("-12-events", "{\"items\":[8"),
+	("99999999999-events", "{\"items\":[9"),
+	("events", "{\"items\":[10"),
 ];
 
 fn write_foreign(dir: &TempDir) -> Result<()> {
@@ -36,7 +33,7 @@ fn write_foreign(dir: &TempDir) -> Result<()> {
 	}
 	let sub = dir.path().join("subdir");
 	fs::create_dir(&sub)?;
-	fs::write(sub.join("3-events"), "{ \"batch\": [11")?;
+	fs::write(sub.join("3-events"), "{\"items\":[11")?;
 	// A directory with one of the store's own names is still not a file it owns.
 	fs::create_dir(dir.path().join("4-events.temp"))?;
 	Ok(())
@@ -129,7 +126,10 @@ fn test_ownership_matches_the_names_the_store_writes() -> Result<()> {
 		let finished_name = files[0].file_name().unwrap().to_str().unwrap();
 		assert_eq!(finished_name, format!("1-{base}.temp"));
 		assert_eq!(store.owned_name(finished_name), Some((1, true)), "{base}");
-		assert_eq!(read_finished(&files[0], KEY)?.batch(), &vec![json!(1)]);
+		assert_eq!(
+			read_finished(&files[0], &with_source(KEY))?.batch(),
+			&vec![json!(1)]
+		);
 	}
 	Ok(())
 }
@@ -171,7 +171,7 @@ fn test_foreign_files_are_never_touched() -> Result<()> {
 	let files = fetched_paths(&mut store)?;
 	assert_eq!(files.len(), 1);
 	assert_eq!(
-		read_finished(&files[0], KEY)?.batch(),
+		read_finished(&files[0], &with_source(KEY))?.batch(),
 		&vec![json!({"mine": 1}), json!({"mine": 2})]
 	);
 	let mut after = snapshot(temp_dir.path())?;
@@ -204,7 +204,7 @@ fn test_foreign_files_survive_a_new_session() -> Result<()> {
 	let files = fetched_paths(&mut store)?;
 	assert_eq!(files, vec![temp_dir.path().join("1-events.temp")]);
 	assert_eq!(
-		read_finished(&files[0], KEY)?.batch(),
+		read_finished(&files[0], &with_source(KEY))?.batch(),
 		&vec![json!("left over")]
 	);
 	let mut after = snapshot(temp_dir.path())?;
@@ -269,7 +269,10 @@ fn test_two_stores_recover_only_their_own_leftovers() -> Result<()> {
 		let mut store = DirectoryStore::new(named(&temp_dir, name))?;
 		let files = fetched_paths(&mut store)?;
 		assert_eq!(files, vec![temp_dir.path().join(format!("1-{name}.temp"))]);
-		assert_eq!(read_finished(&files[0], KEY)?.batch(), &vec![json!(item)]);
+		assert_eq!(
+			read_finished(&files[0], &with_source(KEY))?.batch(),
+			&vec![json!(item)]
+		);
 	}
 	assert_eq!(files_on_disk(&temp_dir)?.len(), 3);
 	Ok(())
@@ -280,11 +283,11 @@ fn test_new_store_picks_an_index_above_its_own_files_only() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	fs::write(
 		temp_dir.path().join("5-events.temp"),
-		"{\"batch\":[1],\"sentAt\":\"s\",\"writeKey\":\"k\"}",
+		"{\"items\":[1],\"source\":\"k\"}",
 	)?;
-	fs::write(temp_dir.path().join("9-events"), "{ \"batch\": [2")?;
-	fs::write(temp_dir.path().join("500-other"), "{ \"batch\": [3")?;
-	fs::write(temp_dir.path().join("700-eventsX"), "{ \"batch\": [4")?;
+	fs::write(temp_dir.path().join("9-events"), "{\"items\":[2")?;
+	fs::write(temp_dir.path().join("500-other"), "{\"items\":[3")?;
+	fs::write(temp_dir.path().join("700-eventsX"), "{\"items\":[4")?;
 
 	let mut store = DirectoryStore::new(named(&temp_dir, "events"))?;
 	store.append(json!("new"))?;
@@ -299,7 +302,7 @@ fn test_new_store_picks_an_index_above_its_own_files_only() -> Result<()> {
 fn test_index_scan_counts_finished_and_unfinished_files() -> Result<()> {
 	for (name, expected) in [("41-events.temp", "42-events"), ("41-events", "42-events")] {
 		let temp_dir = TempDir::new()?;
-		fs::write(temp_dir.path().join(name), "{ \"batch\": [1")?;
+		fs::write(temp_dir.path().join(name), "{\"items\":[1")?;
 		let mut store = DirectoryStore::new(named(&temp_dir, "events"))?;
 		store.append(json!("new"))?;
 		assert_eq!(

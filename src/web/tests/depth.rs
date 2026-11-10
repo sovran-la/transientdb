@@ -23,7 +23,7 @@ fn read_back(store: &mut WebStore) -> Vec<Value> {
 	let result = store.fetch(None, None).unwrap().unwrap();
 	let bytes = serde_json::to_vec(result.data.as_ref().unwrap()).unwrap();
 	let batch: Value = serde_json::from_slice(&bytes).unwrap();
-	batch["batch"].as_array().unwrap().clone()
+	batch["items"].as_array().unwrap().clone()
 }
 
 fn boundary_items() -> Vec<Value> {
@@ -131,7 +131,7 @@ async fn test_boundary_items_survive_a_reopen() {
 	}
 	settle().await;
 
-	let mut reopened = WebStore::new(config(db_name, 1024 * 1024, KEY)).await;
+	let mut reopened = WebStore::new(config(db_name, 1024 * 1024, with_source(KEY))).await;
 	assert_eq!(queued(&reopened), items);
 	assert_eq!(read_back(&mut reopened), items);
 	reopened.reset();
