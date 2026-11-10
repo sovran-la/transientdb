@@ -143,16 +143,19 @@ fn test_failure_writing_the_opening_of_a_new_file() -> Result<()> {
 		assert_fetches(&mut store, &[json!("kept")], 4096)?;
 	}
 
-	// The same on rotation: the finished file is unharmed.
+	// The same on rotation: the finished file is unharmed. The closing of the finished
+	// file goes through the same writer, so the budget lets all of it through.
 	let temp_dir = TempDir::new()?;
 	let mut config = config(&temp_dir, 4096, KEY);
 	config.max_file_items = Some(1);
 	let mut store = DirectoryStore::new(config)?;
 	store.append(json!("a"))?;
-	fail_after(&store, 3);
+	let first = store.current_path.clone().unwrap();
+	fail_after(&store, CLOSING + 3);
 	assert!(store.append(json!("lost")).is_err());
 	assert!(store.writer.is_none());
-	assert_eq!(store.sorted_files(true)?.len(), 1);
+	assert_eq!(store.sorted_files(true)?, vec![finished(&first)]);
+	assert!(store.leftovers.is_empty());
 	heal(&store);
 	store.append(json!("c"))?;
 	let files = finished_files(&mut store)?;
