@@ -318,11 +318,13 @@ if let Some(result) = db.fetch(Some(100), None)? {
 - Async construction, sync operations (fire-and-forget persistence)
 - Graceful fallback to memory-only if IndexedDB unavailable
 - Automatic hydration from IndexedDB on startup, in append order
-- Stores any JSON value (objects, arrays, strings, numbers, booleans, null) unmodified
+- Stores any JSON value (objects, arrays, strings, numbers, booleans, null) unmodified;
+  items are persisted as JSON text, so after a reload an integer above 2^53 or a float
+  such as `42.0` comes back exactly as appended
 - IndexedDB writes are issued in call order, so a `remove()` or `reset()` right after an
   `append()` is never undone by the append landing late
-- A database written by an earlier version (transientdb 0.2.x, or before batch boundaries)
-  uses an older record format; it is emptied the first time this version opens it (old
+- A database written by an earlier version (transientdb 0.2.x, or a pre-release build of
+  this version) uses an older record format; it is emptied the first time this version opens it (old
   records are discarded, not migrated)
 - [Batch boundaries](#batch-boundaries) survive a page reload
 - Ideal for web applications and browser-based analytics

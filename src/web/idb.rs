@@ -1,12 +1,14 @@
 //! IndexedDB plumbing for `WebStore`: the database schema, its record format, and the
 //! requests the store issues.
 //!
-//! Every record wraps one queued item as `{ "key": <u32>, "value": <item>, "batch": <u32> }`
+//! Every record wraps one queued item as `{ "key": <u32>, "value": "<item>", "batch": <u32> }`
 //! in the object store [`STORE_NAME`], whose key path is `key` with no auto-increment.
 //! The store assigns every key itself, so memory and IndexedDB always agree on an item's
-//! key, and wrapping the item lets any JSON value be stored unmodified. `batch` is the
+//! key. `value` is the item serialized compactly with `serde_json`, as a string, and
+//! hydration parses it back with `serde_json`: stored as a JavaScript value, an integer
+//! above 2^53 would lose precision and `42.0` would come back as `42`. `batch` is the
 //! batch number the item was appended under, so `end_batch` boundaries survive a reload.
-//! Both are `u32`, which a JavaScript number holds exactly.
+//! `key` and `batch` are `u32`, which a JavaScript number holds exactly.
 //!
 //! One more record may exist, `{ "key": "boundary", "batch": <u32> }`: the batch number
 //! the store moved to at its last `end_batch`. It keeps a boundary set after the last
@@ -29,8 +31,8 @@ use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransa
 
 /// Version 1 stored items in-line under an auto-incremented `_idb_key`. Version 2
 /// stores wrapper records keyed by the store's own counter. Version 3 adds each item's
-/// batch number, and the boundary record.
-pub(super) const DB_VERSION: u32 = 3;
+/// batch number, and the boundary record. Version 4 stores each item as JSON text.
+pub(super) const DB_VERSION: u32 = 4;
 pub(super) const STORE_NAME: &str = "events";
 const KEY_PATH: &str = "key";
 const VALUE_FIELD: &str = "value";
@@ -42,9 +44,10 @@ fn js_error(what: &str, e: JsValue) -> Error {
 	Error::other(format!("{what}: {e:?}"))
 }
 
-/// The record stored for the item `value` under `key`, appended under `batch`.
+/// The record stored for the item `value` under `key`, appended under `batch`: the item
+/// is held as its compact JSON text.
 pub(super) fn record(key: u32, batch: u32, value: &Value) -> Value {
-	json!({ (KEY_PATH): key, (VALUE_FIELD): value, (BATCH_FIELD): batch })
+	json!({ (KEY_PATH): key, (VALUE_FIELD): value.to_string(), (BATCH_FIELD): batch })
 }
 
 /// The key of a record, if it has one this store could have assigned.
@@ -60,11 +63,11 @@ pub(super) fn record_batch(record: &Value) -> Option<u32> {
 }
 
 /// The item a record wraps, if the record has the wrapper shape: a key, a batch number
-/// and a value.
-pub(super) fn record_value(record: &Value) -> Option<&Value> {
+/// and a value that is a string holding JSON text.
+pub(super) fn record_value(record: &Value) -> Option<Value> {
 	record_key(record)?;
 	record_batch(record)?;
-	record.get(VALUE_FIELD)
+	serde_json::from_str(record.get(VALUE_FIELD)?.as_str()?).ok()
 }
 
 /// Whether a record is the boundary record, valid or not.

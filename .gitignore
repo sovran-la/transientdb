@@ -1,4 +1,5 @@
 /target
+/tools/release/target
 
 .DS_Store
 

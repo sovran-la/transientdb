@@ -1,0 +1,9 @@
+[package]
+name = "transientdb-release"
+version = "0.1.0"
+edition = "2021"
+description = "Release tool for transientdb: bumps the version, tags, publishes. Run by release.sh."
+publish = false
+
+[dependencies]
+toml_edit = "0.22"

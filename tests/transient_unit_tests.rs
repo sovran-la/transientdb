@@ -176,8 +176,31 @@ fn test_concurrent_reset() -> Result<()> {
 		handle.join().unwrap();
 	}
 
-	// The final state should be consistent (no panics or deadlocks)
-	// everything has been handled, so there's no data.
+	// When the reset lands relative to the appends depends on scheduling, so the test
+	// can't expect a particular amount of data to survive. What it can expect: the reset
+	// ran after the initial fill (which finished before any thread started) and wiped all
+	// of it, and fetch removes nothing, so what remains is exactly the appends that came
+	// after the reset: a contiguous, in-order tail of new_index ending at 99, or nothing
+	// if the reset came last.
+	let mut survivors = Vec::new();
+	while let Some(result) = db.fetch(None, None)? {
+		let batch = result.data.unwrap();
+		for item in batch["items"].as_array().unwrap() {
+			assert!(
+				item.get("index").is_none(),
+				"an item from before the reset survived it: {item}"
+			);
+			survivors.push(item["new_index"].as_i64().unwrap());
+		}
+		db.remove(&result.removable.unwrap())?;
+	}
+	if let Some(&first) = survivors.first() {
+		let expected: Vec<i64> = (first..100).collect();
+		assert_eq!(
+			survivors, expected,
+			"the post-reset appends are not an in-order tail"
+		);
+	}
 	assert!(!db.has_data());
 
 	Ok(())

@@ -28,7 +28,7 @@ async fn flushed(store: &WebStore) -> Vec<Value> {
 	let records = idb::read_all(store.db.as_ref().unwrap()).await.unwrap();
 	records
 		.iter()
-		.map(|record| idb::record_value(record).unwrap().clone())
+		.map(|record| idb::record_value(record).unwrap())
 		.collect()
 }
 

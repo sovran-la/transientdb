@@ -780,6 +780,7 @@ mod tests {
 	mod end_batch_limits;
 	mod envelope;
 	mod envelope_recovery;
+	mod exact_items;
 	mod finish_failure;
 	mod foreign_removables;
 	mod index_limit;

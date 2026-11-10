@@ -54,7 +54,9 @@ print_success "WASM clippy passed"
 # Check for wasm-pack
 if command -v wasm-pack &> /dev/null; then
     print_step "Running WASM tests..."
-    wasm-pack test --headless --chrome --features web
+    # The test runner gives each test binary 20 seconds by default; the browser suite
+    # can take longer on a slow machine.
+    WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-300}" wasm-pack test --headless --chrome --features web
     print_success "WASM tests passed"
 else
     echo -e "${YELLOW}⚠ wasm-pack not found, skipping WASM tests${NC}"
@@ -106,7 +108,9 @@ fi
 # =============================================================================
 
 print_step "Running release process..."
-cargo run --bin release
+# The release tool is its own package, so the library never depends on its
+# dependencies. It works on the Cargo.toml in the current directory, the root.
+cargo run --quiet --manifest-path tools/release/Cargo.toml
 
 echo ""
 print_success "Release complete! 🍺"
