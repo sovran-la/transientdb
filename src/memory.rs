@@ -239,10 +239,14 @@ impl DataStore for MemoryStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store unchanged, if the serialized
-	/// item cannot fit in a batch by itself under `max_fetch_size`. Returns an error,
+	/// item cannot fit in a batch by itself under `max_fetch_size`, or if it is nested
+	/// more than 125 levels deep in arrays and objects, too deep to read back from a
+	/// batch. Returns an error,
 	/// leaving the store unchanged, if sequence numbers are exhausted: they never wrap,
 	/// so no two items can share one.
 	fn append(&mut self, data: Value) -> Result<()> {
+		// First: serializing a value nested too deeply could overflow the stack.
+		let data = batch::within_depth(data)?;
 		let item_size = Self::get_item_size(&data);
 		if item_size > self.max_item_size {
 			return Err(batch::item_too_large(
@@ -308,6 +312,7 @@ mod tests {
 	use std::io::Result;
 
 	mod ceiling;
+	mod depth;
 	mod duplicates;
 	mod oversized;
 	mod repeat;

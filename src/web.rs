@@ -403,8 +403,12 @@ impl DataStore for WebStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store and IndexedDB unchanged, if the
-	/// serialized item cannot fit in a batch by itself under `max_fetch_size`.
+	/// serialized item cannot fit in a batch by itself under `max_fetch_size`, or if it is
+	/// nested more than 125 levels deep in arrays and objects, too deep to read back from
+	/// a batch or from IndexedDB.
 	fn append(&mut self, data: Value) -> Result<()> {
+		// First: serializing a value nested too deeply could overflow the stack.
+		let data = batch::within_depth(data)?;
 		let item_size = data.to_string().len();
 		if item_size > self.max_item_size {
 			return Err(batch::item_too_large(
@@ -490,6 +494,7 @@ mod tests {
 	wasm_bindgen_test_configure!(run_in_browser);
 
 	mod ceiling;
+	mod depth;
 	mod duplicates;
 	mod head_drop;
 	mod isolation;

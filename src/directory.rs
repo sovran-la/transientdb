@@ -583,7 +583,8 @@ impl DataStore for DirectoryStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, without touching any file, if the serialized
-	/// item is too large to fit even alone in a fresh file. Also propagates IO errors
+	/// item is too large to fit even alone in a fresh file, or if it is nested more than
+	/// 125 levels deep in arrays and objects, too deep to read back. Also propagates IO errors
 	/// from finishing the previous file, and from writing the item. A failed write
 	/// stores nothing of the item: the open file is rolled back to the items before it,
 	/// and the next append continues it. If even the rollback fails, the store stops
@@ -596,6 +597,8 @@ impl DataStore for DirectoryStore {
 	/// The files already there can still be fetched, and once they are removed, a store
 	/// opened again starts over from index 1.
 	fn append(&mut self, data: Value) -> Result<()> {
+		// First: serializing a value nested too deeply could overflow the stack.
+		let data = batch::within_depth(data)?;
 		let item = serde_json::to_vec(&data)?;
 
 		// Reject before touching anything: an item that cannot fit in any file must not
@@ -718,6 +721,7 @@ mod tests {
 	mod base_filename;
 	mod ceiling;
 	mod deferred;
+	mod depth;
 	mod duplicates;
 	mod finish_failure;
 	mod index_limit;

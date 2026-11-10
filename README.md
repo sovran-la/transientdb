@@ -365,6 +365,12 @@ An item too large to fit by itself under the configured limit (`max_file_size` o
 that fits. The rejected item is not stored, and the store is otherwise unchanged:
 DirectoryStore does not rotate or create a file, and WebStore issues no IndexedDB write.
 
+`append` also rejects, with `InvalidInput` and the same guarantees, an item nested more than
+125 levels deep in arrays and objects (each `[]` or `{}` is one level; scalars add none).
+`serde_json` cannot parse anything nested deeper inside a batch, so such an item could not
+be recovered from a file, hydrated from IndexedDB, or read by the consumer. The check does
+not recurse, so even an absurdly deep value is rejected without overflowing the stack.
+
 ```rust
 match db.append(event) {
     Ok(()) => {}
