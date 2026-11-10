@@ -109,6 +109,23 @@ fn test_rejected_item_does_not_trigger_drop_oldest() -> Result<()> {
 }
 
 #[test]
+fn test_nothing_carries_over_to_a_store_with_a_smaller_limit() -> Result<()> {
+	// MemoryStore persists nothing, so no item stored under a larger limit can reach a
+	// store with a smaller one; such an item has to come through append, which refuses it.
+	let item = item_of_len(300, 0);
+	let mut large = store(1024);
+	large.append(item.clone())?;
+	assert_eq!(drain(&mut large, None, None)?.concat(), vec![item.clone()]);
+
+	let mut small = store(200);
+	assert!(!small.has_data());
+	assert!(small.fetch(None, None)?.is_none());
+	assert_invalid_input(&small.append(item).unwrap_err());
+	assert!(!small.has_data());
+	Ok(())
+}
+
+#[test]
 fn test_reset_after_rejection() -> Result<()> {
 	let mut store = store(100);
 	store.append(json!("first"))?;

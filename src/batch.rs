@@ -1,4 +1,4 @@
-//! Byte-ceiling arithmetic shared by the stores.
+//! Byte-ceiling arithmetic shared by the stores, and the nesting limit on items.
 //!
 //! A batch is serialized as `{"batch":[item,item,...],"sentAt":"...","writeKey":"..."}`,
 //! so its compact length is the length of that envelope with an empty `batch`, plus
@@ -6,6 +6,12 @@
 
 use serde_json::json;
 use std::io;
+
+mod depth;
+
+pub(crate) use depth::within_depth;
+#[cfg(test)]
+pub(crate) use depth::{nested, Shape, MAX_ITEM_DEPTH, SHAPES};
 
 /// Write keys that need escaping in JSON, or are multi-byte in UTF-8, for tests of every
 /// store's envelope.

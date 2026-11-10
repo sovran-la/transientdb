@@ -976,3 +976,37 @@ fn test_directory_file_item_limit_concurrent_appends() -> Result<()> {
 	assert_eq!(files.len(), 25);
 	Ok(())
 }
+
+#[test]
+fn test_removables_pass_through_to_the_one_wrapped_store() -> Result<()> {
+	let config = MemoryConfig {
+		write_key: "test-key".to_string(),
+		max_items: 100,
+		max_fetch_size: 4096,
+		max_fetch_items: None,
+	};
+	let (a, b) = (
+		TransientDB::new(MemoryStore::new(config.clone())),
+		TransientDB::new(MemoryStore::new(config)),
+	);
+	for i in 0..4 {
+		a.append(json!({"i": i}))?;
+		b.append(json!({"i": i}))?;
+	}
+	let batch = |db: &TransientDB<Value>| -> Result<Vec<Value>> {
+		Ok(db.fetch(None, None)?.unwrap().data.unwrap()["batch"]
+			.as_array()
+			.unwrap()
+			.clone())
+	};
+	let all = batch(&a)?;
+
+	// Its own removables remove exactly what it fetched, as the wrapped store does.
+	let removable = a.fetch(Some(2), None)?.unwrap().removable.unwrap();
+	a.remove(&removable)?;
+	assert_eq!(batch(&a)?, all[2..]);
+	// Another TransientDB's store ignores them.
+	b.remove(&removable)?;
+	assert_eq!(batch(&b)?, all);
+	Ok(())
+}

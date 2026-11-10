@@ -75,9 +75,13 @@ struct StoredEvent {
 	value: Value,
 }
 
-/// A removable from `WebStore::fetch`: the key of one fetched item.
+/// A removable from `WebStore::fetch`: the identity of the store instance that issued
+/// it and the key of one fetched item.
 #[derive(Debug, PartialEq)]
-struct WebKey(u32);
+struct WebKey {
+	store: u64,
+	key: u32,
+}
 
 impl Equivalent for WebKey {
 	fn equals(&self, other: &dyn Equivalent) -> bool {
@@ -131,6 +135,8 @@ pub enum PersistenceState {
 /// mode to be common.
 pub struct WebStore {
 	config: WebConfig,
+	/// This instance's identity, unique within the process, carried in its removables
+	id: u64,
 	/// In-memory queue - this is the source of truth for sync operations
 	items: VecDeque<StoredEvent>,
 	/// IndexedDB database handle (None if unavailable/blocked)
@@ -178,6 +184,7 @@ impl WebStore {
 		let mut store = Self {
 			max_item_size: config.max_fetch_size - envelope_len,
 			config,
+			id: crate::next_store_id(),
 			items: VecDeque::new(),
 			db: None,
 			next_key: 0,
@@ -374,7 +381,12 @@ impl WebStore {
 
 		let removable: Vec<Box<dyn Equivalent>> = items
 			.iter()
-			.map(|item| Box::new(WebKey(item.key)) as Box<dyn Equivalent>)
+			.map(|item| {
+				Box::new(WebKey {
+					store: self.id,
+					key: item.key,
+				}) as Box<dyn Equivalent>
+			})
 			.collect();
 
 		Some(DataResult {
@@ -403,8 +415,12 @@ impl DataStore for WebStore {
 	///
 	/// # Errors
 	/// Returns an `InvalidInput` error, leaving the store and IndexedDB unchanged, if the
-	/// serialized item cannot fit in a batch by itself under `max_fetch_size`.
+	/// serialized item cannot fit in a batch by itself under `max_fetch_size`, or if it is
+	/// nested more than 125 levels deep in arrays and objects, too deep to read back from
+	/// a batch or from IndexedDB.
 	fn append(&mut self, data: Value) -> Result<()> {
+		// First: serializing a value nested too deeply could overflow the stack.
+		let data = batch::within_depth(data)?;
 		let item_size = data.to_string().len();
 		if item_size > self.max_item_size {
 			return Err(batch::item_too_large(
@@ -459,11 +475,17 @@ impl DataStore for WebStore {
 	/// Removes exactly the items a previous `fetch` returned, in memory and in IndexedDB.
 	///
 	/// Items already gone (removed before, or dropped since the fetch) are skipped.
+	///
+	/// Only removables this instance issued count; anything else is ignored, which is not
+	/// an error. That includes the removables of another `WebStore` opened on the same
+	/// `database_name`: each instance has its own identity, even when both hold the same
+	/// items under the same keys, so items fetched through one are removed through that one.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
 		let keys: HashSet<u32> = data
 			.iter()
 			.filter_map(|removable| removable.as_any().downcast_ref::<WebKey>())
-			.map(|key| key.0)
+			.filter(|key| key.store == self.id)
+			.map(|key| key.key)
 			.collect();
 
 		let mut removed = Vec::new();
@@ -490,7 +512,9 @@ mod tests {
 	wasm_bindgen_test_configure!(run_in_browser);
 
 	mod ceiling;
+	mod depth;
 	mod duplicates;
+	mod foreign_removables;
 	mod head_drop;
 	mod isolation;
 	mod oversized;
