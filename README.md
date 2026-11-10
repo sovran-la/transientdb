@@ -213,6 +213,15 @@ store.set_file_validator(move |path| {
 });
 ```
 
+### Durability (DirectoryStore)
+
+Files are not fsynced, so durability across a power loss or OS crash is not guaranteed.
+What was written is salvaged by the next session's first `fetch`: a file cut short keeps
+every complete item, byte for byte and in order, and loses whatever follows the last one.
+A file that does not start like one of the store's data files is left untouched. A write
+that fails while the store is running (disk full, an I/O error) is rolled back, so the
+failed item leaves nothing behind and the next append continues the same file.
+
 ### Web Store Example (WASM)
 
 ```rust
