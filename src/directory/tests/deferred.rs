@@ -246,7 +246,7 @@ fn test_recovery_runs_once() -> Result<()> {
 }
 
 #[test]
-fn test_this_sessions_unfinished_files_are_never_leftovers() -> Result<()> {
+fn test_a_file_that_fails_to_finish_is_retried_once_by_the_next_fetch() -> Result<()> {
 	let temp_dir = TempDir::new()?;
 	let (paths, _) = three_leftovers(&temp_dir)?;
 
@@ -261,10 +261,15 @@ fn test_this_sessions_unfinished_files_are_never_leftovers() -> Result<()> {
 	store.append(json!("a"))?;
 	assert!(store.append(json!("b")).is_err());
 	assert!(first_new.exists());
+	// Listed once, after the earlier session's leftovers.
+	let mut listed = paths.clone();
+	listed.push(first_new.clone());
+	assert_eq!(store.leftovers, listed);
 	store.append(json!("c"))?;
 
 	let files = fetched(&mut store)?;
-	// Leftovers, then this session's later file; the unfinished one is not recovered.
+	// Leftovers, then this session's later file. The fetch retries the unfinished one,
+	// which still cannot be renamed: it is logged, kept, and not listed again.
 	assert_eq!(files.len(), 4);
 	assert_eq!(files[3], finished(&temp_dir.path().join("11-events")));
 	assert_eq!(
@@ -272,11 +277,12 @@ fn test_this_sessions_unfinished_files_are_never_leftovers() -> Result<()> {
 		&paths.iter().map(|p| finished(p)).collect::<Vec<_>>()[..]
 	);
 	assert!(first_new.exists());
-	assert_eq!(
-		seen(&log).iter().filter(|p| **p == first_new).count(),
-		1,
-		"{:?}",
-		seen(&log)
-	);
+	assert!(store.leftovers.is_empty());
+	let validated = || seen(&log).iter().filter(|p| **p == first_new).count();
+	assert_eq!(validated(), 2, "{:?}", seen(&log));
+	for _ in 0..3 {
+		assert_eq!(fetched(&mut store)?.len(), 4);
+	}
+	assert_eq!(validated(), 2, "{:?}", seen(&log));
 	Ok(())
 }

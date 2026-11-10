@@ -130,8 +130,9 @@ pub struct DirectoryStore {
 	closing_len: usize,
 	file_validator: Option<FileValidator>,
 	next_index: AtomicU32,
-	/// Unfinished files for the next `fetch` to recover: those an earlier session left
-	/// behind, listed by `new`, and any this session abandoned after a failed write.
+	/// Unfinished files for the next `fetch` to recover, each listed once: those an
+	/// earlier session left behind, listed by `new`, and any this session abandoned after
+	/// a failed write or failed to finish. Every fetch recovers and clears the list.
 	leftovers: Vec<PathBuf>,
 	/// Failures to inject into the data files this store opens.
 	#[cfg(test)]
@@ -217,6 +218,9 @@ impl DirectoryStore {
 	/// - when the first `fetch` of a session recovers or salvages the files an earlier
 	///   session left unfinished. Those are recovered by that fetch, not by `new`, so a
 	///   validator set before it sees them.
+	/// - when a later `fetch` recovers a file this session failed to finish or
+	///   abandoned. A file whose rename failed after the validator accepted it is
+	///   validated again then.
 	///
 	/// Returning `Ok(())` accepts the file. **Returning an error means "delete this file
 	/// and every item in it".** The store deletes it, and the operation that triggered
@@ -439,18 +443,6 @@ impl DirectoryStore {
 		Ok((max_index, unfinished))
 	}
 
-	/// Finalizes a file by completing the JSON structure and renaming with .temp extension
-	fn finalize_file(&self, path: &Path) -> Result<()> {
-		{
-			let mut file = OpenOptions::new().append(true).open(path)?;
-			let closing = self.closing(Utc::now());
-			debug_assert_eq!(closing.len(), self.closing_len);
-			file.write_all(&closing)?;
-			file.flush()?;
-		}
-		self.mark_finished(path)
-	}
-
 	/// Validates a closed file, if a validator is set, and renames it with the .temp
 	/// extension.
 	///
@@ -474,6 +466,13 @@ impl DirectoryStore {
 		Ok(())
 	}
 
+	/// Closes the open file, writing the closing through its writer, and marks it
+	/// finished (see [`mark_finished`](Self::mark_finished)).
+	///
+	/// If writing or flushing the closing, or renaming the file, fails, the error is
+	/// returned and the file is listed for the next `fetch` to recover, which salvages
+	/// its complete items, or renames it as is if the closing made it whole. A validator
+	/// rejection is not a failure: the file is deleted and nothing is listed.
 	fn finish_file(&mut self) -> Result<()> {
 		let Some(mut writer) = self.writer.take() else {
 			return Ok(());
@@ -485,12 +484,23 @@ impl DirectoryStore {
 		self.current_size = 0;
 		self.current_items = 0;
 
-		writer.flush()?;
-		// Drop the writer to close the file
-		drop(writer);
+		let closing = self.closing(Utc::now());
+		debug_assert_eq!(closing.len(), self.closing_len);
+		let closed = writer.write_all(&closing).and_then(|()| writer.flush());
+		// Close the file without flushing again on drop: after a failure, bytes still
+		// buffered stay unwritten, and recovery cuts any partial closing off.
+		drop(writer.into_parts());
 
-		if let Some(current_path) = current_path {
-			self.finalize_file(&current_path)?;
+		let Some(path) = current_path else {
+			return closed;
+		};
+		if let Err(e) = closed.and_then(|()| self.mark_finished(&path)) {
+			eprintln!(
+				"Failed to finish {:?}, listing it for the next fetch to recover: {}",
+				path, e
+			);
+			self.list_leftover(path);
+			return Err(e);
 		}
 		Ok(())
 	}
@@ -576,7 +586,8 @@ impl DataStore for DirectoryStore {
 	/// stores nothing of the item: the open file is rolled back to the items before it,
 	/// and the next append continues it. If even the rollback fails, the store stops
 	/// using that file and the next append starts a new one; the next `fetch` salvages
-	/// the abandoned file's complete items.
+	/// the abandoned file's complete items. If finishing the previous file fails, the
+	/// item is not stored, and the next `fetch` recovers that file with all its items.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let item = serde_json::to_vec(&data)?;
 
@@ -616,9 +627,12 @@ impl DataStore for DirectoryStore {
 	/// The first fetch of a session also recovers the files an earlier session left
 	/// unfinished, after finishing the open file and before choosing what to return, so
 	/// they come back from that same fetch in index order. The validator runs on each.
-	/// Recovery happens once per session. A file cut short partway through an item
-	/// (the process was killed, or the machine lost power) is salvaged: it keeps every
-	/// complete item, in order and byte for byte, and loses what follows the last one.
+	/// Each such file is recovered once per session. A file this session fails to
+	/// finish, or abandons after a failed write, is recovered the same way by the next
+	/// fetch, whether or not a fetch has run before. A file cut short partway through an
+	/// item (the process was killed, or the machine lost power) is salvaged: it keeps
+	/// every complete item, in order and byte for byte, and loses what follows the last
+	/// one.
 	/// A file with no complete item is deleted, and so is one that does not start like a
 	/// data file: its name makes it this store's, and nothing in it can be read. Files
 	/// of other names are never touched. A recovered file that fails for a reason other
@@ -632,7 +646,8 @@ impl DataStore for DirectoryStore {
 	///
 	/// # Errors
 	/// Propagates IO errors from finishing the open file, and IO errors listing the
-	/// directory.
+	/// directory. A file that failed to finish (here, or on rotation in `append`) is
+	/// recovered by the next fetch, like any leftover, with all its items.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
@@ -697,6 +712,7 @@ mod tests {
 	mod ceiling;
 	mod deferred;
 	mod duplicates;
+	mod finish_failure;
 	mod lifecycle;
 	mod oversized;
 	mod ownership;

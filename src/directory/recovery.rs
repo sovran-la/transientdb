@@ -1,9 +1,12 @@
-//! Recovery of the files an earlier session left unfinished.
+//! Recovery of the files an earlier session left unfinished, and of those this session
+//! could not finish.
 //!
 //! `new` only lists this store's unfinished files; nothing on disk changes until the
 //! first `fetch`, which recovers each listed file once, after any validator has been
-//! set. A file the validator rejects is deleted; one that fails to recover for any
-//! other reason is logged and left for a later session.
+//! set. A file this session abandons after a failed rollback, or fails to finish, is
+//! added to the same list, so the next `fetch` recovers it. Every fetch recovers what
+//! is listed and clears the list. A file the validator rejects is deleted; one that
+//! fails to recover for any other reason is logged and left for a later session.
 //!
 //! A file that is not already a complete envelope is salvaged: it is cut back to the
 //! end of its last complete item, then closed as usual. Nothing is fsynced, so a crash
@@ -16,11 +19,12 @@
 //! keeping it would only leave it undeliverable forever.
 
 use super::DirectoryStore;
+use chrono::Utc;
 use serde::de::IgnoredAny;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
-use std::io::Result;
-use std::path::Path;
+use std::io::{Result, Write};
+use std::path::{Path, PathBuf};
 
 /// What can be kept of an unfinished file that is not a complete envelope.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,9 +38,17 @@ pub(super) enum Salvage {
 }
 
 impl DirectoryStore {
-	/// Recovers every file `new` listed as left over, lowest index first, then forgets
-	/// the list. A failure recovering one file is logged and does not stop the others;
-	/// a file the validator rejects is deleted, which is not a failure.
+	/// Lists `path` for the next `fetch` to recover, unless it is listed already.
+	pub(super) fn list_leftover(&mut self, path: PathBuf) {
+		if !self.leftovers.contains(&path) {
+			self.leftovers.push(path);
+		}
+	}
+
+	/// Recovers every listed file, in the order listed, and clears the list, so each
+	/// listing is recovered once. A failure recovering one file is logged and does not
+	/// stop the others, and the file is not listed again: a later session finds it. A
+	/// file the validator rejects is deleted, which is not a failure.
 	pub(super) fn recover_leftovers(&mut self) {
 		for path in std::mem::take(&mut self.leftovers) {
 			if let Err(e) = self.recover_file(&path) {
@@ -45,8 +57,9 @@ impl DirectoryStore {
 		}
 	}
 
-	/// Finalizes a file an earlier session left without the `.temp` extension, running
-	/// the validator on it as on any other finished file.
+	/// Finalizes a listed file, one an earlier session left without the `.temp`
+	/// extension or one this session could not finish, running the validator on it as
+	/// on any other finished file.
 	///
 	/// A file that is already a complete envelope, because the session ended after
 	/// closing it and before renaming it, is not closed a second time. Any other file is
@@ -90,6 +103,18 @@ impl DirectoryStore {
 				self.finalize_file(path)
 			}
 		}
+	}
+
+	/// Appends a closing to a salvaged file and marks it finished.
+	fn finalize_file(&self, path: &Path) -> Result<()> {
+		{
+			let mut file = OpenOptions::new().append(true).open(path)?;
+			let closing = self.closing(Utc::now());
+			debug_assert_eq!(closing.len(), self.closing_len);
+			file.write_all(&closing)?;
+			file.flush()?;
+		}
+		self.mark_finished(path)
 	}
 
 	/// Deletes a leftover that holds nothing deliverable.

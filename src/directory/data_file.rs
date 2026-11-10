@@ -122,7 +122,9 @@ impl super::DirectoryStore {
 				);
 				self.current_size = 0;
 				self.current_items = 0;
-				self.leftovers.extend(path);
+				if let Some(path) = path {
+					self.list_leftover(path);
+				}
 			}
 		}
 		Err(e)

@@ -222,7 +222,9 @@ A leftover with no complete item is deleted, and so is one of the store's files 
 not even start like a data file (empty, or cut inside its opening): nothing in it can be
 read, so it could never be delivered. Files not named for the store are never touched. A
 write that fails while the store is running (disk full, an I/O error) is rolled back, so
-the failed item leaves nothing behind and the next append continues the same file.
+the failed item leaves nothing behind and the next append continues the same file. If
+finishing a file fails (writing its closing, or renaming it), the `append` or `fetch` that
+tried returns the error, and the next `fetch` recovers that file with all its items.
 
 ### Web Store Example (WASM)
 
