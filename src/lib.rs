@@ -18,6 +18,13 @@ pub use transient::TransientDB;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use web::{PersistenceState, WebConfig, WebStore};
 
+/// A new identity for a store instance, unique within the process. A store carries it
+/// in every removable it issues, so its `remove` can ignore another instance's.
+pub(crate) fn next_store_id() -> u64 {
+	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Represents the result of a data fetch operation.
 /// Contains either raw data bytes or paths to data files, along with items that can be removed.
 #[derive(Debug)]
@@ -90,5 +97,9 @@ pub trait DataStore {
 	///
 	/// # Arguments
 	/// * `data` - Slice of removable items from a previous fetch operation
+	///
+	/// The built-in stores act only on removables issued by the same store instance
+	/// (for `DirectoryStore`, on paths to its own finished files) and silently ignore
+	/// anything else, returning `Ok`, as they do for items already removed.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()>;
 }

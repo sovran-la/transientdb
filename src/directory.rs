@@ -561,13 +561,13 @@ impl DataStore for DirectoryStore {
 		self.current_size = 0;
 		self.current_items = 0;
 
+		// Directly, not through `remove`, which deletes only finished files.
 		if let Ok(files) = self.sorted_files(true) {
-			let _ = self.remove(
-				&files
-					.iter()
-					.map(|p| Box::new(p.clone()) as Box<dyn Equivalent>)
-					.collect::<Vec<_>>(),
-			);
+			for path in files {
+				if let Err(e) = fs::remove_file(&path) {
+					eprintln!("Failed to remove file {:?}: {}", path, e);
+				}
+			}
 		}
 	}
 
@@ -695,9 +695,26 @@ impl DataStore for DirectoryStore {
 		}))
 	}
 
+	/// Deletes the finished files a previous `fetch` returned.
+	///
+	/// Only this store's own finished files count: a path is deleted only if it names a
+	/// regular file directly in this store's storage directory, with a finished name by
+	/// the ownership rule (see [`DirectoryConfig::base_filename`]). The directory is
+	/// compared by canonical path, so a relative and an absolute spelling of it both
+	/// match. Anything else is ignored, which is not an error: another store's file
+	/// (another `base_filename`, or the same one in another directory), this store's open
+	/// or unfinished file, a file outside the directory, or a file already gone. A
+	/// failure to delete one of its own files is logged with `eprintln!` and skipped.
 	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()> {
+		// If the directory itself is gone, so is every file in it.
+		let Ok(storage) = fs::canonicalize(&self.config.storage_location) else {
+			return Ok(());
+		};
 		for item in data {
 			if let Some(path) = item.as_any().downcast_ref::<PathBuf>() {
+				if !self.is_own_finished_file(path, &storage) {
+					continue;
+				}
 				if let Err(e) = fs::remove_file(path) {
 					eprintln!("Failed to remove file {:?}: {}", path, e);
 				}
@@ -724,6 +741,7 @@ mod tests {
 	mod depth;
 	mod duplicates;
 	mod finish_failure;
+	mod foreign_removables;
 	mod index_limit;
 	mod lifecycle;
 	mod oversized;
