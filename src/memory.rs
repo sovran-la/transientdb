@@ -19,10 +19,12 @@ impl Equivalent for Value {
 	}
 }
 
-/// A queued item and its sequence number, unique within its store.
+/// A queued item, its sequence number, unique within its store, and the batch number it
+/// was appended under.
 #[derive(Clone, Debug, PartialEq)]
 struct QueuedItem {
 	seq: u64,
+	batch: u64,
 	value: Value,
 }
 
@@ -118,6 +120,8 @@ pub struct MemoryStore {
 	items: VecDeque<QueuedItem>,
 	/// The sequence number the next appended item gets
 	next_seq: u64,
+	/// The batch number the next appended item gets; `end_batch` advances it
+	current_batch: u64,
 	/// Length of the configured envelope with no items, the same for every batch
 	envelope_len: usize,
 	/// The largest serialized item that fits alone in a batch under `max_fetch_size`
@@ -158,6 +162,7 @@ impl MemoryStore {
 			id: crate::next_store_id(),
 			items: VecDeque::new(),
 			next_seq: 0,
+			current_batch: 0,
 		}
 	}
 
@@ -205,6 +210,7 @@ impl DataStore for MemoryStore {
 
 		self.items.push_back(QueuedItem {
 			seq: self.next_seq,
+			batch: self.current_batch,
 			value: data,
 		});
 		self.next_seq = next_seq;
@@ -224,6 +230,11 @@ impl DataStore for MemoryStore {
 	/// `None`) bytes, envelope included, and holds at most `count` and `max_fetch_items`
 	/// items. A `max_bytes` too small for the oldest item returns `Ok(None)` even though
 	/// the store has data; a fetch at the configured `max_fetch_size` always returns it.
+	///
+	/// The batch also stops at the first [`end_batch`](DataStore::end_batch) boundary:
+	/// it holds only items appended under the oldest item's batch, so it can be smaller
+	/// than every limit allows while more items are stored. Once those are removed, the
+	/// next fetch returns the items after the boundary.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
@@ -234,8 +245,7 @@ impl DataStore for MemoryStore {
 		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
 		let count = batch::effective_count(count, self.config.max_fetch_items);
 		let num_items = batch::leading_items_that_fit(
-			self.items
-				.iter()
+			batch::head_batch(&self.items, |item| item.batch)
 				.map(|item| Self::get_item_size(&item.value)),
 			self.envelope_len,
 			max_bytes,
@@ -281,6 +291,29 @@ impl DataStore for MemoryStore {
 		self.items.retain(|item| !fetched.contains(&item.seq));
 		Ok(())
 	}
+
+	/// Ends the current batch: items appended after this call are never fetched in the
+	/// same batch as items appended before it, and a `fetch` stops at the boundary.
+	///
+	/// Only a batch that holds a queued item is ended. With none (nothing appended since
+	/// the store was created, since the last `end_batch`, or since those items were all
+	/// removed, dropped or reset) this does nothing and returns `Ok(())`, so repeated
+	/// calls are the same as one, and no empty batch ever exists.
+	///
+	/// # Errors
+	/// Returns an error, changing nothing, if batch numbers are exhausted: they never
+	/// wrap, so two batches can never share one.
+	fn end_batch(&mut self) -> Result<()> {
+		// Batch numbers only grow along the queue, so the newest item is the one to check.
+		if self.items.back().map(|item| item.batch) != Some(self.current_batch) {
+			return Ok(());
+		}
+		self.current_batch = self
+			.current_batch
+			.checked_add(1)
+			.ok_or_else(|| std::io::Error::other("MemoryStore batch numbers exhausted"))?;
+		Ok(())
+	}
 }
 
 #[cfg(test)]
@@ -295,6 +328,8 @@ mod tests {
 	mod ceiling;
 	mod depth;
 	mod duplicates;
+	mod end_batch;
+	mod end_batch_limits;
 	mod envelope;
 	mod foreign_removables;
 	mod oversized;

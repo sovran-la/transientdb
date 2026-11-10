@@ -5,11 +5,11 @@ use super::support::*;
 use super::*;
 use web_sys::{IdbOpenDbRequest, IdbRequest, IdbTransactionMode};
 
-fn factory() -> web_sys::IdbFactory {
+pub(super) fn factory() -> web_sys::IdbFactory {
 	web_sys::window().unwrap().indexed_db().unwrap().unwrap()
 }
 
-fn indexed_db_available() -> bool {
+pub(super) fn indexed_db_available() -> bool {
 	let available = web_sys::window()
 		.and_then(|w| w.indexed_db().ok().flatten())
 		.is_some();
@@ -20,7 +20,7 @@ fn indexed_db_available() -> bool {
 }
 
 /// Deletes `db_name`, so the test starts from no database at all.
-async fn delete_database(db_name: &str) {
+pub(super) async fn delete_database(db_name: &str) {
 	let request = factory().delete_database(db_name).unwrap();
 	idb::await_request::<JsValue>(&request).await.unwrap();
 }
@@ -44,7 +44,7 @@ async fn create_version_1(db_name: &str) -> IdbDatabase {
 }
 
 /// Adds raw JSON `records` to `db`'s object store and waits for them to commit.
-async fn add_raw(db: &IdbDatabase, records: &[Value]) {
+pub(super) async fn add_raw(db: &IdbDatabase, records: &[Value]) {
 	let transaction = db
 		.transaction_with_str_and_mode(idb::STORE_NAME, IdbTransactionMode::Readwrite)
 		.unwrap();
@@ -124,11 +124,11 @@ async fn test_records_without_wrapper_shape_are_skipped() {
 	add_raw(
 		&db,
 		&[
-			json!({"key": 3, "value": "ok"}),
-			json!({"key": 10}),
-			json!({"key": 12.5, "value": "fractional key"}),
-			json!({"key": "text", "value": "string key"}),
-			json!({"key": 4, "value": null}),
+			json!({"key": 3, "value": "ok", "batch": 0}),
+			json!({"key": 10, "batch": 0}),
+			json!({"key": 12.5, "value": "fractional key", "batch": 0}),
+			json!({"key": "text", "value": "string key", "batch": 0}),
+			json!({"key": 4, "value": null, "batch": 0}),
 		],
 	)
 	.await;
@@ -191,7 +191,11 @@ async fn test_record_at_the_last_key_is_kept_and_never_reused() {
 	}
 	settle().await;
 	let db = store.db.clone().unwrap();
-	add_raw(&db, &[json!({"key": u32::MAX, "value": "at the end"})]).await;
+	add_raw(
+		&db,
+		&[json!({"key": u32::MAX, "value": "at the end", "batch": 0})],
+	)
+	.await;
 
 	let mut reopened = WebStore::new(config(db_name, 4096, with_source(KEY))).await;
 	assert_eq!(queued(&reopened), vec![json!("at the end")]);
@@ -201,7 +205,7 @@ async fn test_record_at_the_last_key_is_kept_and_never_reused() {
 	settle().await;
 	assert_eq!(
 		idb::read_all(&db).await.unwrap(),
-		vec![json!({"key": u32::MAX, "value": "at the end"})]
+		vec![json!({"key": u32::MAX, "value": "at the end", "batch": 0})]
 	);
 
 	let result = reopened.fetch(None, None).unwrap().unwrap();

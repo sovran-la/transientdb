@@ -226,7 +226,7 @@ impl DirectoryStore {
 	/// .temp extension), with the file's path. It runs:
 	/// - when `append` finishes the open file because the next item would not fit
 	///   (rotation),
-	/// - when `fetch` finishes the open file,
+	/// - when `end_batch` or `fetch` finishes the open file,
 	/// - when the first `fetch` of a session recovers or salvages the files an earlier
 	///   session left unfinished. Those are recovered by that fetch, not by `new`, so a
 	///   validator set before it sees them.
@@ -237,8 +237,9 @@ impl DirectoryStore {
 	/// Returning `Ok(())` accepts the file. **Returning an error means "delete this file
 	/// and every item in it".** The store deletes it, and the operation that triggered
 	/// validation continues and succeeds: `append` still writes its item, to a fresh
-	/// file, and `fetch` returns the other finished files, or `Ok(None)`. Nothing about
-	/// the rejection is reported through the return value of `append` or `fetch`.
+	/// file, `end_batch` returns `Ok(())`, and `fetch` returns the other finished files,
+	/// or `Ok(None)`. Nothing about the rejection is reported through the return value
+	/// of `append`, `end_batch` or `fetch`.
 	///
 	/// The validator is the caller's own code, and it is the one place to observe a
 	/// rejection. A caller that wants to record, count, report, or keep a copy of a
@@ -473,16 +474,32 @@ impl DirectoryStore {
 	/// returned and the file is listed for the next `fetch` to recover, which salvages
 	/// its complete items, or renames it as is if the closing made it whole. A validator
 	/// rejection is not a failure: the file is deleted and nothing is listed.
+	///
+	/// An open file that holds no item (a failed write of its first item was rolled back
+	/// to the bare opening) is discarded instead of finished, so no empty batch is ever
+	/// written. Failing to delete it is logged and the file is listed; recovery deletes it.
 	fn finish_file(&mut self) -> Result<()> {
 		let Some(mut writer) = self.writer.take() else {
 			return Ok(());
 		};
 		let current_path = self.current_path.take();
+		let holds_items = self.current_items > 0;
 
 		// The file is closed from here on, even if flushing or finalizing it fails,
 		// so the next append must start a fresh file with fresh accounting.
 		self.current_size = 0;
 		self.current_items = 0;
+
+		if !holds_items {
+			drop(writer.into_parts());
+			if let Some(path) = current_path {
+				if let Err(e) = self.remove_leftover(&path) {
+					eprintln!("Failed to delete {:?}, which holds no item: {}", path, e);
+					self.list_leftover(path);
+				}
+			}
+			return Ok(());
+		}
 
 		let closing = self.closing();
 		debug_assert_eq!(closing.len(), self.closing_len);
@@ -720,6 +737,24 @@ impl DataStore for DirectoryStore {
 		}
 		Ok(())
 	}
+
+	/// Finishes the open file now, exactly as rotation does, so the next `append` starts a
+	/// new file: items appended before and after this call are never in the same file.
+	///
+	/// With no open file (nothing appended since the store was created, since the last
+	/// `end_batch` or `fetch`, or since `reset`) this does nothing and returns `Ok(())`.
+	/// It never writes a file without items, does not recover files an earlier session
+	/// left unfinished (the next `fetch` does), and fetches and removes nothing.
+	///
+	/// The validator runs on the finished file; a rejection deletes the file with every
+	/// item in it and is not an error, as for rotation.
+	///
+	/// # Errors
+	/// Propagates IO errors from finishing the open file. The file is then listed, and
+	/// the next `fetch` recovers it with all its items; later appends go to a new file.
+	fn end_batch(&mut self) -> Result<()> {
+		self.finish_file()
+	}
 }
 
 #[cfg(test)]
@@ -740,6 +775,9 @@ mod tests {
 	mod deferred;
 	mod depth;
 	mod duplicates;
+	mod empty_open_file;
+	mod end_batch;
+	mod end_batch_limits;
 	mod envelope;
 	mod envelope_recovery;
 	mod finish_failure;

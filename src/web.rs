@@ -77,11 +77,13 @@ pub struct WebConfig {
 	pub max_fetch_items: Option<usize>,
 }
 
-/// A queued item and the key it is stored under in IndexedDB.
+/// A queued item, the key it is stored under in IndexedDB, and its batch number.
 #[derive(Clone, Debug)]
 struct StoredEvent {
 	/// The item's key, assigned by the store at append; the same in IndexedDB.
 	key: u32,
+	/// The batch number the item was appended under; the same in IndexedDB.
+	batch: u32,
 	/// The item, exactly as appended
 	value: Value,
 }
@@ -162,6 +164,8 @@ pub struct WebStore {
 	db: Option<Rc<IdbDatabase>>,
 	/// The key the next appended item gets; above every key in the queue and in IndexedDB
 	next_key: u32,
+	/// The batch number the next appended item gets; `end_batch` advances it
+	current_batch: u32,
 	/// Current persistence state
 	persistence_state: PersistenceState,
 	/// Length of the configured envelope with no items, the same for every batch
@@ -213,6 +217,7 @@ impl WebStore {
 			items: VecDeque::new(),
 			db: None,
 			next_key: 0,
+			current_batch: 0,
 			persistence_state: PersistenceState::MemoryOnly,
 		};
 
@@ -228,6 +233,7 @@ impl WebStore {
 					// writing to this database is not safe. Leave it untouched.
 					store.items.clear();
 					store.next_key = 0;
+					store.current_batch = 0;
 					web_sys::console::warn_1(
 						&format!(
 							"Failed to hydrate from IndexedDB ({:?}), falling back to \
@@ -285,18 +291,37 @@ impl WebStore {
 	/// Loads every stored item from IndexedDB into memory, in key (append) order, and
 	/// sets the next key above every key seen.
 	///
-	/// A record without the wrapper shape is skipped with a warning; its key, if it has
-	/// one, still counts, so no new item is given it.
+	/// Each item keeps its batch number. The current batch number becomes the highest
+	/// one stored, on an item or on the boundary record, so a reload is not a boundary
+	/// by itself, but every `end_batch` that reached IndexedDB still is.
+	///
+	/// A record without the wrapper shape (or a boundary record without a valid batch
+	/// number) is skipped with a warning; its key, if it has one, still counts, so no new
+	/// item is given it.
 	async fn hydrate(&mut self, db: &IdbDatabase) -> Result<()> {
 		for record in idb::read_all(db).await? {
 			if let Some(key) = idb::record_key(&record) {
 				self.next_key = self.next_key.max(key.saturating_add(1));
 			}
-			match (idb::record_key(&record), idb::record_value(&record)) {
-				(Some(key), Some(value)) => self.items.push_back(StoredEvent {
-					key,
-					value: value.clone(),
-				}),
+			let batch = idb::record_batch(&record);
+			if idb::is_boundary(&record) {
+				match batch {
+					Some(batch) => self.current_batch = self.current_batch.max(batch),
+					None => web_sys::console::warn_1(
+						&"Skipping an IndexedDB boundary record without a batch number".into(),
+					),
+				}
+				continue;
+			}
+			match (idb::record_key(&record), batch, idb::record_value(&record)) {
+				(Some(key), Some(batch), Some(value)) => {
+					self.current_batch = self.current_batch.max(batch);
+					self.items.push_back(StoredEvent {
+						key,
+						batch,
+						value: value.clone(),
+					});
+				}
 				_ => web_sys::console::warn_1(
 					&"Skipping an IndexedDB record that is not a stored item".into(),
 				),
@@ -308,7 +333,7 @@ impl WebStore {
 	/// Fire-and-forget add of `event` to IndexedDB
 	fn persist_event(&self, event: &StoredEvent) {
 		let Some(db) = &self.db else { return };
-		idb::fire_and_forget("write", idb::add(db, event.key, &event.value));
+		idb::fire_and_forget("write", idb::add(db, event.key, event.batch, &event.value));
 	}
 
 	/// Fire-and-forget delete of `keys` from IndexedDB
@@ -365,7 +390,7 @@ impl WebStore {
 		let max_bytes = max_bytes.unwrap_or(self.config.max_fetch_size);
 		let count = batch::effective_count(count, self.config.max_fetch_items);
 		let num_items = batch::leading_items_that_fit(
-			self.items.iter().map(Self::get_item_size),
+			batch::head_batch(&self.items, |e| u64::from(e.batch)).map(Self::get_item_size),
 			self.envelope_len,
 			max_bytes,
 			count,
@@ -437,6 +462,7 @@ impl DataStore for WebStore {
 
 		let event = StoredEvent {
 			key: self.next_key,
+			batch: self.current_batch,
 			value: data,
 		};
 		self.next_key = next_key;
@@ -462,9 +488,15 @@ impl DataStore for WebStore {
 	/// items. A `max_bytes` too small for the oldest item returns `Ok(None)` even though
 	/// the store has data; a fetch at the configured `max_fetch_size` always returns it.
 	///
+	/// The batch also stops at the first [`end_batch`](DataStore::end_batch) boundary:
+	/// it holds only items appended under the oldest item's batch, so it can be smaller
+	/// than every limit allows while more items are stored. Once those are removed, the
+	/// next fetch returns the items after the boundary.
+	///
 	/// Items at the head of the queue too large for any batch under `max_fetch_size`
 	/// (persisted under a larger `max_fetch_size`) are dropped, deleted from IndexedDB, and
 	/// logged with `console.warn`; if that empties the queue, this returns `Ok(None)`.
+	/// The boundary is then the one of the new oldest item.
 	fn fetch(
 		&mut self,
 		count: Option<usize>,
@@ -503,6 +535,37 @@ impl DataStore for WebStore {
 
 		Ok(())
 	}
+
+	/// Ends the current batch: items appended after this call are never fetched in the
+	/// same batch as items appended before it, and a `fetch` stops at the boundary.
+	///
+	/// Only a batch that holds a queued item is ended. With none (nothing appended since
+	/// the store was opened, since the last `end_batch`, or since those items were all
+	/// removed, dropped or reset) this does nothing and returns `Ok(())`, so repeated
+	/// calls are the same as one, and no empty batch ever exists.
+	///
+	/// The boundary survives a reload: every item is persisted with its batch number, and
+	/// the new current number is written to IndexedDB too (fire-and-forget, like every
+	/// write), so a boundary set after the last append is kept as well. A reload by itself
+	/// is not a boundary: items appended after it may share a batch with those before.
+	///
+	/// # Errors
+	/// Returns an error, changing nothing, if batch numbers are exhausted: they never
+	/// wrap, so two batches can never share one.
+	fn end_batch(&mut self) -> Result<()> {
+		// Batch numbers only grow along the queue, so the newest item is the one to check.
+		if self.items.back().map(|e| e.batch) != Some(self.current_batch) {
+			return Ok(());
+		}
+		self.current_batch = self
+			.current_batch
+			.checked_add(1)
+			.ok_or_else(|| Error::other("WebStore batch numbers exhausted"))?;
+		if let Some(db) = &self.db {
+			idb::fire_and_forget("boundary write", idb::put_boundary(db, self.current_batch));
+		}
+		Ok(())
+	}
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -519,6 +582,9 @@ mod tests {
 	mod ceiling;
 	mod depth;
 	mod duplicates;
+	mod end_batch;
+	mod end_batch_limits;
+	mod end_batch_reload;
 	mod envelope;
 	mod foreign_removables;
 	mod head_drop;

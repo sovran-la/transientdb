@@ -155,8 +155,8 @@ impl DirectoryStore {
 		self.mark_finished(path)
 	}
 
-	/// Deletes a leftover that holds nothing deliverable.
-	fn remove_leftover(&self, path: &Path) -> Result<()> {
+	/// Deletes a leftover, or an open file, that holds nothing deliverable.
+	pub(super) fn remove_leftover(&self, path: &Path) -> Result<()> {
 		#[cfg(test)]
 		if self.faults.lock().unwrap().fail_remove {
 			return Err(std::io::Error::other("injected remove failure"));

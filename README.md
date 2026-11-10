@@ -61,6 +61,7 @@ The core interface that storage implementations must provide:
 - `append()`: Add new items to the store
 - `fetch()`: Retrieve batches of data with optional limits
 - `remove()`: Clean up processed data
+- `end_batch()`: Set a [batch boundary](#batch-boundaries)
 - `has_data()`: Check if data is available
 - `reset()`: Clear all stored data
 
@@ -189,16 +190,16 @@ A validator set with `set_file_validator` is your own code. It is given the path
 finished file before the file is marked ready (renamed with `.temp`), and it runs:
 
 - when `append` finishes the open file because the next item would not fit (rotation),
-- when `fetch` finishes the open file,
+- when `end_batch` or `fetch` finishes the open file,
 - when the first `fetch` of a session recovers or salvages files an earlier session left
   unfinished. Recovery happens there, not in `DirectoryStore::new`, so a validator set
   right after `new` sees those files too.
 
 Returning `Ok(())` accepts the file. **Returning an error means "delete this file and
 every item in it".** The store deletes it, and the operation that triggered validation
-continues and succeeds: `append` still writes its item, to a fresh file, and `fetch`
-returns the other finished files, or nothing. A rejection is never reported through the
-return value of `append` or `fetch`.
+continues and succeeds: `append` still writes its item, to a fresh file, `end_batch`
+returns `Ok(())`, and `fetch` returns the other finished files, or nothing. A rejection is
+never reported through the return value of `append`, `end_batch` or `fetch`.
 
 The validator is therefore the one place to observe a rejection. If you want to record,
 count, report, or keep a copy of a rejected file, do it inside the validator, before you
@@ -232,8 +233,8 @@ not even start like a data file (empty, or cut inside its opening): nothing in i
 read, so it could never be delivered. Files not named for the store are never touched. A
 write that fails while the store is running (disk full, an I/O error) is rolled back, so
 the failed item leaves nothing behind and the next append continues the same file. If
-finishing a file fails (writing its closing, or renaming it), the `append` or `fetch` that
-tried returns the error, and the next `fetch` recovers that file with all its items.
+finishing a file fails (writing its closing, or renaming it), the `append`, `end_batch` or
+`fetch` that tried returns the error, and the next `fetch` recovers that file with all its items.
 
 ### Web Store Example (WASM)
 
@@ -320,8 +321,10 @@ if let Some(result) = db.fetch(Some(100), None)? {
 - Stores any JSON value (objects, arrays, strings, numbers, booleans, null) unmodified
 - IndexedDB writes are issued in call order, so a `remove()` or `reset()` right after an
   `append()` is never undone by the append landing late
-- A database written by transientdb 0.2.x uses an older record format; it is emptied the
-  first time this version opens it (old records are discarded, not migrated)
+- A database written by an earlier version (transientdb 0.2.x, or before batch boundaries)
+  uses an older record format; it is emptied the first time this version opens it (old
+  records are discarded, not migrated)
+- [Batch boundaries](#batch-boundaries) survive a page reload
 - Ideal for web applications and browser-based analytics
 - Requires the `web` feature flag
 
@@ -458,6 +461,35 @@ Each store can enforce one:
       max_fetch_items: Some(8), // every fetch returns at most 8 items
   };
   ```
+
+## Batch boundaries
+
+`end_batch()` guarantees that items appended before the call and items appended after it
+are never returned in the same batch, in every store. Use it when a change (say, the user
+identity) means the events on either side must not travel in one request.
+
+```rust
+db.append(json!({"user": "a", "event": "logout"}))?;
+db.end_batch()?;
+db.append(json!({"user": "b", "event": "login"}))?;
+
+// The first fetch returns only user a's event, even though more is stored.
+let first = db.fetch(Some(100), None)?.unwrap();
+db.remove(&first.removable.unwrap())?;
+// The next one returns user b's.
+let second = db.fetch(Some(100), None)?.unwrap();
+```
+
+- `DirectoryStore` finishes the open file at once, as rotation does (the validator runs on
+  it), so the next `append` starts a new file. A batch is one file.
+- `MemoryStore` and `WebStore` stop each `fetch` at the boundary, alongside `count`,
+  `max_fetch_items` and the byte limit: a fetch can return fewer items than asked for while
+  more are stored. Once those are removed, the next fetch returns what follows.
+- With nothing appended since the store was created, since the last `end_batch`, or since
+  everything was removed or reset, `end_batch` does nothing. Calling it twice is the same
+  as once, and it never creates an empty batch. It fetches and removes nothing.
+- `WebStore` persists boundaries, including one set after the last append, so they hold
+  after a page reload. A reload by itself is not a boundary.
 
 ## Envelope
 

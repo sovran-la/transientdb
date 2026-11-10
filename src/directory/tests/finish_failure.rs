@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy)]
-enum Fault {
+pub(super) enum Fault {
 	/// Writing the closing fails after this many of its bytes.
 	Closing(usize),
 	/// Flushing the closing fails; the closing itself reaches the file.
@@ -20,7 +20,7 @@ enum Fault {
 
 /// Arms `fault` for the next attempt to finish the open file. Returns the directory
 /// put in the way of a rename, if any, for [`heal`] to remove.
-fn arm(store: &DirectoryStore, fault: Fault) -> Option<PathBuf> {
+pub(super) fn arm(store: &DirectoryStore, fault: Fault) -> Option<PathBuf> {
 	match fault {
 		Fault::Closing(bytes) => store.faults.lock().unwrap().write_budget = Some(bytes),
 		Fault::Flush => store.faults.lock().unwrap().fail_flush = true,
@@ -33,14 +33,14 @@ fn arm(store: &DirectoryStore, fault: Fault) -> Option<PathBuf> {
 	None
 }
 
-fn heal(store: &DirectoryStore, blocker: Option<PathBuf>) {
+pub(super) fn heal(store: &DirectoryStore, blocker: Option<PathBuf>) {
 	*store.faults.lock().unwrap() = Faults::default();
 	if let Some(blocker) = blocker {
 		fs::remove_dir(blocker).unwrap();
 	}
 }
 
-const FAULTS: [Fault; 6] = [
+pub(super) const FAULTS: [Fault; 6] = [
 	Fault::Closing(0),
 	Fault::Closing(1),
 	Fault::Closing(30),
@@ -50,7 +50,7 @@ const FAULTS: [Fault; 6] = [
 ];
 
 /// A unique JSON string item, `tag` then padding, exactly `len` bytes serialized.
-fn tagged(len: usize, tag: &str) -> Value {
+pub(super) fn tagged(len: usize, tag: &str) -> Value {
 	let item = Value::String(format!("{tag}{}", "x".repeat(len - 2 - tag.len())));
 	assert_eq!(item_len(&item), len);
 	item
