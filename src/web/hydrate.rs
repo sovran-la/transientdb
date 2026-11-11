@@ -1,7 +1,6 @@
 //! Loading a `WebStore`'s queue from IndexedDB when it opens.
 
 use super::{idb, WebStore};
-use crate::serialize;
 use std::io::Result;
 use wasm_bindgen::JsValue;
 use web_sys::IdbDatabase;
@@ -15,14 +14,14 @@ impl WebStore {
 	/// next sequence number above every one seen. Every item is available: nothing that
 	/// was pending before a reload is pending after it.
 	///
-	/// What this store would not have accepted is discarded, deleted from IndexedDB and
-	/// logged, the way FileStore discards what does not match at open:
+	/// An item was checked when it was appended, and IndexedDB returns what was stored,
+	/// so an item's text is not parsed again. Only these are discarded, deleted from
+	/// IndexedDB and logged:
 	///
 	/// - a record without the record shape (a sequence number in `1..=MAX_SEQ` and a
 	///   string), or one that cannot be read as JSON at all, whose sequence number, if it
 	///   has one, still counts, so no new item is given it;
-	/// - an item that is not well-formed JSON, is larger than `max_item_size` (stored under
-	///   a larger limit), or is nested too deeply;
+	/// - an item larger than `max_item_size` (stored under a larger limit);
 	/// - the oldest items beyond `max_items`, if more are stored (under a larger limit).
 	///
 	/// Only reading can fail; the deletes are fire-and-forget, like every write.
@@ -37,13 +36,16 @@ impl WebStore {
 				discarded.extend(idb::record_key(&record));
 				continue;
 			};
-			match serialize::check_text(&text, self.config.max_item_size) {
-				Ok(()) => self.queue.restore(seq, text),
-				Err(unfit) => {
-					warn(&format!("Discarding stored item {seq}: {unfit}"));
-					discarded.push(JsValue::from_f64(seq as f64));
-				}
+			let max = self.config.max_item_size;
+			if text.len() > max {
+				warn(&format!(
+					"Discarding stored item {seq}: it is {} bytes, over max_item_size = {max} bytes",
+					text.len()
+				));
+				discarded.push(JsValue::from_f64(seq as f64));
+				continue;
 			}
+			self.queue.restore(seq, text);
 		}
 
 		let dropped = self.queue.drop_oldest_beyond(self.config.max_items);

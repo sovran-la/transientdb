@@ -136,10 +136,11 @@ impl WebStore {
 	/// Creates a new WebStore with IndexedDB persistence.
 	///
 	/// This opens (or creates) the IndexedDB database and hydrates in-memory state from
-	/// any previously persisted items. Stored records that are not items this store would
-	/// accept (malformed, or larger than `max_item_size`) are discarded, and if more items
-	/// are stored than `max_items` allows, the oldest are dropped; both are logged to the
-	/// console and deleted from IndexedDB.
+	/// any previously persisted items. An item's text is not parsed again: it was checked
+	/// when it was appended. A stored record that is not an item (without a usable
+	/// sequence number and a text string), or whose text is larger than `max_item_size`,
+	/// is discarded, and if more items are stored than `max_items` allows, the oldest are
+	/// dropped; both are logged to the console and deleted from IndexedDB.
 	///
 	/// If IndexedDB is unavailable (private browsing, third-party context,
 	/// storage blocked, etc), or its contents cannot be read, the store falls

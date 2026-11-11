@@ -79,10 +79,10 @@ What a fetch hands out: one or more items, oldest first, and the store's claim o
 - `byte_len()`: the total bytes of the items' text, as counted against `max_bytes`
 - `json()`: one JSON array holding every item, `[{...},{...}]`, built by joining the stored text without parsing anything. Its length is `byte_len()`, plus one comma between each pair of items, plus 2
 - `values()`: every item parsed as a `serde_json::Value`
-- `iter()`: each item's own JSON text, exactly as it was serialized at append
+- `iter()`: each item's stored text as it is, the JSON serialized at append
 - `release()`: give the items back for a later fetch
 
-None of these can fail: every store checks an item before handing it out. None of them wraps the items in anything either. The request body around them (a key, other fields, a timestamp) is yours to build.
+An item is checked when it is appended; what is fetched is what was stored, and is not parsed again. None of these methods can fail or panic. `json()` and `iter()` pass the stored text through as it is, and `values()` gives an item whose text does not parse (only possible if something else wrote to the store's storage, such as another script writing to a `WebStore`'s database) as a JSON string of that text. None of them wraps the items in anything either. The request body around them (a key, other fields, a timestamp) is yours to build.
 
 ### Error
 Every fallible operation returns `transientdb::Result<T>`, whose error is `transientdb::Error`. See [Error Handling](#error-handling).
@@ -117,6 +117,8 @@ fn flush(db: &TransientDB, send: impl Fn(&str) -> bool) -> Result<()> {
     Ok(())
 }
 ```
+
+Here `send` returns `false` only for a failure worth retrying: a network error, or a server error such as a 5xx. If the server rejects a batch as malformed (a 400, say), `remove` it as if it had been delivered. Released, it would be fetched, sent and rejected again, forever, and nothing behind it would get through.
 
 ### Memory Store Example
 
@@ -264,9 +266,9 @@ For a service that rejects request bodies over some size, pass a `max_bytes` tha
 
 **The file.** A 256 byte header, then slots, all `32 + max_item_size` bytes. Each slot holds one item and a 32 byte entry with the item's length, sequence number and CRC-32. Order is by sequence number, not by position. A removed item's slot is reused by a later append, lowest slot first, and the file grows by one slot only when none is free, so the file is as large as the queue has been deep since the file was last emptied. That is never more than `256 + (32 + max_item_size) * max_items` bytes, taking the largest `max_items` the file has been opened with since then: lowering `max_items` drops items, but does not shrink the file. With `max_item_size = 8192` and `max_items = 2560` that is 21,053,696 bytes, but a queue that is never more than 50 items deep keeps the file at 411,456. When the last item is removed, the file is cut back to its header. Nothing in the file is ever moved, rewritten or renamed.
 
-A file that does not match the config (another id or `max_item_size`, another format version, a damaged header, or not a FileStore file at all) is deleted with everything in it, logged, and created again. `new` does not fail for this. A damaged item is caught when it is fetched: it is deleted, logged and skipped, so it can never be fetched forever. FileStore logs one line on stderr for each of these.
+A file that does not match the config (another id or `max_item_size`, another format version, a damaged header, or not a FileStore file at all) is deleted with everything in it, logged, and created again. `new` does not fail for this. A damaged item, one that fails its CRC or is not UTF-8, is caught when it is fetched: it is deleted, logged and skipped, so it can never be fetched forever. FileStore logs one line on stderr for each of these.
 
-**One store per file.** A file is used by one store at a time. Within a process this is enforced: a second `FileStore` for a file another one is using, whether its path is spelled the same way, relative, through `..` or through a symbolic link, is created, but leaves the file alone. Its `append`, `fetch` and `remove` return `Error::InUse`, `has_data` is false, and `reset` does nothing, until the first store is dropped; its next call then opens the file and carries on. A hard link is a different path to the file, and is not detected. Across processes it is a rule for you, not enforced: an app and its extension, say, must not open the same file. If they do, items can be lost or sent twice (never malformed: every fetched item is checked).
+**One store per file.** A file is used by one store at a time. Within a process this is enforced: a second `FileStore` for a file another one is using, whether its path is spelled the same way, relative, through `..` or through a symbolic link, is created, but leaves the file alone. Its `append`, `fetch` and `remove` return `Error::InUse`, `has_data` is false, and `reset` does nothing, until the first store is dropped; its next call then opens the file and carries on. A hard link is a different path to the file, and is not detected. Across processes it is a rule for you, not enforced: an app and its extension, say, must not open the same file. If they do, items can be lost or sent twice (never torn: every fetched item's CRC is checked).
 
 **Where to put the file.** The location is your choice, and it matters:
 - Not a temporary or cache directory. The OS may delete those while the app is suspended, and writes to a deleted file succeed and go nowhere.
@@ -278,7 +280,7 @@ A file that does not match the config (another id or `max_item_size`, another fo
 ### WebStore (WASM)
 - Browser-based storage using IndexedDB, behind an in-memory queue
 - Async construction, sync operations: every write to IndexedDB is fire-and-forget, issued during the call that causes it, so writes land in call order
-- Loads what IndexedDB holds when it opens, in append order; anything it would not accept now (malformed, larger than `max_item_size`, or the oldest beyond `max_items`) is discarded and logged to the console
+- Loads what IndexedDB holds when it opens, in append order, without parsing it again: an item was checked when it was appended. A record that is not an item (no usable sequence number and text), an item larger than `max_item_size`, and the oldest beyond `max_items` are discarded and logged to the console
 - Items are persisted as JSON text, so after a reload an integer above 2^53 or a float such as `42.0` comes back exactly as appended
 - Which items are fetched is kept in memory only, so after a reload every stored item can be fetched again
 - A failed IndexedDB write is not an error: it is logged, and the item is still queued in memory

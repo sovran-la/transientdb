@@ -1,10 +1,9 @@
-//! Reading items back at fetch, checking each one as it is read.
+//! Reading items back at fetch, checking each one's CRC and UTF-8 as it is read.
 
 use super::core::FileCore;
 use super::entry::{self, Entry, LIVE};
 use super::faults::Op;
 use super::index::Live;
-use crate::serialize;
 use std::io;
 
 impl FileCore {
@@ -12,10 +11,11 @@ impl FileCore {
 	/// at most `count`, whose lengths total at most `max_bytes`. Stops at the first item
 	/// that would pass `max_bytes`, so items are never returned out of order.
 	///
-	/// Each item is checked as it is read: its CRC, that it is UTF-8, and that it is
-	/// well-formed JSON within the depth `append` allows. One that fails is freed, logged and skipped. One whose slot no longer holds
-	/// it (only another process using the file can cause that) is forgotten, logged and
-	/// skipped, and its slot left as it is.
+	/// Each item is checked as it is read: its CRC, which proves its bytes are the ones
+	/// written for it, and that it is UTF-8. Its JSON was checked when it was appended
+	/// and is not parsed again. One that fails is freed, logged and skipped. One whose slot
+	/// no longer holds it (only another process using the file can cause that) is
+	/// forgotten, logged and skipped, and its slot left as it is.
 	///
 	/// On an I/O error nothing is returned and the index is as it was, apart from any
 	/// damaged item already freed.
@@ -75,10 +75,6 @@ impl FileCore {
 			self.discard(sequence, "it is not UTF-8");
 			return Ok(None);
 		};
-		if let Err(unfit) = serialize::check_text(&text, self.layout.slot_size as usize) {
-			self.discard(sequence, &unfit.to_string());
-			return Ok(None);
-		}
 		Ok(Some(text))
 	}
 

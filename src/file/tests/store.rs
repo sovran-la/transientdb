@@ -21,6 +21,7 @@ mod reuse;
 mod send;
 mod sequence;
 mod shrink;
+mod stored_text;
 mod two_stores;
 
 /// A store on `path` with `SLOT` byte items and room for `max_items`.

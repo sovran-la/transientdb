@@ -280,11 +280,14 @@ Fetching removes nothing from disk. The items stay stored, but are not returned
 by another fetch until they are released. This replaces the 0.3.0 contract,
 under which a later fetch returned the same items again.
 
-Each item is checked as it is read: its CRC, that it is valid UTF-8, and that it
-is well-formed JSON. An item that fails any of these is freed, logged and
-skipped, so a damaged item cannot be fetched forever. This is the one place a
-bad item is caught. Everything in an `Items` is known to be good, which is why
-none of its methods can fail.
+An item is checked when it is appended; what is fetched is what was stored. As
+each item is read, its CRC proves that its bytes are the ones written for it,
+and it must be valid UTF-8, since an `Items` holds text. Its JSON is not parsed
+again. An item that fails either check is freed, logged and skipped, and does
+not count toward `count` or `max_bytes`, so a damaged item cannot be fetched
+forever. An item whose slot no longer holds it (only another process using the
+file can cause that) is forgotten, logged and skipped, and its slot is left as
+it is.
 
 Fetch returns `Items`: the fetched items, in order, and the store's claim on
 them, in one value.
@@ -301,11 +304,12 @@ impl Items {
     // The items, in whichever form the caller wants them. Oldest first.
 
     /// One JSON array holding every item: `[{...},{...}]`.
-    /// Built by joining the stored text; nothing is parsed.
+    /// Built by joining the stored text as it is; nothing is parsed or checked.
     pub fn json(&self) -> String;
-    /// Every item parsed. Cannot fail: fetch already checked each one.
+    /// Every item parsed. Never fails or panics: an item whose text does not
+    /// parse is given as a `Value::String` of that text.
     pub fn values(&self) -> Vec<serde_json::Value>;
-    /// Each item's own JSON text, exactly as it was serialized at append.
+    /// Each item's stored text as it is: the JSON serialized at append.
     pub fn iter(&self) -> impl Iterator<Item = &str>;
 
     /// Gives the items back: they will be returned by a later fetch.
@@ -313,8 +317,9 @@ impl Items {
 }
 ```
 
-An `Items` holds each item as the JSON text that was stored. The three ways of
-reading it are views of that one text, so asking for one costs nothing for the
+An `Items` holds each item as the text that was stored: the JSON `append`
+serialized for it. None of its methods can fail. The three ways of reading it
+are views of that one text, so asking for one costs nothing for the
 others, and more can be added later without changing what is stored.
 
 - `json()` is for a caller that drops the items into a request body:
@@ -463,9 +468,9 @@ store takes it, opens the file, and carries on as normal from then on.
 
 **Across processes it is a rule for the caller, not enforced.** An app and its
 extension, say, must not open the same file. If they do, each works from its own
-idea of which slots are free, so items can be overwritten or sent twice. No
-malformed item is ever handed out, because fetch checks every item it returns,
-but items can be lost or duplicated.
+idea of which slots are free, so items can be overwritten or sent twice. Every
+item handed out is still one that was appended whole, because fetch checks each
+item's CRC, but items can be lost or duplicated.
 
 No OS file lock is taken. Three reasons, the last two checked on 2026-11-10:
 
@@ -567,8 +572,8 @@ The tests cover, in addition to the usual behavior tests:
 - An I/O error on every read and write leaves the store usable, with the same
   items, for the next call.
 - Two stores on one file without the registry (as two processes would be),
-  interleaving appends, fetches and removes: every fetched item is a whole,
-  valid item that was appended by one of them.
+  interleaving appends, fetches and removes: every fetched item is a whole item
+  that was appended by one of them.
 - CRC-32 against the standard check value.
 
 ## Open questions

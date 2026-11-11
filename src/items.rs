@@ -19,9 +19,16 @@ use std::fmt;
 /// after the store itself is gone (then it does nothing). An `Items` is `Send` on native
 /// targets, so a caller can fetch on one thread and remove on another.
 ///
-/// The items are kept as the JSON text that was stored, and every one is well-formed.
-/// [`json`](Self::json), [`values`](Self::values) and [`iter`](Self::iter) are three
-/// views of that text; none of them can fail, and none wraps the items in anything.
+/// The items are kept as the text that was stored. An item is checked when it is
+/// appended, and what is fetched is what was stored, so each item's text is the compact
+/// JSON its `append` serialized. [`json`](Self::json), [`values`](Self::values) and
+/// [`iter`](Self::iter) are three views of that text; none of them can fail or panic,
+/// whatever the text is, and none wraps the items in anything.
+///
+/// The one way stored text can be other than what `append` wrote is for something else to
+/// change the storage underneath the store: another script on the page writing to a
+/// `WebStore`'s database, say. Such text is handed out as it is: `json` and `iter` pass it
+/// through, and `values` gives it as a JSON string if it does not parse.
 ///
 /// ```
 /// use serde_json::json;
@@ -77,8 +84,11 @@ impl Items {
 
 	/// One JSON array holding every item, oldest first: `[{...},{...}]`.
 	///
-	/// Built by joining the stored text; nothing is parsed. Its length is
-	/// [`byte_len`](Self::byte_len), plus one comma between each pair of items, plus 2.
+	/// Built by joining each item's stored text as it is, with commas, inside brackets;
+	/// nothing is parsed or checked. Its length is [`byte_len`](Self::byte_len), plus one
+	/// comma between each pair of items, plus 2. It is a well-formed JSON array if every
+	/// item's text is well-formed JSON, as everything `append` stored is; text written
+	/// to the storage by something else is joined as it is.
 	pub fn json(&self) -> String {
 		let mut json = String::with_capacity(self.byte_len + self.entries.len() + 1);
 		json.push('[');
@@ -93,16 +103,21 @@ impl Items {
 	}
 
 	/// Every item parsed, oldest first. Each equals the value that was appended.
+	///
+	/// An item whose stored text does not parse (text written to the storage by
+	/// something else) is given as a [`Value::String`] holding that text, and the others
+	/// are parsed as usual. `serde_json` refuses text nested past its recursion limit
+	/// rather than overflow the stack, so that too is given as a string.
 	pub fn values(&self) -> Vec<Value> {
 		self.iter()
 			.map(|text| {
-				// Every store checks an item's text before handing it out.
-				serde_json::from_str(text).expect("stored item text is well-formed JSON")
+				serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 			})
 			.collect()
 	}
 
-	/// Each item's own JSON text, oldest first, exactly as it was serialized at append.
+	/// Each item's stored text, oldest first, as it is: the JSON `append` serialized for
+	/// it. Nothing is parsed or checked.
 	pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
 		self.entries.iter().map(|(_, text)| text.as_str())
 	}

@@ -112,6 +112,21 @@ pub(crate) fn poke(path: &Path, offset: u64, bytes: &[u8]) {
 	file.write_all(bytes).unwrap();
 }
 
+/// Writes `payload` into slot `slot` of the file at `path`, whose slots are `slot_size`
+/// bytes, under a live entry for item `sequence` whose CRC matches it: an item the store
+/// will read back as written, whatever its bytes.
+pub(crate) fn write_item(path: &Path, slot_size: usize, slot: u64, sequence: u64, payload: &[u8]) {
+	let layout = Layout {
+		slot_size: slot_size as u32,
+	};
+	poke(path, layout.payload_offset(slot), payload);
+	poke(
+		path,
+		layout.entry_offset(slot),
+		&crate::file::entry::encode_live(sequence, payload),
+	);
+}
+
 /// The bytes of the file at `path`.
 pub(crate) fn bytes_of(path: &Path) -> Vec<u8> {
 	std::fs::read(path).unwrap()

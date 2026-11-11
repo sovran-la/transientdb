@@ -1,4 +1,5 @@
-//! Reading items back: limits, order, and the checks every item passes as it is read.
+//! Reading items back: limits, order, and the checks every item passes as it is read: its
+//! CRC and UTF-8, not its JSON, which was checked at append.
 
 use super::support::*;
 use crate::file::entry::encode_live;
@@ -83,8 +84,9 @@ fn test_reading_writes_nothing_and_changes_nothing() {
 	assert_eq!(core.index, index);
 }
 
-/// Damages the second of three 5 byte items in each way an item can fail its checks.
-/// Past the CRC, the entry is rewritten to match the damaged payload.
+/// Changes the second of three 5 byte items: damages it in each way an item can fail its
+/// checks ("crc", "utf8"), or writes text that is not JSON ("json"). Past the CRC, the
+/// entry is rewritten to match the new payload.
 fn damage(path: &std::path::Path, how: &str) {
 	let slot = 1;
 	let entry = layout().entry_offset(slot);
@@ -107,7 +109,7 @@ fn damage(path: &std::path::Path, how: &str) {
 
 #[test]
 fn test_a_damaged_item_is_freed_and_skipped_and_the_rest_still_read() {
-	for how in ["crc", "utf8", "json"] {
+	for how in ["crc", "utf8"] {
 		let (_dir, path) = temp_path();
 		drop(stored(&path, &[5, 5, 5]));
 		damage(&path, how);
@@ -127,6 +129,24 @@ fn test_a_damaged_item_is_freed_and_skipped_and_the_rest_still_read() {
 		drop(core);
 		assert_eq!(texts(&mut open(&path)).len(), 2, "{how}");
 	}
+}
+
+#[test]
+fn test_an_item_that_is_not_json_under_a_valid_crc_is_read_as_it_was_stored() {
+	let (_dir, path) = temp_path();
+	drop(stored(&path, &[5, 5, 5]));
+	damage(&path, "json");
+	let (mut core, hook) = open_with(&path, 100);
+	let before = bytes_of(&path);
+	let items = core.read_items(3, 100, |_| false).unwrap();
+	let expected = vec![(1, item(5, 0)), (2, "[1,2,".to_string()), (3, item(5, 2))];
+	assert_eq!(items, expected);
+	// Nothing is freed or written for it, and it is read the same way again.
+	assert!(drain(&hook).is_empty());
+	assert_eq!(bytes_of(&path), before);
+	assert_eq!(all(&mut core), expected);
+	drop(core);
+	assert_eq!(all(&mut open(&path)), expected);
 }
 
 #[test]

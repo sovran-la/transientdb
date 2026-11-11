@@ -88,6 +88,9 @@ pub trait DataStore {
 	/// is 0, or the oldest waiting item alone is larger than `max_bytes`. Otherwise the
 	/// returned [`Items`] holds at least one item.
 	///
+	/// An item is checked when it is appended, and what is fetched is what was stored: each
+	/// item's text is the JSON its `append` serialized, and is not parsed again.
+	///
 	/// Fetching deletes nothing, but the items handed out are not returned by another
 	/// fetch until their `Items` is released, so consecutive fetches never return the same
 	/// item. Pass the `Items` to [`remove`](Self::remove) once its items are delivered, or

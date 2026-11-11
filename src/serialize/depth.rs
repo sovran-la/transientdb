@@ -38,7 +38,7 @@ impl<'a> Children<'a> {
 
 /// Whether `value` is nested more than `limit` levels deep. Walks it without recursion,
 /// keeping at most `limit + 1` levels, and stops at the first level past `limit`.
-pub(crate) fn nested_deeper_than(value: &Value, limit: usize) -> bool {
+fn nested_deeper_than(value: &Value, limit: usize) -> bool {
 	let mut levels: Vec<Children> = Children::of(value).into_iter().collect();
 	while levels.len() <= limit {
 		let Some(level) = levels.last_mut() else {

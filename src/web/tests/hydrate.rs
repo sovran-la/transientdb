@@ -1,6 +1,7 @@
-//! Opening a store over what an earlier one stored: records this store would not have
-//! accepted are discarded, deleted from IndexedDB and logged, and if more items are stored
-//! than `max_items` allows, the oldest are dropped. Nothing else is touched.
+//! Opening a store over what an earlier one stored: records that are not items, and items
+//! larger than `max_item_size`, are discarded, deleted from IndexedDB and logged, and if
+//! more items are stored than `max_items` allows, the oldest are dropped. Nothing else is
+//! touched: an item's text is not parsed again.
 
 use super::schema::add_raw;
 use super::*;
@@ -103,6 +104,8 @@ async fn test_both_limits_lowered_at_once() {
 	settle().await;
 }
 
+/// Records without the record shape are discarded; records with it are kept, whatever
+/// their text, as an item's text was checked when it was appended.
 #[wasm_bindgen_test]
 async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reused() {
 	let db_name = "test-hydrate-not-items";
@@ -136,28 +139,34 @@ async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reus
 
 	let mut reopened = WebStore::new(config(db_name, 4096, 1000)).await;
 	assert!(reopened.is_persisted());
-	let valid = vec![json!({"n": u64::MAX}), json!(42.0)];
-	assert_exact(&queued(&reopened), &valid);
-	assert_eq!(
-		stored(&reopened)
-			.iter()
-			.map(|(seq, _)| *seq)
-			.collect::<Vec<_>>(),
-		[1, 8]
-	);
-	// A discarded record's sequence number still counts: 30 is never given out again.
+	let kept: Vec<(u64, String)> = [
+		(1, json!({"n": u64::MAX}).to_string()),
+		(5, "not json".to_string()),
+		(6, String::new()),
+		(7, "{\"a\":1} trailing".to_string()),
+		(8, "42.0".to_string()),
+		(9, too_deep),
+		(30, "[1,".to_string()),
+	]
+	.into();
+	assert_eq!(stored(&reopened), kept);
+	// The JSON ones read back exactly.
+	let fetched = reopened.fetch(1, 4096).unwrap().unwrap();
+	assert_exact(&fetched.values(), &[json!({"n": u64::MAX})]);
+	drop(fetched);
+	// A discarded record's sequence number still counts: 30 is the highest kept, and 31
+	// on is never given out to an existing record.
 	assert_eq!(reopened.queue.next_seq, 31);
 	// Everything discarded was deleted.
 	assert_eq!(flushed(&reopened).await, stored(&reopened));
-	assert_eq!(records(db_name).await.len(), 2);
+	assert_eq!(records(db_name).await.len(), kept.len());
 
 	reopened.append(json!("new")).unwrap();
 	assert_eq!(reopened.queue.items.back().unwrap().seq, 31);
 	settle().await;
-	assert_exact(
-		&hydrated(db_name).await,
-		&[valid, vec![json!("new")]].concat(),
-	);
+	let again = WebStore::new(config(db_name, 4096, 1000)).await;
+	let new = (31, json!("new").to_string());
+	assert_eq!(stored(&again), [kept, vec![new]].concat());
 	reopened.reset();
 	settle().await;
 	assert!(idb::read_all(&db).await.unwrap().is_empty());

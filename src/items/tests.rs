@@ -3,11 +3,17 @@ use crate::item_samples::{assert_exact, awkward_items};
 use serde_json::json;
 
 fn items_of(values: &[Value]) -> (Ledger, Items) {
+	let texts: Vec<String> = values.iter().map(Value::to_string).collect();
+	items_of_texts(&texts)
+}
+
+/// An `Items` holding `texts` as stored, whatever they are.
+fn items_of_texts(texts: &[impl AsRef<str>]) -> (Ledger, Items) {
 	let ledger = Ledger::new();
-	let entries: Vec<(u64, String)> = values
+	let entries: Vec<(u64, String)> = texts
 		.iter()
 		.enumerate()
-		.map(|(i, v)| (i as u64 + 1, v.to_string()))
+		.map(|(i, t)| (i as u64 + 1, t.as_ref().to_string()))
 		.collect();
 	{
 		let mut claims = ledger.lock();
@@ -43,6 +49,76 @@ fn test_views_of_awkward_items_are_exact() {
 	let parsed: Vec<Value> = serde_json::from_str(&items.json()).unwrap();
 	assert_exact(&parsed, &values);
 	assert_eq!(items.json().len(), items.byte_len() + values.len() - 1 + 2);
+}
+
+#[test]
+fn test_text_that_is_not_json_is_passed_through_and_given_as_a_string() {
+	let bad = [
+		"",
+		" ",
+		"not json",
+		"[1,2,",
+		"{\"a\":1} trailing",
+		"'s'",
+		"1 2",
+		"{",
+		"\"open",
+	];
+	for text in bad {
+		assert!(serde_json::from_str::<Value>(text).is_err(), "{text:?}");
+		let (_, items) = items_of_texts(&[r#"{"a":1}"#, text, "[3]"]);
+		assert_eq!(items.len(), 3);
+		assert_eq!(items.byte_len(), 7 + text.len() + 3);
+		assert_eq!(
+			items.iter().collect::<Vec<_>>(),
+			[r#"{"a":1}"#, text, "[3]"],
+			"{text:?}"
+		);
+		assert_eq!(
+			items.json(),
+			format!(r#"[{{"a":1}},{text},[3]]"#),
+			"{text:?}"
+		);
+		assert_eq!(
+			items.values(),
+			vec![json!({"a": 1}), Value::String(text.to_string()), json!([3])],
+			"{text:?}"
+		);
+	}
+}
+
+#[test]
+fn test_every_item_not_json_is_given_as_a_string_and_the_rest_parsed() {
+	let (_, items) = items_of_texts(&["oops", "2", "[", "\"three\"", "}"]);
+	assert_eq!(
+		items.values(),
+		vec![
+			json!("oops"),
+			json!(2),
+			json!("["),
+			json!("three"),
+			json!("}")
+		]
+	);
+	let (_, items) = items_of_texts(&["nope"]);
+	assert_eq!(items.values(), vec![json!("nope")]);
+	assert_eq!(items.json(), "[nope]");
+}
+
+#[test]
+fn test_text_too_deep_to_parse_is_given_as_a_string_without_overflowing() {
+	// Within what `serde_json` reads: parsed, although deeper than `append` allows.
+	let depth = crate::serialize::MAX_ITEM_DEPTH + 1;
+	let parsable = "[".repeat(depth) + &"]".repeat(depth);
+	// Far past it: `serde_json` refuses it instead of recursing.
+	let deepest = "[".repeat(100_000) + &"]".repeat(100_000);
+	let (_, items) = items_of_texts(&[parsable.as_str(), deepest.as_str(), "1"]);
+	let values = items.values();
+	assert_eq!(values[0].to_string(), parsable);
+	assert_eq!(values[1], Value::String(deepest.clone()));
+	assert_eq!(values[2], json!(1));
+	assert_eq!(items.json(), format!("[{parsable},{deepest},1]"));
+	assert_eq!(items.iter().nth(1), Some(deepest.as_str()));
 }
 
 #[test]

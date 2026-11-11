@@ -16,6 +16,7 @@ mod isolation;
 mod persistence;
 mod reopen;
 mod schema;
+mod stored_text;
 mod support;
 mod upgrade;
 mod write_failure;

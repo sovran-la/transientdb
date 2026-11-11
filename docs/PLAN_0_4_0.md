@@ -44,7 +44,9 @@ Their definitions and behavior are in the FileStore spec, in the sections
   released. `remove` takes the `Items` by value. Dropping an `Items` releases
   it; `release()` is the explicit form. Pending is kept in memory only.
 - `Items` offers `len`, `byte_len`, `json`, `values`, `iter` and `release`, and
-  none of them can fail. Every item in an `Items` is well-formed JSON text.
+  none of them can fail.
+- An item is checked when it is appended; what is fetched is what was stored.
+  No store parses an item's JSON again when it reads the item back.
 - `has_data` is true only if a fetch could return something.
 - `max_bytes` counts item bytes only.
 - A store that is full drops its oldest item on append. This is not
