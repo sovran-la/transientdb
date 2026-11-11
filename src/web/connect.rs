@@ -6,12 +6,15 @@
 //! - The store's connection closes itself as soon as a newer version, or a delete, of
 //!   its database is requested elsewhere (`versionchange`). The store then keeps working
 //!   in memory only.
-//! - Opening gives up as soon as the open is `blocked` by a connection that does not
-//!   close, such as a page loaded before a deploy that raised [`DB_VERSION`]: such a page
-//!   holds its connection until it goes away, so waiting would only hang the caller. The
-//!   store then works in memory only. The abandoned request is left harmless: if it later
-//!   gets to upgrade, the upgrade is aborted, so the database stays exactly as it was for
-//!   the next open; if it ever succeeds, the connection is closed at once.
+//! - Opening gives up if it is still `blocked` after a short wait ([`BLOCKED_GRACE_MS`]).
+//!   The wait lets a connection that is already closing finish: `close()` takes effect
+//!   only once that connection's running transactions are done, and until then it blocks
+//!   the upgrade. A connection that does not close, such as a page loaded before a deploy
+//!   that raised [`DB_VERSION`], holds the database until that page goes away, so waiting
+//!   longer would only hang the caller. The store then works in memory only. The
+//!   abandoned request is left harmless: if it later gets to upgrade, the upgrade is
+//!   aborted, so the database stays exactly as it was for the next open; if it ever
+//!   succeeds, the connection is closed at once.
 
 use super::idb::{js_error, result_of, DB_VERSION, KEY_PATH, STORE_NAME};
 use std::cell::{Cell, RefCell};
@@ -23,6 +26,10 @@ use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest};
 fn warn(message: &str) {
 	web_sys::console::warn_1(&message.into());
 }
+
+/// How long `open` still waits for `success` once the open is `blocked`, before it gives
+/// up: long enough for a closing connection's last transactions to commit.
+pub(super) const BLOCKED_GRACE_MS: i32 = 1000;
 
 /// `Some` until `open` has its answer: success, failure, or giving up when blocked.
 type Waiting = Rc<RefCell<Option<futures_channel::oneshot::Sender<Result<()>>>>>;
@@ -37,7 +44,8 @@ fn answer(waiting: &Waiting, outcome: Result<()>) -> bool {
 ///
 /// Upgrading from an older version deletes every object store it has and creates the
 /// current one empty: old records are discarded, not migrated. Fails, instead of
-/// waiting, if another connection blocks the upgrade.
+/// waiting any longer, if another connection still blocks the upgrade
+/// [`BLOCKED_GRACE_MS`] after `blocked`.
 pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 	let window = web_sys::window().ok_or_else(|| Error::other("No window object"))?;
 	let factory = window
@@ -54,14 +62,20 @@ pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 	let on_blocked = Closure::once({
 		let waiting = waiting.clone();
 		move |_event: web_sys::Event| {
-			warn(
-				"IndexedDB upgrade blocked: another page holds the database open at an older \
-				 version. Using memory-only storage.",
-			);
-			answer(
-				&waiting,
-				Err(Error::other("blocked by an open older version")),
-			);
+			// `success`, or `error`, answers first if the blocking connection closes in time.
+			wasm_bindgen_futures::spawn_local(async move {
+				delay(BLOCKED_GRACE_MS).await;
+				let gave_up = answer(
+					&waiting,
+					Err(Error::other("blocked by an open older version")),
+				);
+				if gave_up {
+					warn(
+						"IndexedDB upgrade blocked: another page holds the database open at an \
+						 older version. Using memory-only storage.",
+					);
+				}
+			});
 		}
 	});
 	let on_upgrade = Closure::once({
@@ -106,6 +120,22 @@ pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 	let outcome = receiver.await;
 	outcome.unwrap_or_else(|_| Err(Error::other("Channel closed")))?;
 	result_of(&request)
+}
+
+/// Resolves after `ms` milliseconds, on a browser timer; at once if there is none.
+///
+/// A `setTimeout` promise rather than a `Closure`, so it adds no closure shape for
+/// wasm-bindgen to export (see the note on `settle` in `tests/common/mod.rs`).
+async fn delay(ms: i32) {
+	let timer = js_sys::Promise::new(&mut |resolve, _reject| {
+		let set = web_sys::window()
+			.map(|w| w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms));
+		if !matches!(set, Some(Ok(_))) {
+			let _ = resolve.call0(&JsValue::UNDEFINED);
+		}
+	});
+	// The promise only ever resolves.
+	let _ = wasm_bindgen_futures::JsFuture::from(timer).await;
 }
 
 /// Attaches the open request's handlers, which live as long as the page: the request

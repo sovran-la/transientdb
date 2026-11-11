@@ -45,6 +45,41 @@ async fn open_at(db_name: &'static str, version: u32) -> IdbDatabase {
 	idb::await_request::<IdbDatabase>(&request).await.unwrap()
 }
 
+/// Every record in `db`, read in a transaction that has finished by the time this
+/// returns, so that closing `db` afterwards takes effect at once.
+async fn read_all_finished(db: &IdbDatabase) -> Vec<Value> {
+	let transaction = db.transaction_with_str(idb::STORE_NAME).unwrap();
+	let finished = idb::completion(&transaction);
+	let request = transaction
+		.object_store(idb::STORE_NAME)
+		.unwrap()
+		.get_all()
+		.unwrap();
+	let records = idb::await_request::<js_sys::Array>(&request).await.unwrap();
+	finished.await.unwrap();
+	let json = |r: JsValue| js_sys::JSON::stringify(&r).unwrap().as_string().unwrap();
+	records
+		.iter()
+		.map(|r| serde_json::from_str(&json(r)).unwrap())
+		.collect()
+}
+
+/// A store opened now, while nothing else holds `db_name` open, upgrades it as usual:
+/// persisted, at the current version, and empty.
+async fn assert_opens_upgraded(db_name: &str) {
+	let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(store.is_persisted());
+	assert_eq!(
+		store.db.as_ref().unwrap().version(),
+		f64::from(idb::DB_VERSION)
+	);
+	assert!(!store.has_data());
+	append_all(&mut store, &tagged(0..2));
+	assert_eq!(flushed(&store).await, stored(&store));
+	store.reset();
+	settle().await;
+}
+
 /// `store` still does everything, in memory: it keeps what it holds, and fetches,
 /// removes and resets.
 fn assert_works_in_memory(store: &mut WebStore, held: Vec<Value>) {
@@ -84,23 +119,53 @@ async fn test_open_gives_up_while_an_older_version_is_held_open() {
 	let after = idb::await_request::<IdbDatabase>(&request).await.unwrap();
 	assert_eq!(after.version(), f64::from(idb::DB_VERSION - 1));
 	assert_eq!(
-		idb::read_all(&after).await.unwrap(),
+		read_all_finished(&after).await,
 		vec![json!({"key": 0, "value": "old"})]
 	);
 	after.close();
 
 	// A store opened now upgrades it as usual.
-	let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
-	assert!(store.is_persisted());
-	assert_eq!(
-		store.db.as_ref().unwrap().version(),
-		f64::from(idb::DB_VERSION)
-	);
-	assert!(!store.has_data());
-	append_all(&mut store, &tagged(0..2));
-	assert_eq!(flushed(&store).await, stored(&store));
-	store.reset();
-	settle().await;
+	assert_opens_upgraded(db_name).await;
+}
+
+/// The older page has closed its connection, but the close is still waiting for that
+/// page's last write to commit, which blocks the upgrade until it has. Opening waits for
+/// that, instead of taking it for a page that holds the database open.
+#[wasm_bindgen_test]
+async fn test_open_waits_for_a_connection_that_is_closing() {
+	let db_name = "test-upgrade-closing";
+	delete_database(db_name).await;
+	let old = open_at(db_name, idb::DB_VERSION - 1).await;
+	let transaction = old
+		.transaction_with_str_and_mode(idb::STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
+		.unwrap();
+	let records = transaction.object_store(idb::STORE_NAME).unwrap();
+	for key in 0..2000 {
+		let record = js_sys::JSON::parse(&json!({"key": key, "value": "old"}).to_string());
+		records.put(&record.unwrap()).unwrap();
+	}
+	old.close();
+
+	assert_opens_upgraded(db_name).await;
+}
+
+/// The older page closes its connection soon after the open is blocked by it: opening
+/// still succeeds, with that open's own connection.
+#[wasm_bindgen_test]
+async fn test_open_succeeds_when_the_holder_closes_during_the_wait() {
+	let db_name = "test-upgrade-closes-soon";
+	delete_database(db_name).await;
+	let old = open_at(db_name, idb::DB_VERSION - 1).await;
+	add_raw(&old, &[json!({"key": 0, "value": "old"})]).await;
+	wasm_bindgen_futures::spawn_local(async move {
+		// About 300 ms in: after `new` is blocked, well within its wait.
+		for _ in 0..3 {
+			settle().await;
+		}
+		old.close();
+	});
+
+	assert_opens_upgraded(db_name).await;
 }
 
 /// Another page asks for a newer version while a store is open. The store closes its

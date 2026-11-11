@@ -102,13 +102,16 @@ pub enum PersistenceState {
 ///
 /// - If another page holds the database open at an older version and does not close it
 ///   (a page loaded before a deploy that brought a newer version of this store), opening
-///   gives up at once instead of waiting for that page to go away. The store starts in
-///   memory-only mode and logs a warning. The database is left as it was, to be upgraded
-///   by the next store opened once that page is gone.
+///   gives up after a short wait (about a second) instead of waiting for that page to go
+///   away. The store starts in memory-only mode and logs a warning. The database is left
+///   as it was, to be upgraded by the next store opened once that page is gone. A
+///   connection that is only finishing its last writes before it closes is waited for,
+///   and the store opens normally.
 /// - If another page asks for a newer version of the database, or deletes it, this
 ///   store closes its connection at once and carries on in memory-only mode, with every
 ///   item it holds, and logs a warning. Its items stored in IndexedDB stay there for the
-///   newer version to deal with; nothing it does from then on is written.
+///   newer version to deal with; nothing it does from then on is written, so the items it
+///   removes afterwards stay there too.
 ///
 /// So [`persistence_state()`](Self::persistence_state) can change from `Persisted` to
 /// `MemoryOnly` while the store is in use, but never back.
