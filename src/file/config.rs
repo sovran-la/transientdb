@@ -37,8 +37,10 @@ pub struct FileConfig {
 	/// it goes through a symbolic link to a missing directory: then `append`, `fetch` and
 	/// `remove` return [`Error::Io`](crate::Error) (kind `InvalidInput`) naming the link,
 	/// `has_data` is false and `reset` does nothing, and nothing is created, until that
-	/// directory is back. Two stores in one process must not use one file, however its
-	/// path is spelled: the second does nothing until the first is dropped.
+	/// directory is back. Two stores in one process must not use one file: the second
+	/// does nothing until the first is dropped. That holds whether the second's path is
+	/// spelled the same, relative, through `..` or through a symbolic link; a hard link
+	/// is a different path to the file, and two stores on two such paths are not stopped.
 	pub path: PathBuf,
 	/// Whose data this is: a write key, for example. It is recorded in the file, and a
 	/// file recorded under a different id is discarded at open. 1 to 224 bytes.

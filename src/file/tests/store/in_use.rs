@@ -1,5 +1,6 @@
-//! One store per file in a process: a second store on a path the first holds, however it
-//! is spelled, is created but does nothing, until the first is dropped.
+//! One store per file in a process: a second store on a path the first holds, spelled the
+//! same, relative or through a symbolic link, is created but does nothing, until the first
+//! is dropped.
 
 use super::*;
 use crate::contract::{append_all, available, tagged};
