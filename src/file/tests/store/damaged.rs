@@ -77,8 +77,8 @@ fn test_a_damaged_item_is_freed_and_skipped_and_does_not_count() {
 
 #[test]
 fn test_a_store_whose_only_items_are_damaged_hands_out_nothing() {
-	// `has_data` is true until a fetch finds the damage (spec differs, W2-R4): no
-	// payload is read before a fetch, in the store that wrote them or in the next one.
+	// `has_data` is true until a fetch finds the damage: no payload is read before a
+	// fetch, in the store that wrote them or in the next one.
 	for reopen in [false, true] {
 		let (_dir, path) = temp_path();
 		let mut store = store(&path, 100);

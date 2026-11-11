@@ -289,6 +289,10 @@ impl DataStore for FileStore {
 
 	/// Whether a fetch could return something. False while another store in this
 	/// process is using the file, or while the file cannot be opened.
+	///
+	/// No item is read for this, so a damaged item counts until a fetch finds it and
+	/// frees it: a store whose only items are damaged has data until its next fetch,
+	/// which returns `None`.
 	fn has_data(&self) -> bool {
 		let mut state = self.state();
 		let Ok(core) = ready(&mut state, &self.config, &self.hook) else {
