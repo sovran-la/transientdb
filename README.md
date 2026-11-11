@@ -257,7 +257,7 @@ For a service that rejects request bodies over some size, pass a `max_bytes` tha
 - Ideal for apps that must not lose queued data when they are killed or suspended
 
 **FileConfig:**
-- `path`: The store's file. Its parent directory is created if missing, unless the path goes through a symbolic link to a missing directory: then every call returns `Error::Io` (kind `InvalidInput`) naming the link, and nothing is created, until that directory is back
+- `path`: The store's file. Its parent directory is created if missing, unless the path goes through a symbolic link to a missing directory: then `append`, `fetch` and `remove` return `Error::Io` (kind `InvalidInput`) naming the link, `has_data` is false and `reset` does nothing, and nothing is created, until that directory is back
 - `id`: Whose data this is (a write key, for example), 1 to 224 bytes. It is recorded in the file, and a file recorded under a different id is discarded when opened
 - `max_item_size`: Largest item, in bytes. This is the size of every slot in the file, so changing it discards the file
 - `max_items`: Most items held. It can change between runs: raised, the file may grow further; lowered, the oldest items beyond it are dropped when the file is opened
