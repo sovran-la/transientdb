@@ -29,8 +29,9 @@ fn warn(message: &str) {
 	web_sys::console::warn_1(&message.into());
 }
 
-/// How long `open` still waits for `success` once the open is `blocked`, before it gives
-/// up: long enough for a closing connection's last transactions to commit.
+/// How long `open` waits, once it is `blocked`, for the upgrade to start before it gives
+/// up: long enough for a closing connection's last transactions to commit. Once the
+/// upgrade has started, `open` waits for its `success` or `error`.
 pub(super) const BLOCKED_GRACE_MS: i32 = 1000;
 
 /// `Some` until `open` has its answer: success, failure, or giving up when blocked.

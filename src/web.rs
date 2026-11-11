@@ -245,10 +245,13 @@ impl DataStore for WebStore {
 	/// # Errors
 	/// [`Error::ItemTooDeep`](crate::Error) or [`Error::ItemTooLarge`](crate::Error),
 	/// changing nothing and writing nothing, as described on [`DataStore::append`]. An
-	/// `Io` error, changing nothing, if the store has used up its sequence numbers (after
-	/// 2^53 - 1 appends, the most an IndexedDB number key holds exactly): they never wrap,
-	/// so no two items can share one. A failed IndexedDB write is not an error; it is
-	/// logged, and the item is still queued in memory.
+	/// `Io` error, changing nothing, once the store has used up its sequence numbers: they
+	/// never wrap, so no two items can share one. That takes 2^53 - 1 appends (the most an
+	/// IndexedDB number key holds exactly), or none if the database held a record numbered
+	/// that high when the store opened (only possible if something else wrote it). It
+	/// lasts until the record is gone (`reset` deletes it) and the store is opened again,
+	/// as on a page reload. A failed IndexedDB write is not an error; it is logged, and the
+	/// item is still queued in memory.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let text = serialize::item_text(data, self.config.max_item_size)?;
 		let (seq, dropped) = self.queue.push(text.clone())?;
