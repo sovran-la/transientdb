@@ -116,21 +116,18 @@ fn test_a_store_without_its_file_rejects_a_too_deep_item_without_overflowing() {
 	});
 }
 
-/// The child overflows its stack, which aborts it: the parent fails, and nothing else.
+/// The child exits with a failure before its test can finish, as it does when it aborts:
+/// the parent fails, and nothing else. A plain exit, not a real abort, so that no run
+/// leaves a crash report behind; the deep-item test above aborts its child if the bug it
+/// guards against comes back.
 #[test]
 #[should_panic(expected = "failed in its own process")]
-fn test_an_isolated_test_that_aborts_fails_without_aborting_the_rest() {
+fn test_an_isolated_test_whose_process_exits_with_a_failure_fails() {
 	let test = concat!(
 		module_path!(),
-		"::test_an_isolated_test_that_aborts_fails_without_aborting_the_rest"
+		"::test_an_isolated_test_whose_process_exits_with_a_failure_fails"
 	);
-	isolated(test, || {
-		drop(crate::serialize::nested(
-			1_000_000,
-			crate::serialize::Shape::Arrays,
-			json!(0),
-		))
-	});
+	isolated(test, || std::process::exit(1));
 }
 
 /// A name that matches no test runs nothing in the child, which is not a pass.

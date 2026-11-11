@@ -133,6 +133,7 @@ async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reus
 			json!({"seq": 9_007_199_254_740_992u64, "text": "\"past MAX_SEQ\""}),
 			json!({"seq": "text key", "text": "\"string key\""}),
 			json!({"seq": 30, "text": "[1,"}),
+			json!({"seq": 35, "text": 42}),
 		],
 	)
 	.await;
@@ -154,18 +155,18 @@ async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reus
 	let fetched = reopened.fetch(1, 4096).unwrap().unwrap();
 	assert_exact(&fetched.values(), &[json!({"n": u64::MAX})]);
 	drop(fetched);
-	// A discarded record's sequence number still counts: 30 is the highest kept, and 31
-	// on is never given out to an existing record.
-	assert_eq!(reopened.queue.next_seq, 31);
+	// A discarded record's sequence number still counts: 35, discarded, is above every
+	// kept one, and is never given out again.
+	assert_eq!(reopened.queue.next_seq, 36);
 	// Everything discarded was deleted.
 	assert_eq!(flushed(&reopened).await, stored(&reopened));
 	assert_eq!(records(db_name).await.len(), kept.len());
 
 	reopened.append(json!("new")).unwrap();
-	assert_eq!(reopened.queue.items.back().unwrap().seq, 31);
+	assert_eq!(reopened.queue.items.back().unwrap().seq, 36);
 	settle().await;
 	let again = WebStore::new(config(db_name, 4096, 1000)).await;
-	let new = (31, json!("new").to_string());
+	let new = (36, json!("new").to_string());
 	assert_eq!(stored(&again), [kept, vec![new]].concat());
 	reopened.reset();
 	settle().await;

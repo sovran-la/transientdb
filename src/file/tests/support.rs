@@ -139,6 +139,11 @@ const ISOLATED_TEST: &str = "TRANSIENTDB_ISOLATED_TEST";
 /// child process running only that test, and fails if the child does not pass it. A
 /// stack overflow aborts a whole process, so a test that would overflow on a regression
 /// fails on its own instead of taking the rest of the test binary with it.
+///
+/// `test` is typed by hand, so it must be the calling test's own name. A name that
+/// matches no test runs nothing in the child, and fails. But a test copied from another
+/// that keeps the original's name runs the original in the child, which passes, so the
+/// copy passes without its own body ever running.
 pub(crate) fn isolated(test: &str, body: impl FnOnce()) {
 	let name = test.split_once("::").map_or(test, |(_, name)| name);
 	if std::env::var(ISOLATED_TEST).as_deref() == Ok(name) {
