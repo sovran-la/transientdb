@@ -24,6 +24,9 @@ fn test_items_fetched_on_one_thread_are_removed_on_another() {
 			}
 		})
 	};
+	// Every batch is fetched before any is handled; otherwise releasing batch 1 before
+	// the third fetch would hand items 2 and 3 out again. The channel holds them meanwhile.
+	fetcher.join().unwrap();
 	let remover = {
 		let store = Arc::clone(&store);
 		thread::spawn(move || {
@@ -36,7 +39,6 @@ fn test_items_fetched_on_one_thread_are_removed_on_another() {
 			}
 		})
 	};
-	fetcher.join().unwrap();
 	remover.join().unwrap();
 	let mut store = Arc::try_unwrap(store).ok().unwrap().into_inner().unwrap();
 	assert_eq!(stored(&mut store), tagged(2..4));
