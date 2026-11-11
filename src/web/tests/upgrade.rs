@@ -172,8 +172,13 @@ async fn test_open_succeeds_when_the_holder_closes_during_the_wait() {
 /// upgrade, which has a lot of old data to delete, is still committing when it does:
 /// opening uses that upgrade instead of giving up on a database it has just upgraded.
 ///
-/// Whether the commit spans the end of the wait depends on timing, so this cannot pass
-/// by mistake but need not catch a regression on every run.
+/// Timers are not exact, and the upgrade starts only some time after the close, so it
+/// may start after the wait has run out instead. Then the store rightly gives up, and
+/// its upgrade, when it gets to start, is aborted. Either way the store is persisted if
+/// and only if the database ended up at the current version: if it is, the old records
+/// are gone; if it is not, the database is still at the older version with its old
+/// records intact. A store that gives up on a database it has just upgraded fails this
+/// whenever the upgrade starts in time, which is on most runs but not on every one.
 #[wasm_bindgen_test]
 async fn test_open_uses_an_upgrade_that_started_before_the_wait_ran_out() {
 	let db_name = "test-upgrade-late-close";
@@ -203,12 +208,27 @@ async fn test_open_uses_an_upgrade_that_started_before_the_wait_ran_out() {
 	let request = factory().open(db_name).unwrap();
 	let after = idb::await_request::<IdbDatabase>(&request).await.unwrap();
 	let version = after.version();
+	let held = read_all_finished(&after).await;
 	after.close();
-	assert_eq!(version, f64::from(idb::DB_VERSION));
-	assert!(
-		persisted,
-		"the store gave up on the database it had just upgraded"
-	);
+	if persisted {
+		assert_eq!(
+			version,
+			f64::from(idb::DB_VERSION),
+			"the store is persisted on a database that was not upgraded"
+		);
+		assert_eq!(held, Vec::<Value>::new());
+	} else {
+		assert_ne!(
+			version,
+			f64::from(idb::DB_VERSION),
+			"the store gave up on the database it had just upgraded"
+		);
+		assert_eq!(version, f64::from(idb::DB_VERSION - 1));
+		assert!(
+			held == records,
+			"the abandoned upgrade changed the old records"
+		);
+	}
 	delete_database(db_name).await;
 }
 
