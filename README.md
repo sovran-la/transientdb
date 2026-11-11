@@ -162,7 +162,7 @@ use transientdb::{FileConfig, FileStore, TransientDB};
 /// (not a temporary or cache directory; see "Where to put the file" below).
 fn open_queue(data_dir: &Path) -> TransientDB {
     TransientDB::new(FileStore::new(FileConfig {
-        path: data_dir.join("events.tdb"), // its parent directory is created if missing
+        path: data_dir.join("events.tdb"), // parent directory created if missing; see below
         id: "my-write-key".into(),         // whose data this is
         max_item_size: 8 * 1024,
         max_items: 2560,
@@ -257,7 +257,7 @@ For a service that rejects request bodies over some size, pass a `max_bytes` tha
 - Ideal for apps that must not lose queued data when they are killed or suspended
 
 **FileConfig:**
-- `path`: The store's file. Its parent directory is created if missing
+- `path`: The store's file. Its parent directory is created if missing, unless it is a symbolic link to a missing directory: then every call returns `Error::Io` (kind `InvalidInput`) naming the link, and nothing is created where the link points, until that directory is back
 - `id`: Whose data this is (a write key, for example), 1 to 224 bytes. It is recorded in the file, and a file recorded under a different id is discarded when opened
 - `max_item_size`: Largest item, in bytes. This is the size of every slot in the file, so changing it discards the file
 - `max_items`: Most items held. It can change between runs: raised, the file may grow further; lowered, the oldest items beyond it are dropped when the file is opened
@@ -347,9 +347,9 @@ What `Io` means for FileStore, operation by operation:
 - `fetch`: nothing is handed out; a later fetch returns the same items.
 - `remove`: every item is tried; those that could not be deleted stay stored and are fetched again.
 
-MemoryStore never returns `InUse` or `Io`: each item takes the next of its `u64` sequence numbers, which at one append per nanosecond last more than 580 years. WebStore never returns `InUse`, and returns `Io`, storing nothing, only once it has used up its sequence numbers, which takes 2^53 - 1 appends (the most an IndexedDB number key holds exactly); retrying does not help.
+MemoryStore never returns `InUse` or `Io`: each item takes the next of its `u64` sequence numbers, which at one append per nanosecond last more than 580 years. WebStore never returns `InUse`, and returns `Io`, storing nothing, only once it has used up its sequence numbers: after 2^53 - 1 appends (the most an IndexedDB number key holds exactly), or at once (or within a few appends) if the database holds a record numbered at or near that limit, which only something else writing to the database could put there. Retrying does not help. The next number is set only when the store opens, above every record in the database, and `reset()` clears the database without rewinding it, so this lasts until such a record is gone from the database (`reset()` deletes it) and the page is reloaded.
 
-Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. FileStore logs each of these, every item a full store drops included. MemoryStore and WebStore drop the oldest item without logging it; WebStore logs what it discards when it opens, and each fall back to memory-only mode.
+Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. FileStore logs each of these, every item a full store drops included. MemoryStore and WebStore drop the oldest item without logging it; WebStore logs what it discards when it opens, and each fallback to memory-only mode.
 
 ```rust
 use serde_json::Value;

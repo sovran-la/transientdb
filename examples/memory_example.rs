@@ -2,6 +2,14 @@ use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 use transientdb::{Error, MemoryConfig, MemoryStore, Result, TransientDB};
 
+/// "1 event", "2 events".
+fn event_count(count: usize) -> String {
+	match count {
+		1 => "1 event".to_string(),
+		_ => format!("{count} events"),
+	}
+}
+
 fn memory_store_example() -> Result<()> {
 	// Create a memory store configuration.
 	let config = MemoryConfig {
@@ -53,8 +61,8 @@ fn memory_store_example() -> Result<()> {
 		// Pretend the second request fails.
 		if attempt == 2 {
 			println!(
-				"Sending {} events failed; keeping them for a retry",
-				items.len()
+				"Sending {} failed; keeping them for a retry",
+				event_count(items.len())
 			);
 			// Releasing gives them back: the next fetch returns them, in order. Dropping
 			// `items` does the same.
@@ -62,7 +70,7 @@ fn memory_store_example() -> Result<()> {
 			continue;
 		}
 
-		println!("Sending {} events: {body}", items.len());
+		println!("Sending {}: {body}", event_count(items.len()));
 		sent += items.len();
 		// After a successful send, remove the fetched items.
 		db.remove(items)?;

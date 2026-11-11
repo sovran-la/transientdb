@@ -56,6 +56,14 @@ mod native {
 		}
 	}
 
+	/// "1 event", "2 events".
+	fn event_count(count: usize) -> String {
+		match count {
+			1 => "1 event".to_string(),
+			_ => format!("{count} events"),
+		}
+	}
+
 	/// Sends what is queued, one request per fetch, until nothing is left or a request fails.
 	/// Returns how many events were sent.
 	fn flush(db: &TransientDB, online: bool) -> Result<usize> {
@@ -74,7 +82,7 @@ mod native {
 					db.remove(items)?;
 				}
 				Err(reason) => {
-					println!("  could not send {} events: {reason}", items.len());
+					println!("  could not send {}: {reason}", event_count(items.len()));
 					// Give them back: a later fetch returns them, in order. Dropping `items`
 					// does the same. Stop here, or the next fetch would hand them straight back.
 					items.release();
@@ -128,8 +136,9 @@ mod native {
 				Some(json!("/product/0")),
 				"the events of a failed send should be fetched again, first"
 			);
-			drop(retry); // dropping an `Items` gives its events back too
-			    // The app quits here, with five events queued.
+			// Dropping an `Items` gives its events back too.
+			drop(retry);
+			// The app quits here, with five events queued.
 		}
 
 		println!("Second run, online:");
