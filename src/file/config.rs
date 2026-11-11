@@ -34,11 +34,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileConfig {
 	/// The store's file. Its parent directory is created if missing, unless the path to
-	/// it goes through a symbolic link to a missing directory: then every call returns
-	/// [`Error::Io`](crate::Error) (kind `InvalidInput`) naming the link, and nothing is
-	/// created, until that directory is back. Two stores in one process must not use one
-	/// file, however its path is spelled: the second does nothing until the first is
-	/// dropped.
+	/// it goes through a symbolic link to a missing directory: then `append`, `fetch` and
+	/// `remove` return [`Error::Io`](crate::Error) (kind `InvalidInput`) naming the link,
+	/// `has_data` is false and `reset` does nothing, and nothing is created, until that
+	/// directory is back. Two stores in one process must not use one file, however its
+	/// path is spelled: the second does nothing until the first is dropped.
 	pub path: PathBuf,
 	/// Whose data this is: a write key, for example. It is recorded in the file, and a
 	/// file recorded under a different id is discarded at open. 1 to 224 bytes.
