@@ -5,10 +5,14 @@ use std::path::PathBuf;
 
 /// Configuration for a [`FileStore`](crate::FileStore).
 ///
-/// The file is never larger than `256 + (32 + max_item_size) * max_items` bytes, and is
-/// only as large as the queue has been deep: with `max_item_size = 8192` and
+/// The file is a 256 byte header and one `32 + max_item_size` byte slot per item at the
+/// queue's deepest since the file was last cut back to its header, which removing the
+/// last item does. So while `max_items` stays the same the file is never larger than
+/// `256 + (32 + max_item_size) * max_items` bytes: with `max_item_size = 8192` and
 /// `max_items = 2560` it may reach 21,053,696 bytes, but a queue never more than 50
-/// items deep keeps it at 411,456.
+/// items deep keeps it at 411,456. Lowering `max_items` drops items but does not shrink
+/// the file, so until it is next emptied the bound is that of the largest `max_items` it
+/// has been opened with since it was last emptied.
 ///
 /// Put the file somewhere the OS keeps while the app is suspended: not in a temporary
 /// or cache directory, preferably in the app's own container, and with a
@@ -43,7 +47,8 @@ pub struct FileConfig {
 	pub max_item_size: usize,
 	/// The most items the store holds at once. Appending past it drops the oldest item,
 	/// fetched or not. It can change between runs: lowered, the oldest items beyond it
-	/// are dropped when the file is opened. Must not be 0.
+	/// are dropped when the file is opened, and the file keeps its length until it is
+	/// next emptied. Must not be 0.
 	pub max_items: usize,
 }
 

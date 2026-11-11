@@ -2,6 +2,7 @@
 
 use super::support::*;
 use crate::file::faults::Op;
+use crate::file::layout::HEADER_LEN;
 
 #[test]
 fn test_a_full_store_drops_the_oldest_into_its_slot() {
@@ -140,4 +141,43 @@ fn test_max_items_raised_between_runs_lets_the_file_grow() {
 	assert_eq!(file_len(&path), len_of(5));
 	let expected: Vec<String> = (2..=6).map(|t| item(6, t)).collect();
 	assert_eq!(texts(&mut core), expected);
+}
+
+#[test]
+fn test_lowering_max_items_keeps_the_file_long_until_it_is_emptied() {
+	let (_dir, path) = temp_path();
+	let (mut core, _) = open_with(&path, 5);
+	for tag in 0..5 {
+		core.append_text(&item(6, tag)).unwrap();
+	}
+	drop(core);
+	// Lowered to 2: three items are dropped, but the file keeps all five slots, past
+	// the length max_items = 2 alone would allow.
+	let (mut core, _) = open_with(&path, 2);
+	assert_eq!(file_len(&path), len_of(5));
+	// Full at 2, each append reuses the oldest item's slot: the file neither grows nor
+	// shrinks.
+	let mut live = Vec::new();
+	for tag in 5..10 {
+		live.push(core.append_text(&item(6, tag)).unwrap());
+		assert_eq!(file_len(&path), len_of(5), "after {tag}");
+	}
+	drop(core);
+	let (mut core, _) = open_with(&path, 2);
+	assert_eq!(file_len(&path), len_of(5));
+	assert_eq!(texts(&mut core), vec![item(6, 8), item(6, 9)]);
+	// Emptied: cut back to the header, after which max_items = 2 bounds it again.
+	for sequence in &live[live.len() - 2..] {
+		assert!(core.free(*sequence).unwrap());
+	}
+	assert_eq!(file_len(&path), HEADER_LEN);
+	for tag in 10..15 {
+		core.append_text(&item(6, tag)).unwrap();
+		assert!(file_len(&path) <= len_of(2), "after {tag}");
+	}
+	assert_eq!(file_len(&path), len_of(2));
+	drop(core);
+	let (mut core, _) = open_with(&path, 2);
+	assert_eq!(file_len(&path), len_of(2));
+	assert_eq!(texts(&mut core), vec![item(6, 13), item(6, 14)]);
 }
