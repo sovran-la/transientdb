@@ -30,7 +30,7 @@ fn exhausting_file(path: &Path) {
 
 #[test]
 fn test_an_all_ff_entry_loses_only_its_own_item() {
-	// The review's probe: 64 byte items, slot 1's entry overwritten with 0xFF.
+	// 64 byte items, slot 1's entry overwritten with 0xFF.
 	let (_dir, path) = temp_path();
 	let config = FileConfig {
 		max_item_size: 64,

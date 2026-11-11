@@ -152,8 +152,8 @@ fn test_max_items_lowered_and_raised_between_runs() {
 
 #[test]
 fn test_a_failed_payload_write_into_a_held_oldest_items_slot_keeps_it_held() {
-	// The review's probe for W2-R2: the append fails before the oldest item is dropped,
-	// so it is still stored and still held, and must not be handed out a second time.
+	// The append fails before the oldest item is dropped, so it is still stored and
+	// still held, and must not be handed out a second time.
 	for release in [false, true] {
 		let (_dir, path) = temp_path();
 		let (mut store, hook) = store_with(&path, 2);
