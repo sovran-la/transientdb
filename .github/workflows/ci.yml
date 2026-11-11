@@ -47,6 +47,12 @@ jobs:
       - name: Run unit tests
         run: cargo test --all-features --lib
 
+      # Run the examples, which exit non-zero if what they show stops being true
+      - name: Run examples
+        run: |
+          cargo run --example memory_example
+          cargo run --example file_example
+
       # Check docs build
       - name: Check docs
         run: cargo doc --no-deps
@@ -64,6 +70,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run doc tests
         run: cargo test --doc
+
+  web-example:
+    name: Web Example
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # A crate of its own, with its own lockfile and target directory
+        working-directory: examples/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/web
+      - name: Check formatting
+        run: cargo fmt -- --check
+      - name: Check lints
+        run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+      - name: Build for wasm32
+        run: cargo build --locked --target wasm32-unknown-unknown
 
   msrv:
     name: MSRV Check (${{ matrix.os }})

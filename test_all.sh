@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# test_all.sh - Run all tests for transientdb (native and WASM)
+# test_all.sh - Run all tests for transientdb (native and WASM), and the examples
 #
 # Usage:
 #   ./test_all.sh          # Run all tests
-#   ./test_all.sh native   # Run only native tests
-#   ./test_all.sh wasm     # Run only WASM tests
+#   ./test_all.sh native   # Run only native tests and examples
+#   ./test_all.sh wasm     # Run only WASM tests and the web example build
 #   ./test_all.sh --help   # Show help
 
 set -e
@@ -38,12 +38,13 @@ show_help() {
     echo ""
     echo "Targets:"
     echo "  (none)    Run all tests (native + WASM)"
-    echo "  native    Run only native tests"
-    echo "  wasm      Run only WASM tests"
+    echo "  native    Run only native tests, then run the native examples"
+    echo "  wasm      Run only WASM tests, then build the web example for wasm32"
     echo "  --help    Show this help message"
     echo ""
     echo "Requirements:"
     echo "  - Rust toolchain (cargo)"
+    echo "  - The wasm32-unknown-unknown target: rustup target add wasm32-unknown-unknown"
     echo "  - wasm-pack (for WASM tests): cargo install wasm-pack"
     echo "  - Chrome or Firefox (for headless WASM tests)"
     echo ""
@@ -55,13 +56,21 @@ run_native_tests() {
     print_header "Running Native Tests"
     
     echo "Running cargo test..."
-    if cargo test; then
-        print_success "Native tests passed"
-        return 0
-    else
+    if ! cargo test; then
         print_error "Native tests failed"
         return 1
     fi
+    print_success "Native tests passed"
+
+    for example in memory_example file_example; do
+        echo "Running example $example..."
+        if ! cargo run --example "$example"; then
+            print_error "Example $example failed"
+            return 1
+        fi
+    done
+    print_success "Native examples ran"
+    return 0
 }
 
 run_wasm_tests() {
@@ -79,13 +88,20 @@ run_wasm_tests() {
     echo "Running wasm-pack test (browser: $BROWSER)..."
     # The test runner gives each test binary 20 seconds by default; the browser suite
     # can take longer on a slow machine.
-    if WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-300}" wasm-pack test --headless --"$BROWSER" --features web; then
-        print_success "WASM tests passed"
-        return 0
-    else
+    if ! WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-300}" wasm-pack test --headless --"$BROWSER" --features web; then
         print_error "WASM tests failed"
         return 1
     fi
+    print_success "WASM tests passed"
+
+    # examples/web is its own crate, with its own lockfile and target directory.
+    echo "Building the web example for wasm32..."
+    if ! (cd "$(dirname "$0")/examples/web" && cargo build --locked --target wasm32-unknown-unknown); then
+        print_error "Web example build failed"
+        return 1
+    fi
+    print_success "Web example built"
+    return 0
 }
 
 # Main
