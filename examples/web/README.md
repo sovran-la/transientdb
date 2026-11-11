@@ -94,7 +94,7 @@ After a refresh, step 2 reports instead:
 ```
 📤 Sending events left from the last visit...
    POST {"events":[{"event":"page_hide","page":"/dashboard"}],"source":"demo-app"}
-✅ Sent 1 events from the last visit
+✅ Sent 1 event from the last visit
 ```
 
 ## Troubleshooting

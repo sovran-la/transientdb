@@ -33,14 +33,14 @@ mod native {
 		}
 	}
 
-	/// Queues an event. One the store can never hold is reported and dropped; anything else
-	/// that goes wrong is the caller's to handle.
-	fn track(db: &TransientDB, event: Value) -> Result<()> {
+	/// Queues an event, and says whether it was stored. One the store can never hold is
+	/// reported and dropped; anything else that goes wrong is the caller's to handle.
+	fn track(db: &TransientDB, event: Value) -> Result<bool> {
 		match db.append(event) {
-			Ok(()) => Ok(()),
+			Ok(()) => Ok(true),
 			Err(e @ (Error::ItemTooLarge { .. } | Error::ItemTooDeep)) => {
 				println!("  dropped an event: {e}");
-				Ok(())
+				Ok(false)
 			}
 			Err(e) => Err(e),
 		}
@@ -98,12 +98,14 @@ mod native {
 		{
 			let db = TransientDB::new(FileStore::new(config(&path)));
 			for i in 0..5 {
-				track(
-					&db,
-					json!({"event": "page_view", "page": format!("/product/{i}")}),
-				)?;
+				let page = json!({"event": "page_view", "page": format!("/product/{i}")});
+				assert!(track(&db, page)?, "a page view should have been stored");
 			}
-			track(&db, json!({"event": "upload", "data": "x".repeat(2000)}))?;
+			let upload = json!({"event": "upload", "data": "x".repeat(2000)});
+			assert!(
+				!track(&db, upload)?,
+				"an event over max_item_size should have been dropped"
+			);
 
 			// One store per file: a second store for the same file does nothing while the first
 			// one has it. That is a setup mistake, not something to retry.
@@ -115,17 +117,37 @@ mod native {
 
 			let sent = flush(&db, false)?;
 			println!("  sent {sent}; still queued: {}", db.has_data());
-			// The app quits here, with five events queued.
+			assert_eq!(sent, 0, "nothing can be sent while offline");
+			// The failed batch was given back, so the next fetch starts with it again.
+			let retry = db.fetch(BATCH_ITEMS, BATCH_BYTES)?;
+			let first = retry
+				.as_ref()
+				.map(|items| items.values()[0]["page"].clone());
+			assert_eq!(
+				first,
+				Some(json!("/product/0")),
+				"the events of a failed send should be fetched again, first"
+			);
+			drop(retry); // dropping an `Items` gives its events back too
+			    // The app quits here, with five events queued.
 		}
 
 		println!("Second run, online:");
 		let db = TransientDB::new(FileStore::new(config(&path)));
 		println!("  queued from last run: {}", db.has_data());
+		assert!(db.has_data(), "the events should have survived the restart");
 		let sent = flush(&db, true)?;
 		println!("  sent {sent}; still queued: {}", db.has_data());
+		assert_eq!(
+			sent, 5,
+			"every event from the last run should have been sent"
+		);
+		assert!(!db.has_data(), "nothing should be left once all is sent");
 
 		// With every event removed, the file is back to its 256 byte header.
-		println!("  file size: {} bytes", std::fs::metadata(&path)?.len());
+		let size = std::fs::metadata(&path)?.len();
+		println!("  file size: {size} bytes");
+		assert_eq!(size, 256, "an empty store's file should be just its header");
 		Ok(())
 	}
 }

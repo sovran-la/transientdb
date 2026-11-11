@@ -79,6 +79,14 @@ fn send(body: &str, online: bool) -> Result<(), String> {
 	}
 }
 
+/// "1 event", "2 events".
+fn event_count(count: usize) -> String {
+	match count {
+		1 => "1 event".to_string(),
+		_ => format!("{count} events"),
+	}
+}
+
 /// Sends what is queued, one request per fetch, until nothing is left or a request
 /// fails. Returns how many events were sent.
 fn flush(db: &TransientDB, online: bool) -> transientdb::Result<usize> {
@@ -94,8 +102,8 @@ fn flush(db: &TransientDB, online: bool) -> transientdb::Result<usize> {
 			}
 			Err(reason) => {
 				log(&format!(
-					"   Could not send {} events: {reason}",
-					items.len()
+					"   Could not send {}: {reason}",
+					event_count(items.len())
 				));
 				// Give them back: a later fetch returns them, in order. Dropping `items`
 				// does the same. Stop here, or the next fetch would hand them straight back.
@@ -143,7 +151,7 @@ async fn run_demo() -> Result<(), Error> {
 	if db.has_data() {
 		log("📤 Sending events left from the last visit...");
 		let sent = flush(&db, true)?;
-		log_success(&format!("Sent {sent} events from the last visit"));
+		log_success(&format!("Sent {} from the last visit", event_count(sent)));
 	} else {
 		log("📭 Nothing left from the last visit");
 	}
@@ -188,7 +196,7 @@ async fn run_demo() -> Result<(), Error> {
 	// =========================================================================
 	log("📡 Sending once back online...");
 	let sent = flush(&db, true)?;
-	log_success(&format!("Sent {sent} events"));
+	log_success(&format!("Sent {}", event_count(sent)));
 	log(&format!("📊 Has data after sending: {}", db.has_data()));
 	log("");
 

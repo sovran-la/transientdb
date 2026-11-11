@@ -203,7 +203,9 @@ async fn start() -> transientdb::Result<(TransientDB, Duration)> {
     let store = WebStore::new(config).await;
 
     // Check persistence state - IndexedDB may be unavailable
-    // in private browsing or third-party iframe contexts
+    // in private browsing or third-party iframe contexts.
+    // This is the state at startup; it can drop to MemoryOnly later
+    // (see "Persistence States" below).
     let flush_every = match store.persistence_state() {
         // Full persistence available
         PersistenceState::Persisted => Duration::from_secs(30),
@@ -260,7 +262,7 @@ For a service that rejects request bodies over some size, pass a `max_bytes` tha
 - `max_item_size`: Largest item, in bytes. This is the size of every slot in the file, so changing it discards the file
 - `max_items`: Most items held. It can change between runs: raised, the file may grow further; lowered, the oldest items beyond it are dropped when the file is opened
 
-**The file.** A 256 byte header, then slots, all `32 + max_item_size` bytes. Each slot holds one item and a 32 byte entry with the item's length, sequence number and CRC-32. Order is by sequence number, not by position. A removed item's slot is reused by a later append, lowest slot first, and the file grows by one slot only when none is free, so the file is as large as the queue has been deep, never more than `256 + (32 + max_item_size) * max_items` bytes. With `max_item_size = 8192` and `max_items = 2560` that is 21,053,696 bytes, but a queue that is never more than 50 items deep keeps the file at 411,456. When the last item is removed, the file is cut back to its header. Nothing in the file is ever moved, rewritten or renamed.
+**The file.** A 256 byte header, then slots, all `32 + max_item_size` bytes. Each slot holds one item and a 32 byte entry with the item's length, sequence number and CRC-32. Order is by sequence number, not by position. A removed item's slot is reused by a later append, lowest slot first, and the file grows by one slot only when none is free, so the file is as large as the queue has been deep since the file was last emptied. That is never more than `256 + (32 + max_item_size) * max_items` bytes, taking the largest `max_items` the file has been opened with since then: lowering `max_items` drops items, but does not shrink the file. With `max_item_size = 8192` and `max_items = 2560` that is 21,053,696 bytes, but a queue that is never more than 50 items deep keeps the file at 411,456. When the last item is removed, the file is cut back to its header. Nothing in the file is ever moved, rewritten or renamed.
 
 A file that does not match the config (another id or `max_item_size`, another format version, a damaged header, or not a FileStore file at all) is deleted with everything in it, logged, and created again. `new` does not fail for this. A damaged item is caught when it is fetched: it is deleted, logged and skipped, so it can never be fetched forever. FileStore logs one line on stderr for each of these.
 
@@ -281,7 +283,7 @@ A file that does not match the config (another id or `max_item_size`, another fo
 - Which items are fetched is kept in memory only, so after a reload every stored item can be fetched again
 - A failed IndexedDB write is not an error: it is logged, and the item is still queued in memory
 - `remove` only counts an `Items` this instance handed out, even if another `WebStore` is open on the same database
-- A database in a record format this version does not write is emptied, not converted, the first time it is opened
+- A database in a record format this version does not write is emptied, not converted, when a store first opens it. An open blocked by another page (see [Database upgrades](#database-upgrades)) leaves it as it was, for a later open
 - Ideal for web applications and browser-based analytics
 - Requires the `web` feature flag
 
@@ -292,9 +294,16 @@ A file that does not match the config (another id or `max_item_size`, another fo
 
 **Persistence States:**
 - `PersistenceState::Persisted` - IndexedDB available, data survives page refresh
-- `PersistenceState::MemoryOnly` - IndexedDB unavailable (private browsing, third-party context, storage blocked) or unreadable, data lost on refresh
+- `PersistenceState::MemoryOnly` - data lost on refresh. The store is in this mode when IndexedDB is unavailable (private browsing, third-party context, storage blocked) or unreadable, when another page holds the database open at an older version, and from the moment another page asks for a newer version of the database or deletes it
 
-The store falls back to memory-only mode by itself and logs a warning to the console; it works the same way otherwise. `persistence_state()` and `is_persisted()` tell you which mode it is in. When in memory-only mode, consider increasing flush frequency to minimize data loss window.
+The store falls back to memory-only mode by itself and logs a warning to the console; it works the same way otherwise. `persistence_state()` and `is_persisted()` tell you which mode it is in now. That can change from `Persisted` to `MemoryOnly` while the store is in use, but never back, so a choice made from it at startup can go stale. A `TransientDB` does not give its store back, so an app that adjusts to the mode as it changes uses the `WebStore` itself (it implements `DataStore`) and checks again before each flush. When in memory-only mode, consider increasing flush frequency to minimize data loss window.
+
+#### Database upgrades
+
+Upgrading a database waits for every other connection to it to close. A store never waits long for that, and never makes another page wait:
+
+- If another page holds the database open at an older version and does not close it (a page loaded before a deploy brought a newer version of this store), `WebStore::new` gives up after about a second, so it can take that long. The store starts in memory-only mode and logs a warning. The database is left as it was, to be upgraded by the next store opened once that page is gone.
+- If another page asks for a newer version of the database, or deletes it, this store closes its connection at once and carries on in memory-only mode, with every item it holds, and logs a warning. Its items in IndexedDB stay there for the newer version to deal with, and nothing it does afterwards is written there.
 
 ## Thread Safety
 
@@ -331,16 +340,16 @@ Only the stores' own operations return a `Result`; nothing on `Items` does. `Err
 - `ItemTooLarge { size, max }`: `append` only. The item is larger than `max_item_size` and will never be stored. Drop it or report it.
 - `ItemTooDeep`: `append` only. The item is nested too deeply and will never be stored. Drop it or report it.
 - `InUse`: FileStore only, from `append`, `fetch` and `remove`. Another store in this process is using the file, so this one did nothing. Two stores were made for one file: a mistake in your setup, not something to retry. Use the store that has it.
-- `Io(std::io::Error)`: the storage failed. Nothing changed, except as noted below, and the store is ready for the next call. This is the only one worth retrying.
+- `Io(std::io::Error)`: the storage failed. Nothing changed, except as noted below, and the store is ready for the next call. This is the only one worth retrying, unless the store has used up its sequence numbers (below).
 
 What `Io` means for FileStore, operation by operation:
-- `append`: the item is not stored. Every other item is as it was, except that a failed write while dropping the oldest item (store full) may have dropped it.
+- `append`: the item is not stored. Every other item is as it was, except that a failed write while dropping the oldest item (store full) may have dropped it. Also returned, writing nothing, when a damaged file has used up every sequence number; that lasts until `reset()`, or until the store is emptied and opened again, so retrying does not help.
 - `fetch`: nothing is handed out; a later fetch returns the same items.
 - `remove`: every item is tried; those that could not be deleted stay stored and are fetched again.
 
-MemoryStore and WebStore never return `InUse`, and return `Io` only if they run out of sequence numbers, which takes at least 2^53 - 1 appends.
+MemoryStore never returns `InUse` or `Io`: each item takes the next of its `u64` sequence numbers, which at one append per nanosecond last more than 580 years. WebStore never returns `InUse`, and returns `Io`, storing nothing, only once it has used up its sequence numbers, which takes 2^53 - 1 appends (the most an IndexedDB number key holds exactly); retrying does not help.
 
-Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. Those are logged.
+Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. FileStore logs each of these, every item a full store drops included. MemoryStore and WebStore drop the oldest item without logging it; WebStore logs what it discards when it opens, and each fall back to memory-only mode.
 
 ```rust
 use serde_json::Value;

@@ -47,7 +47,10 @@ jobs:
       - name: Run unit tests
         run: cargo test --all-features --lib
 
-      # Run the examples, which exit non-zero if what they show stops being true
+      # Run the examples. Each asserts what it shows (an oversized event dropped, a failed
+      # batch fetched again, every event sent once, an empty store at the end; for FileStore
+      # also a second store refused, the events surviving a restart and the file cut back to
+      # its header) and panics, exiting non-zero, if any of it stops being true
       - name: Run examples
         run: |
           cargo run --example memory_example

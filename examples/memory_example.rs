@@ -45,6 +45,7 @@ fn memory_store_example() -> Result<()> {
 	// request body this (imaginary) service expects.
 	println!("Fetching and processing events...");
 	let mut attempt = 0;
+	let mut sent = 0;
 	while let Some(items) = db.fetch(2, 64 * 1024)? {
 		let body = format!("{{\"events\":{},\"source\":\"sensor-7\"}}", items.json());
 		attempt += 1;
@@ -62,12 +63,15 @@ fn memory_store_example() -> Result<()> {
 		}
 
 		println!("Sending {} events: {body}", items.len());
+		sent += items.len();
 		// After a successful send, remove the fetched items.
 		db.remove(items)?;
 		println!("Removed processed events from store");
 	}
 
-	assert!(!db.has_data());
+	// Every stored event was sent once, the released ones on a later attempt.
+	assert_eq!(sent, 5, "every stored event should have been sent");
+	assert!(!db.has_data(), "nothing should be left once all is sent");
 	Ok(())
 }
 
