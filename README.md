@@ -1,32 +1,29 @@
 # TransientDB
 
-TransientDB is a lightweight, thread-safe temporary data storage system designed for efficient handling of transient data in Rust applications. It provides flexible storage options with both in-memory and file-based implementations, making it ideal for scenarios requiring temporary data buffering, event batching, or intermediate data storage.
+TransientDB is a lightweight, thread-safe queue for transient data in Rust applications: events, logs, or anything else that is collected now and delivered later. You append JSON items, fetch the oldest of them in batches, and remove each batch once it has been delivered. Whatever could not be delivered stays queued for the next attempt. It is ideal for analytics and telemetry pipelines, offline buffering, and any producer that must not lose data while its consumer is unreachable.
 
 ## Features
 
-- **Multiple Storage Backends**
-    - In-memory storage with configurable size limits
-    - File-based storage with automatic file rotation
-    - Browser-based IndexedDB storage for WASM targets
-    - Extensible interface for custom implementations
+- **Three Storage Backends, One Interface**
+    - In-memory storage, for the fastest queue that need not outlive the process
+    - Single-file storage on native targets, safe against a kill at any point
+    - Browser-based IndexedDB storage for WASM targets, with an in-memory fallback
+    - One trait, so code written against one store works with every store
+
+- **Delivery Without Bookkeeping**
+    - Fetch hands out the oldest items and keeps them from every other fetch until you remove or release them
+    - Several requests can be in flight at once, each with its own items
+    - A failed or abandoned delivery gives its items back automatically
+    - Items come back as one JSON array, as parsed values, or as each item's own text
+
+- **Bounded by Design**
+    - Every store takes the same two limits: the largest item and the most items
+    - Every fetch says how many items and how many bytes it wants
+    - A full store drops its oldest item, so appending never fails for lack of room
 
 - **Thread-Safe Operations**
-    - Concurrent append and fetch operations
-    - Atomic file operations for the directory-based store
-    - Robust error handling and recovery
-    - Mutex-based synchronization
-
-- **Configurable Behavior**
-    - Customizable maximum file/batch sizes
-    - File validation hooks
-    - Flexible fetch limits (count and size-based)
-    - Configurable batch [envelope](#envelope), the same shape in every store
-
-- **FIFO (First-In-First-Out) Data Management**
-    - Automatic cleanup of old data
-    - Efficient batch processing
-    - Controlled memory usage
-    - Safe removal of processed data
+    - `TransientDB` shares any store between threads
+    - Fetch on one thread, remove on another
 
 ## Installation
 
@@ -34,564 +31,348 @@ Add TransientDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-transientdb = "0.2"  # Replace with actual version
+transientdb = "0.4.0"
 ```
 
 For WASM/browser targets, enable the `web` feature:
 
 ```toml
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-transientdb = { version = "0.2", features = ["web"] }
+transientdb = { version = "0.4.0", features = ["web"] }
 ```
 
-> **Note:** The `web` feature only compiles on WASM targets. On native targets, it's automatically excluded.
+> **Note:** `WebStore` exists only on `wasm32` with the `web` feature. `FileStore` exists only on native targets. `MemoryStore` is everywhere.
 
 ## Core Types
 
-### TransientDB<T>
-The main wrapper type providing thread-safe access to any storage implementation. The type parameter `T` determines the output type of fetch operations (e.g., `Value` for MemoryStore or `Vec<PathBuf>` for DirectoryStore).
-
-### DataResult<T>
-A container for fetch results that includes:
-- `data`: The fetched data of type `T` (JSON Value for MemoryStore or file paths for DirectoryStore)
-- `removable`: Internal tracking data used by `remove()` to clean up processed items
-
 ### DataStore Trait
-The core interface that storage implementations must provide:
-- `append()`: Add new items to the store
-- `fetch()`: Retrieve batches of data with optional limits
-- `remove()`: Clean up processed data
-- `end_batch()`: Set a [batch boundary](#batch-boundaries)
-- `has_data()`: Check if data is available
-- `reset()`: Clear all stored data
+The interface every store implements:
 
-`fetch()` never removes anything, in any store: it returns the batch and its `removable`
-items, and the data stays in the store until you pass `removable` to `remove()`. Fetching
-again before removing returns the same items. Remove a batch only once it has been
-processed (for example, after the upload succeeded), so a failure never loses data.
+```rust
+use serde_json::Value;
+use transientdb::{Items, Result};
 
-`remove()` acts only on removables issued by the same store instance, and silently ignores
-anything else (returning `Ok`, as it does for items already removed). Every MemoryStore and
-WebStore instance has its own identity, so another instance's removables remove nothing,
-even a WebStore opened on the same `database_name`: remove items through the instance that
-fetched them. DirectoryStore deletes a path only if it is one of its own finished files in
-its own storage directory (compared by canonical path, so a relative and an absolute
-spelling both work); another store's file, its own open or unfinished file, and anything
-outside the directory are left in place.
+pub trait DataStore {
+    fn append(&mut self, data: Value) -> Result<()>;
+    fn fetch(&mut self, count: usize, max_bytes: usize) -> Result<Option<Items>>;
+    fn remove(&mut self, items: Items) -> Result<()>;
+    fn reset(&mut self);
+    fn has_data(&self) -> bool;
+}
+```
+
+- `append()`: Add an item to the end of the queue
+- `fetch()`: Hand out the oldest items, within a count and a byte limit
+- `remove()`: Delete the items a fetch handed out, once they are delivered
+- `reset()`: Delete every item
+- `has_data()`: Whether a fetch could return something now
+
+`remove()` acts only on an `Items` the same store instance handed out. One from another store, or from before a `reset()`, matches nothing: it is ignored, which is not an error.
+
+### TransientDB
+A wrapper that puts any store behind a mutex, so threads can share it. It has the same five operations, taking `&self`. On native targets it is `Send` and `Sync`.
+
+### Items
+What a fetch hands out: one or more items, oldest first, and the store's claim on them. An `Items` is never empty. It offers:
+
+- `len()`: how many items
+- `byte_len()`: the total bytes of the items' text, as counted against `max_bytes`
+- `json()`: one JSON array holding every item, `[{...},{...}]`, built by joining the stored text without parsing anything. Its length is `byte_len()`, plus one comma between each pair of items, plus 2
+- `values()`: every item parsed as a `serde_json::Value`
+- `iter()`: each item's own JSON text, exactly as it was serialized at append
+- `release()`: give the items back for a later fetch
+
+None of these can fail: every store checks an item before handing it out. None of them wraps the items in anything either. The request body around them (a key, other fields, a timestamp) is yours to build.
+
+### Error
+Every fallible operation returns `transientdb::Result<T>`, whose error is `transientdb::Error`. See [Error Handling](#error-handling).
 
 ## Usage
+
+### The delivery cycle
+
+Every store is used the same way:
+
+1. `fetch(count, max_bytes)` the oldest items.
+2. Put `items.json()` (or `values()`, or `iter()`) in your request.
+3. If the request succeeds, `remove(items)`. If it fails, drop the `Items` or call `release()`: its items are returned, in their original order, by a later fetch.
+
+A fetched item is not returned by another fetch until its `Items` is released, so consecutive fetches never hand out the same item. A caller that sends several requests at once calls `fetch` once per request and gets different items each time. Because dropping an `Items` releases it, an early return or a panic on the send path cannot hold items back forever.
+
+```rust
+use transientdb::{Result, TransientDB};
+
+/// Sends what is queued, one request per fetch, until nothing is left or a request fails.
+fn flush(db: &TransientDB, send: impl Fn(&str) -> bool) -> Result<()> {
+    while let Some(items) = db.fetch(100, 500 * 1024)? {
+        let body = format!("{{\"batch\":{}}}", items.json());
+        if send(&body) {
+            db.remove(items)?;
+        } else {
+            // Released for a later flush. Stop now: the next fetch would return them again.
+            items.release();
+            break;
+        }
+    }
+    Ok(())
+}
+```
 
 ### Memory Store Example
 
 ```rust
-use transientdb::{Envelope, MemoryConfig, MemoryStore, TransientDB};
 use serde_json::json;
+use transientdb::{MemoryConfig, MemoryStore, TransientDB};
 
-// Configure an in-memory store
-let config = MemoryConfig {
-    envelope: Envelope::default(),
-    max_items: Some(1000),
-    max_fetch_size: 1024 * 1024, // 1MB
-    max_fetch_items: None,
-};
+fn main() -> transientdb::Result<()> {
+    // Configure an in-memory store
+    let config = MemoryConfig {
+        max_item_size: 8 * 1024, // no item over 8 KiB serialized
+        max_items: 1000,         // the 1001st append drops the oldest item
+    };
 
-// Create the store
-let store = MemoryStore::new(config);
-let db = TransientDB::new(store);
+    // Create the store
+    let db = TransientDB::new(MemoryStore::new(config));
 
-// Append data
-db.append(json!({
-    "event": "user_login",
-    "timestamp": "2024-01-01T00:00:00Z"
-}))?;
+    // Append data
+    db.append(json!({"event": "user_login", "user_id": 123}))?;
+    db.append(json!({"event": "page_view", "page": "/home"}))?;
 
-// Fetch data (up to 100 items)
-if let Some(result) = db.fetch(Some(100), None)? {
-    if let Some(batch) = result.data {
-        // Process the batch - it's already a serde_json::Value
-        if let Some(items) = batch["items"].as_array() {
-            for item in items {
-                println!("Processing event: {}", item["event"]);
-            }
+    // Fetch up to 100 items, at most 64 KiB of them
+    if let Some(items) = db.fetch(100, 64 * 1024)? {
+        for item in items.values() {
+            println!("Processing event: {}", item["event"]);
         }
+        // The items stay in the store until removed
+        db.remove(items)?;
     }
-    // The items stay in the store until removed
-    if let Some(removable) = result.removable {
-        db.remove(&removable)?;
-    }
+    assert!(!db.has_data());
+    Ok(())
 }
 ```
 
-### Directory Store Example
+### File Store Example
 
 ```rust
-use std::path::PathBuf;
-use transientdb::{DirectoryConfig, DirectoryStore, Envelope, TransientDB};
 use serde_json::json;
+use std::path::Path;
+use transientdb::{FileConfig, FileStore, TransientDB};
 
-// Configure a file-based store
-let config = DirectoryConfig {
-    envelope: Envelope::default(),
-    storage_location: PathBuf::from("/tmp/events"),
-    base_filename: "batch".into(),
-    max_file_size: 1024 * 1024, // 1MB
-    max_file_items: None,
-};
+/// Opens the event queue in `data_dir`, the app's own data directory
+/// (not a temporary or cache directory; see "Where to put the file" below).
+fn open_queue(data_dir: &Path) -> TransientDB {
+    TransientDB::new(FileStore::new(FileConfig {
+        path: data_dir.join("events.tdb"), // its parent directory is created if missing
+        id: "my-write-key".into(),         // whose data this is
+        max_item_size: 8 * 1024,
+        max_items: 2560,
+    }))
+}
 
-// Create the store with custom validation
-let mut store = DirectoryStore::new(config)?;
-store.set_file_validator(|path| {
-    // Custom validation logic
-    let metadata = std::fs::metadata(path)?;
-    if metadata.len() < 10 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "File too small"
-        ));
-    }
+fn run(data_dir: &Path) -> transientdb::Result<()> {
+    let db = open_queue(data_dir);
+    db.append(json!({"event": "purchase", "amount": 99.99}))?;
+    drop(db); // the process ends
+
+    // A later run finds the item where the last one left it
+    let db = open_queue(data_dir);
+    let items = db.fetch(100, 500 * 1024)?.expect("one item is stored");
+    assert_eq!(items.values()[0]["amount"], 99.99);
+    db.remove(items)?;
     Ok(())
-});
-
-let db = TransientDB::new(store);
-
-// Append events
-db.append(json!({
-    "event": "purchase",
-    "amount": 99.99
-}))?;
-
-// Fetch completed files
-if let Some(result) = db.fetch(None, None)? {
-    if let Some(files) = result.data {
-        // Process the files
-        for file_path in files {
-            // Read and process each file
-            let content = std::fs::read_to_string(file_path)?;
-            let batch: serde_json::Value = serde_json::from_str(&content)?;
-            
-            // Access the items array
-            if let Some(items) = batch["items"].as_array() {
-                for item in items {
-                    println!("Processing event: {}", item["event"]);
-                }
-            }
-        }
-    }
-    // Clean up processed files
-    if let Some(removable) = result.removable {
-        db.remove(&removable)?;
-    }
 }
 ```
-
-### File Validation (DirectoryStore)
-
-A validator set with `set_file_validator` is your own code. It is given the path of each
-finished file before the file is marked ready (renamed with `.temp`), and it runs:
-
-- when `append` finishes the open file because the next item would not fit (rotation),
-- when `end_batch` or `fetch` finishes the open file,
-- when the first `fetch` of a session recovers or salvages files an earlier session left
-  unfinished. Recovery happens there, not in `DirectoryStore::new`, so a validator set
-  right after `new` sees those files too.
-
-Returning `Ok(())` accepts the file. **Returning an error means "delete this file and
-every item in it".** The store deletes it, and the operation that triggered validation
-continues and succeeds: `append` still writes its item, to a fresh file, `end_batch`
-returns `Ok(())`, and `fetch` returns the other finished files, or nothing. A rejection is
-never reported through the return value of `append`, `end_batch` or `fetch`.
-
-The validator is therefore the one place to observe a rejection. If you want to record,
-count, report, or keep a copy of a rejected file, do it inside the validator, before you
-return the error: once it returns, the file is gone. The store's own notice is a single
-line on stderr, which many targets (mobile apps in particular) never surface, so do not
-rely on it.
-
-```rust
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-
-let rejected = Arc::new(AtomicUsize::new(0));
-let counter = rejected.clone();
-store.set_file_validator(move |path| {
-    let content = std::fs::read_to_string(path)?;
-    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-        counter.fetch_add(1, Ordering::SeqCst); // record it now; the file is about to go
-        return Err(std::io::Error::other("not valid JSON"));
-    }
-    Ok(())
-});
-```
-
-### Durability (DirectoryStore)
-
-Files are not fsynced, so durability across a power loss or OS crash is not guaranteed.
-What was written is salvaged by the next session's first `fetch`: a file cut short keeps
-every complete item, byte for byte and in order, and loses whatever follows the last one.
-A leftover with no complete item is deleted, and so is one of the store's files that does
-not even start like a data file (empty, or cut inside its opening): nothing in it can be
-read, so it could never be delivered. Files not named for the store are never touched. A
-write that fails while the store is running (disk full, an I/O error) is rolled back, so
-the failed item leaves nothing behind and the next append continues the same file. If
-finishing a file fails (writing its closing, or renaming it), the `append`, `end_batch` or
-`fetch` that tried returns the error, and the next `fetch` recovers that file with all its items.
 
 ### Web Store Example (WASM)
 
 ```rust
-use transientdb::{Envelope, TransientDB, WebConfig, WebStore, PersistenceState};
 use serde_json::json;
+use std::time::Duration;
+use transientdb::{PersistenceState, TransientDB, WebConfig, WebStore};
 
-// Configure a browser-based store
-let config = WebConfig {
-    envelope: Envelope::default(),
-    database_name: "my-app-events".into(),
-    max_items: Some(1000),
-    max_fetch_size: 1024 * 1024, // 1MB
-    max_fetch_items: None,
-};
+/// Opens the queue, and says how often to flush it.
+async fn start() -> transientdb::Result<(TransientDB, Duration)> {
+    // Configure a browser-based store
+    let config = WebConfig {
+        database_name: "my-app-events".into(),
+        max_item_size: 8 * 1024,
+        max_items: 1000,
+    };
 
-// Create the store (async - opens IndexedDB)
-let store = WebStore::new(config).await;
+    // Create the store (async - opens IndexedDB and loads what it holds)
+    let store = WebStore::new(config).await;
 
-// Check persistence state - IndexedDB may be unavailable
-// in private browsing or third-party iframe contexts
-match store.persistence_state() {
-    PersistenceState::Persisted => {
+    // Check persistence state - IndexedDB may be unavailable
+    // in private browsing or third-party iframe contexts
+    let flush_every = match store.persistence_state() {
         // Full persistence available
-    }
-    PersistenceState::MemoryOnly => {
-        // Degraded mode - consider flushing more frequently
-        println!("Warning: Running in memory-only mode");
-    }
-}
+        PersistenceState::Persisted => Duration::from_secs(30),
+        // Degraded mode - flush more frequently
+        PersistenceState::MemoryOnly => Duration::from_secs(5),
+    };
 
-// Wrap in TransientDB for thread-safe access
-let db = TransientDB::new(store);
-
-// Append data
-db.append(json!({
-    "event": "page_view",
-    "url": "/home"
-}))?;
-
-// Fetch data
-if let Some(result) = db.fetch(Some(100), None)? {
-    if let Some(batch) = result.data {
-        // Process the batch
-        if let Some(items) = batch["items"].as_array() {
-            for item in items {
-                println!("Processing event: {}", item["event"]);
-            }
-        }
-    }
-    // Clean up processed items
-    if let Some(removable) = result.removable {
-        db.remove(&removable)?;
-    }
+    let db = TransientDB::new(store);
+    db.append(json!({"event": "page_view", "url": "/home"}))?;
+    Ok((db, flush_every))
 }
 ```
 
-> **See also:** The [`examples/web/`](examples/web/) directory contains a complete, runnable WASM example with HTML and build instructions.
+> **See also:** [`examples/memory_example.rs`](examples/memory_example.rs) and [`examples/file_example.rs`](examples/file_example.rs) (`cargo run --example file_example`) show the whole cycle, a failed send included. The [`examples/web/`](examples/web/) directory contains a complete, runnable WASM example with HTML and build instructions.
+
+## Limits
+
+Every store takes the same two limits, so an item one store accepts, every store accepts. Both are required and neither may be 0; `new` panics otherwise.
+
+- **`max_item_size`**: the largest item, in bytes of its compact `serde_json` text. `append` rejects a larger item with `Error::ItemTooLarge` and stores nothing.
+- **`max_items`**: the most items the store holds at once. When it is full, `append` drops the oldest item to make room, whether or not that item has been fetched. This is not configurable, and `append` never fails for it. An `Items` holding a dropped item still removes or releases the rest normally.
+
+`append` also rejects, with `Error::ItemTooDeep`, an item nested more than 125 levels deep in arrays and objects (each `[]` or `{}` is one level). `serde_json` could not read such an item back once it is inside a request body. The check does not recurse, so even an absurdly deep value is rejected without overflowing the stack.
+
+Every **fetch** states its own limits, `count` and `max_bytes`; there is no default:
+
+- It returns at most `count` items, whose text totals at most `max_bytes` bytes. An exact fit is allowed.
+- `max_bytes` counts item bytes only. Whatever you put around or between the items is yours to account for: with `json()`, that is one comma between each pair of items and the two brackets, plus your own request body.
+- Items are taken in order, stopping at the first one that does not fit. A smaller item behind it does not jump the queue.
+- It returns `Ok(None)` when there is nothing to hand over: nothing is waiting, `count` is 0, or the oldest waiting item alone is larger than `max_bytes`. That is not an error.
+
+For a service that rejects request bodies over some size, pass a `max_bytes` that leaves room for your wrapper, and a `max_item_size` no larger than that.
 
 ## Storage Implementations
 
 ### MemoryStore
-- Stores data in memory using a FIFO queue
-- Drops the oldest items past `max_items` when it sets a cap; with `max_items: None`, never drops
-- Returns data as serde_json::Value
+- Stores each item as its JSON text, in memory, in append order
 - Ideal for high-throughput, temporary data storage
-- Requires explicit cleanup via remove(); fetch does not remove returned items
+- Nothing survives the store: dropping it discards every item
+- Identical items are distinct entries: `remove` deletes exactly the items a fetch handed out
 
-### DirectoryStore
-- Stores data in rotating files in a specified directory
-- Automatic file management and rotation; no finished file exceeds `max_file_size` bytes
-- Returns paths to completed files
-- Supports custom file validation
-- Requires explicit cleanup via remove()
-- Ideal for larger datasets and persistent storage needs
+**MemoryConfig:**
+- `max_item_size`: Largest item, in bytes; see [Limits](#limits)
+- `max_items`: Most items held; past it the oldest is dropped
+
+### FileStore (native only)
+- Keeps every item in one file, so items survive the process and a kill at any point
+- No recovery pass, no compaction, no background work, no file lock
+- Ideal for apps that must not lose queued data when they are killed or suspended
+
+**FileConfig:**
+- `path`: The store's file. Its parent directory is created if missing
+- `id`: Whose data this is (a write key, for example), 1 to 224 bytes. It is recorded in the file, and a file recorded under a different id is discarded when opened
+- `max_item_size`: Largest item, in bytes. This is the size of every slot in the file, so changing it discards the file
+- `max_items`: Most items held. It can change between runs: raised, the file may grow further; lowered, the oldest items beyond it are dropped when the file is opened
+
+**The file.** A 256 byte header, then slots, all `32 + max_item_size` bytes. Each slot holds one item and a 32 byte entry with the item's length, sequence number and CRC-32. Order is by sequence number, not by position. A removed item's slot is reused by a later append, lowest slot first, and the file grows by one slot only when none is free, so the file is as large as the queue has been deep, never more than `256 + (32 + max_item_size) * max_items` bytes. With `max_item_size = 8192` and `max_items = 2560` that is 21,053,696 bytes, but a queue that is never more than 50 items deep keeps the file at 411,456. When the last item is removed, the file is cut back to its header. Nothing in the file is ever moved, rewritten or renamed.
+
+A file that does not match the config (another id or `max_item_size`, another format version, a damaged header, or not a FileStore file at all) is deleted with everything in it, logged, and created again. `new` does not fail for this. A damaged item is caught when it is fetched: it is deleted, logged and skipped, so it can never be fetched forever. FileStore logs one line on stderr for each of these.
+
+**One store per file.** A file is used by one store at a time. Within a process this is enforced: a second `FileStore` for a file another one is using, however its path is spelled, is created, but leaves the file alone. Its `append`, `fetch` and `remove` return `Error::InUse`, `has_data` is false, and `reset` does nothing, until the first store is dropped; its next call then opens the file and carries on. Across processes it is a rule for you, not enforced: an app and its extension, say, must not open the same file. If they do, items can be lost or sent twice (never malformed: every fetched item is checked).
+
+**Where to put the file.** The location is your choice, and it matters:
+- Not a temporary or cache directory. The OS may delete those while the app is suspended, and writes to a deleted file succeed and go nowhere.
+- Preferably the app's own container, rather than one shared with another app or an extension.
+- With a data-protection class that allows access whenever the app can run. While the file cannot be read or written, calls return `Error::Io` and change nothing; they work again once it can.
+
+**Durability.** FileStore does not buffer writes in user space: when `append` returns `Ok`, the item is with the OS, and a process killed at any point afterwards, or frozen by a mobile OS and never resumed, loses nothing. Nothing is ever synced, so a power loss or OS crash may lose recent appends and removes; a torn write is caught by its CRC, and costs at most that one item. Which items are fetched is kept in memory only: after a restart every stored item can be fetched again, including any that were fetched but not yet removed. Delivery is therefore at least once: a process killed between a successful send and its `remove` sends those items again.
 
 ### WebStore (WASM)
-- Browser-based storage using IndexedDB
-- Drops the oldest items past `max_items` (in memory and in IndexedDB) when it sets a cap;
-  with `max_items: None`, never drops
-- Async construction, sync operations (fire-and-forget persistence)
-- Graceful fallback to memory-only if IndexedDB unavailable
-- Automatic hydration from IndexedDB on startup, in append order
-- Stores any JSON value (objects, arrays, strings, numbers, booleans, null) unmodified;
-  items are persisted as JSON text, so after a reload an integer above 2^53 or a float
-  such as `42.0` comes back exactly as appended
-- IndexedDB writes are issued in call order, so a `remove()` or `reset()` right after an
-  `append()` is never undone by the append landing late
-- A database written by an earlier version (transientdb 0.2.x, or a pre-release build of
-  this version) uses an older record format; it is emptied the first time this version opens it (old
-  records are discarded, not migrated)
-- [Batch boundaries](#batch-boundaries) survive a page reload
+- Browser-based storage using IndexedDB, behind an in-memory queue
+- Async construction, sync operations: every write to IndexedDB is fire-and-forget, issued during the call that causes it, so writes land in call order
+- Loads what IndexedDB holds when it opens, in append order; anything it would not accept now (malformed, larger than `max_item_size`, or the oldest beyond `max_items`) is discarded and logged to the console
+- Items are persisted as JSON text, so after a reload an integer above 2^53 or a float such as `42.0` comes back exactly as appended
+- Which items are fetched is kept in memory only, so after a reload every stored item can be fetched again
+- A failed IndexedDB write is not an error: it is logged, and the item is still queued in memory
+- `remove` only counts an `Items` this instance handed out, even if another `WebStore` is open on the same database
+- A database in a record format this version does not write is emptied, not converted, the first time it is opened
 - Ideal for web applications and browser-based analytics
 - Requires the `web` feature flag
 
+**WebConfig:**
+- `database_name`: Name of the IndexedDB database (use unique names per store)
+- `max_item_size`: Largest item, in bytes; see [Limits](#limits)
+- `max_items`: Most items held; past it the oldest is dropped, in memory and in IndexedDB
+
 **Persistence States:**
 - `PersistenceState::Persisted` - IndexedDB available, data survives page refresh
-- `PersistenceState::MemoryOnly` - IndexedDB unavailable (private browsing, third-party context), data lost on refresh
+- `PersistenceState::MemoryOnly` - IndexedDB unavailable (private browsing, third-party context, storage blocked) or unreadable, data lost on refresh
 
-When in memory-only mode, consider increasing flush frequency to minimize data loss window.
-
-## Configuration Options
-
-### MemoryConfig
-- `envelope`: The JSON object each batch wraps its items in; see [Envelope](#envelope)
-- `max_items`: Total store capacity, or `None` for no cap. With `Some(n)`, the oldest items are dropped silently beyond `n` (must not be `Some(0)`); see [Item cap](#item-cap)
-- `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
-- `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
-
-### DirectoryConfig
-- `envelope`: The JSON object each batch wraps its items in; see [Envelope](#envelope)
-- `storage_location`: Directory path for storing files
-- `base_filename`: Base name for generated files, which are named `{index}-{base_filename}`. Must be a plain file name: not empty, not `.` or `..`, no `/`, `\` or NUL byte (on every platform), and not ending in `.temp`. Dots, spaces, hyphens, digits and non-ASCII characters are fine. The index counts up from one above the highest index on disk and never wraps: if index 4294967295 is taken, an `append` that needs a new file returns an error, and the existing files can still be fetched
-- `max_file_size`: Hard ceiling in bytes on each finished file, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
-- `max_file_items`: Maximum number of items in one file, or `None` for no limit (must not be `Some(0)`)
-
-### WebConfig
-- `envelope`: The JSON object each batch wraps its items in; see [Envelope](#envelope)
-- `database_name`: Name of the IndexedDB database (use unique names per store)
-- `max_items`: Total store capacity, or `None` for no cap. With `Some(n)`, the oldest items are dropped silently beyond `n` (must not be `Some(0)`); see [Item cap](#item-cap)
-- `max_fetch_size`: Hard ceiling in bytes on one fetched batch, envelope included (must be ≥ 100; see [Byte limits](#byte-limits))
-- `max_fetch_items`: Maximum number of items one fetch returns, or `None` for no limit (must not be `Some(0)`)
-
-### Item cap
-
-`MemoryConfig::max_items` and `WebConfig::max_items` set the store's total capacity.
-`Some(n)` drops the oldest items, silently, once an append takes the store past `n`.
-`None` means unbounded: the store never drops an item because of how many it holds, so use
-it for a store that must never lose data by its own policy.
-
-```rust
-let config = MemoryConfig {
-    envelope: Envelope::default(),
-    max_items: None, // never drop items for capacity
-    max_fetch_size: 1024 * 1024,
-    max_fetch_items: None,
-};
-```
-
-With `None` the store grows without limit until fetched items are passed to `remove()`, so
-keeping memory (and, for WebStore, IndexedDB) use in check is the caller's responsibility.
-`DirectoryStore` has no item cap and never drops items for capacity.
-
-### Byte limits
-
-Some consumers send each batch as one request body to an API that rejects bodies over a
-fixed size. Every store's byte limit is a hard ceiling on what it hands back, measured in
-bytes (not characters) and counting the whole JSON batch: the [envelope](#envelope) (its items
-key, fields and timestamp), every item, and the commas between items. An exact fit is allowed.
-
-- **DirectoryStore**: no finished file is ever larger than `max_file_size` on disk. Before
-  each `append` the store computes the size the open file would have once finished with the
-  item in it; if that exceeds `max_file_size`, it finishes the open file and the item starts
-  a new one. A file also rotates when it holds `max_file_items` items, whichever comes first.
-- **MemoryStore and WebStore**: the batch one `fetch` returns, serialized with
-  `serde_json::to_string`, is never longer than `max_bytes` if given, otherwise
-  `max_fetch_size`. A `max_bytes` too small for the oldest item returns `Ok(None)`; a fetch at
-  the configured `max_fetch_size` always returns it. The fetch also stops at `count` or
-  `max_fetch_items` items.
-
-An item too large to fit by itself under the configured limit (`max_file_size` or
-`max_fetch_size`) can never be delivered, so `append` rejects it with
-`std::io::ErrorKind::InvalidInput` and a message giving the item's size and the largest size
-that fits. The rejected item is not stored, and the store is otherwise unchanged:
-DirectoryStore does not rotate or create a file, and WebStore issues no IndexedDB write.
-
-`append` also rejects, with `InvalidInput` and the same guarantees, an item nested more than
-125 levels deep in arrays and objects (each `[]` or `{}` is one level; scalars add none).
-`serde_json` cannot parse anything nested deeper inside a batch, so such an item could not
-be recovered from a file, hydrated from IndexedDB, or read by the consumer. The check does
-not recurse, so even an absurdly deep value is rejected without overflowing the stack.
-
-```rust
-match db.append(event) {
-    Ok(()) => {}
-    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => eprintln!("dropped event: {e}"),
-    Err(e) => return Err(e),
-}
-```
-
-WebStore may hold items persisted under a larger `max_fetch_size`. Hydration loads them as usual; when one reaches the head of the queue and
-cannot fit under `max_fetch_size`, `fetch` drops it, deletes it from IndexedDB, logs a
-`console.warn`, and continues with the next item.
-
-DirectoryStore may likewise find unfinished files left by a session with a larger
-`max_file_size`. Recovery cuts each one down to the leading complete items that fit under
-the current `max_file_size` once closed, dropping the rest (with one line on stderr giving
-the bytes kept of the total), and deletes it if not even its first item fits. That holds
-for a file the earlier session had already closed but not renamed, too: one at or under the
-current limit is renamed untouched. Files an earlier session already finished (`.temp`) are
-fetched as they are.
-
-Because the envelope counts, the limit must leave room for at least a 1-byte item after it;
-the envelope grows with its keys and field values. Constructing a store whose envelope alone
-fills the limit panics.
-
-### Item limits per batch
-
-Some consumers send each batch as one request and need a hard cap on items per batch.
-Each store can enforce one:
-
-- `DirectoryConfig::max_file_items` caps the items in each file. When the open file holds
-  that many items, the next `append` finishes it and starts a new one. It is independent of
-  `max_file_size`; whichever is reached first rotates the file.
-
-  ```rust
-  let config = DirectoryConfig {
-      envelope: Envelope::default(),
-      storage_location: PathBuf::from("/tmp/events"),
-      base_filename: "batch".into(),
-      max_file_size: 1024 * 1024,
-      max_file_items: Some(8), // no file ever holds more than 8 items
-  };
-  ```
-
-- `MemoryConfig::max_fetch_items` and `WebConfig::max_fetch_items` cap the items returned by
-  one `fetch`. If `fetch` is also given a `count`, the smaller of the two applies; a larger
-  `count` is clamped silently. The [byte limit](#byte-limits) still applies. This is separate from
-  `max_items`, which is the store's total capacity.
-
-  ```rust
-  let config = MemoryConfig {
-      envelope: Envelope::default(),
-      max_items: Some(1000),
-      max_fetch_size: 1024 * 1024,
-      max_fetch_items: Some(8), // every fetch returns at most 8 items
-  };
-  ```
-
-## Batch boundaries
-
-`end_batch()` guarantees that items appended before the call and items appended after it
-are never returned in the same batch, in every store. Use it when a change (say, the user
-identity) means the events on either side must not travel in one request.
-
-```rust
-db.append(json!({"user": "a", "event": "logout"}))?;
-db.end_batch()?;
-db.append(json!({"user": "b", "event": "login"}))?;
-
-// The first fetch returns only user a's event, even though more is stored.
-let first = db.fetch(Some(100), None)?.unwrap();
-db.remove(&first.removable.unwrap())?;
-// The next one returns user b's.
-let second = db.fetch(Some(100), None)?.unwrap();
-```
-
-- `DirectoryStore` finishes the open file at once, as rotation does (the validator runs on
-  it), so the next `append` starts a new file. A batch is one file.
-- `MemoryStore` and `WebStore` stop each `fetch` at the boundary, alongside `count`,
-  `max_fetch_items` and the byte limit: a fetch can return fewer items than asked for while
-  more are stored. Once those are removed, the next fetch returns what follows.
-- With nothing appended since the store was created, since the last `end_batch`, or since
-  everything was removed or reset, `end_batch` does nothing. Calling it twice is the same
-  as once, and it never creates an empty batch. It fetches and removes nothing.
-- `WebStore` persists boundaries, including one set after the last append, so they hold
-  after a page reload. A reload by itself is not a boundary.
-
-## Envelope
-
-Every store wraps a batch of items in one JSON object, described by the `envelope` field of
-its config. `Envelope` has three public fields:
-
-- `items_key`: the name of the array that holds the items.
-- `fields`: other top-level keys and their values, written exactly as given (any JSON).
-- `timestamp_key`: if set, the time the batch was finished is written under this key.
-
-`Envelope::default()` puts the items under `items` and adds nothing else, so a default batch
-is exactly:
-
-```json
-{"items":[{"event":"a"},{"event":"b"}]}
-```
-
-A builder covers the common cases. Rename the items key:
-
-```rust
-let envelope = Envelope::new("events");
-// {"events":[...]}
-```
-
-Add a field and a timestamp:
-
-```rust
-let envelope = Envelope::new("events")
-    .field("source", "sensor-7")
-    .timestamp("sentAt");
-// {"events":[...],"source":"sensor-7","sentAt":"2026-11-10T17:04:05.123Z"}
-```
-
-The timestamp is the only value computed per batch. It is always UTC in the format
-`%Y-%m-%dT%H:%M:%S.%3fZ`, 24 bytes, so a given envelope is the same size in every batch and
-the [byte limits](#byte-limits) count it exactly. There is no callback for computed fields:
-`DirectoryStore` must know the exact size of a file's closing before the file is finished.
-
-**DirectoryStore** writes each file as these bytes, compact, with no spaces:
-
-```text
-{"<items_key>":[<item>,<item>,...]<,"<field key>":<field value>>...<,"<timestamp_key>":"<timestamp>">}
-```
-
-That is: `{`, the items key as a JSON string, `:[`; the items separated by commas; then `]`,
-each field in the order given as `,` + key + `:` + value, the timestamp if configured as `,` +
-key + `:` + the timestamp as a JSON string, and `}`. Keys are JSON-escaped and values are
-serialized compactly by `serde_json`.
-
-**MemoryStore and WebStore** return the batch as a `serde_json::Value`: an object with the items
-under the items key, each field under its key, and the timestamp if configured. Key order
-inside a `Value` is not meaningful (`serde_json` serializes it in its own order), but its
-serialized length is the same in any order, and length is what the byte limit guarantees.
-WebStore keeps bare items in IndexedDB, so items persisted earlier are returned under whatever
-envelope the current store is configured with.
-
-Each store's `new` panics if the items key, a field key or the timestamp key is empty, if any
-two of those keys are the same, or if the envelope does not read back as JSON (a field value
-nested too deeply for `serde_json`, for example).
-
-Changing the envelope between sessions is not supported: `DirectoryStore` files already closed
-under the old one are delivered as they were written, and unfinished ones are closed with the
-new envelope or discarded.
+The store falls back to memory-only mode by itself and logs a warning to the console; it works the same way otherwise. `persistence_state()` and `is_persisted()` tell you which mode it is in. When in memory-only mode, consider increasing flush frequency to minimize data loss window.
 
 ## Thread Safety
 
-TransientDB is designed to be thread-safe and can handle concurrent operations from multiple threads:
+`TransientDB` locks its store for the duration of each call, so any number of threads can append, fetch and remove at once. An `Items` never needs that lock: on native targets it is `Send`, so it can be fetched on one thread and removed on another, and dropping or releasing it works anywhere, even while another thread is inside a call, or after the store itself is gone.
 
-- All public methods are thread-safe
-- The DirectoryStore uses atomic operations for file management
-- Batch operations are atomic
-- Safe concurrent append and fetch operations
+```rust
+use serde_json::json;
+use std::sync::Arc;
+use std::thread;
+use transientdb::{MemoryConfig, MemoryStore, TransientDB};
+
+fn main() {
+    let db = Arc::new(TransientDB::new(MemoryStore::new(MemoryConfig {
+        max_item_size: 1024,
+        max_items: 100,
+    })));
+    db.append(json!({"event": "open"})).unwrap();
+
+    let items = db.fetch(10, 4096).unwrap().unwrap();
+    let worker = {
+        let db = Arc::clone(&db);
+        // Deliver on another thread, then remove from there.
+        thread::spawn(move || db.remove(items).unwrap())
+    };
+    worker.join().unwrap();
+    assert!(!db.has_data());
+}
+```
 
 ## Error Handling
 
-All operations that could fail return `Result<T, std::io::Error>`. The library includes comprehensive error handling and recovery mechanisms:
+Only the stores' own operations return a `Result`; nothing on `Items` does. `Error` is `#[non_exhaustive]`, and each variant says what to do:
 
-- Safe handling of concurrent access
-- Atomic file operations
-- Validation of configuration values
-- Recovery from interrupted operations
-- File system error handling
-- JSON parsing error handling
+- `ItemTooLarge { size, max }`: `append` only. The item is larger than `max_item_size` and will never be stored. Drop it or report it.
+- `ItemTooDeep`: `append` only. The item is nested too deeply and will never be stored. Drop it or report it.
+- `InUse`: FileStore only, from `append`, `fetch` and `remove`. Another store in this process is using the file, so this one did nothing. Two stores were made for one file: a mistake in your setup, not something to retry. Use the store that has it.
+- `Io(std::io::Error)`: the storage failed. Nothing changed, except as noted below, and the store is ready for the next call. This is the only one worth retrying.
+
+What `Io` means for FileStore, operation by operation:
+- `append`: the item is not stored. Every other item is as it was, except that a failed write while dropping the oldest item (store full) may have dropped it.
+- `fetch`: nothing is handed out; a later fetch returns the same items.
+- `remove`: every item is tried; those that could not be deleted stay stored and are fetched again.
+
+MemoryStore and WebStore never return `InUse`, and return `Io` only if they run out of sequence numbers, which takes at least 2^53 - 1 appends.
+
+Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. Those are logged.
+
+```rust
+use serde_json::Value;
+use transientdb::{Error, TransientDB};
+
+fn track(db: &TransientDB, event: Value) {
+    match db.append(event) {
+        Ok(()) => {}
+        // This event will never be stored: report it and move on.
+        Err(e @ (Error::ItemTooLarge { .. } | Error::ItemTooDeep)) => eprintln!("dropped event: {e}"),
+        // Two stores on one file: fix the setup.
+        Err(Error::InUse) => panic!("two stores were made for one file"),
+        // The storage failed and nothing changed: try again later.
+        Err(e) => eprintln!("could not queue event, will retry: {e}"),
+    }
+}
+```
 
 ## Testing
 
 The library includes an extensive test suite covering:
-- Basic operations
+- Every operation of every store, against one shared set of checks
 - Concurrent access patterns
-- Edge cases and error conditions
-- Recovery scenarios
+- Edge cases, boundaries and error conditions
+- FileStore under a kill at every byte of a write, injected I/O errors, and damaged or mismatched files
 - Performance under load
-- File system interactions
-- Data format validation
-- Configuration validation
+- WebStore in headless Chrome and Firefox
 
 Run the tests using:
 
 ```bash
-# Run all tests (native + WASM)
+# Run all tests (native + WASM), and the examples
 ./test_all.sh
 
 # Native tests only
