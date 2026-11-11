@@ -49,6 +49,7 @@ mod tests {
 	mod open;
 	mod registry;
 	mod reuse;
+	mod sequence;
 	mod shrink;
 	mod store;
 	mod support;

@@ -24,26 +24,46 @@ fn in_use() -> MutexGuard<'static, BTreeSet<PathBuf>> {
 ///
 /// The file itself need not exist. If it does, the whole path is canonicalized. If not,
 /// the parent is, and the file name appended, so the result is the path the file will
-/// have once created.
+/// have once created. A symbolic link to a file that does not exist yet is followed, so
+/// the result is where the link points: the file is created there, and a store given
+/// the target's own path is the same store.
 pub(super) fn canonical(path: &Path) -> io::Result<PathBuf> {
-	let name = path.file_name().ok_or_else(|| {
-		io::Error::new(
-			io::ErrorKind::InvalidInput,
-			format!("{} does not name a file", path.display()),
-		)
-	})?;
-	match path.canonicalize() {
-		Ok(canonical) => return Ok(canonical),
-		Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-		Err(e) => return Err(e),
+	let mut path = path.to_path_buf();
+	// A loop, or a chain longer than the OS follows, fails to canonicalize. The bound
+	// only stops links that are changed while they are being followed.
+	for _ in 0..=MAX_LINKS {
+		let name = path.file_name().ok_or_else(|| {
+			io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("{} does not name a file", path.display()),
+			)
+		})?;
+		match path.canonicalize() {
+			Ok(canonical) => return Ok(canonical),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => return Err(e),
+		}
+		let parent = match path.parent() {
+			Some(parent) if !parent.as_os_str().is_empty() => parent,
+			_ => Path::new("."),
+		};
+		let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+		if is_link {
+			// A relative target is relative to the link's directory.
+			path = parent.join(std::fs::read_link(&path)?);
+			continue;
+		}
+		std::fs::create_dir_all(parent)?;
+		return Ok(parent.canonicalize()?.join(name));
 	}
-	let parent = match path.parent() {
-		Some(parent) if !parent.as_os_str().is_empty() => parent,
-		_ => Path::new("."),
-	};
-	std::fs::create_dir_all(parent)?;
-	Ok(parent.canonicalize()?.join(name))
+	Err(io::Error::new(
+		io::ErrorKind::InvalidInput,
+		format!("{}: too many symbolic links", path.display()),
+	))
 }
+
+/// The most symbolic links [`canonical`] follows to a file that does not exist yet.
+const MAX_LINKS: usize = 40;
 
 /// A store's claim on its file, held until it is dropped.
 #[derive(Debug)]

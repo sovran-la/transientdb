@@ -13,7 +13,7 @@ fn test_create_writes_the_header_and_nothing_else() {
 	assert_eq!(bytes_of(&path), encode(SLOT as u32, ID));
 	assert_eq!(drain(&hook), vec![Op::Create, Op::Header]);
 	assert_eq!(core.index.slots(), 0);
-	assert_eq!(core.index.next_sequence(), 1);
+	assert_eq!(core.index.next_sequence(), Some(1));
 }
 
 #[test]
@@ -45,13 +45,43 @@ fn test_next_sequence_follows_the_highest_entry_live_or_free() {
 	assert!(core.free(3).unwrap());
 	drop(core);
 	let mut core = open(&path);
-	assert_eq!(core.index.next_sequence(), 5);
+	assert_eq!(core.index.next_sequence(), Some(5));
 	assert_eq!(core.append_text(&item(4, 7)).unwrap(), 5);
-	// A damaged entry's sequence counts as well.
-	poke(&path, layout().entry_offset(3) + 8, &900u64.to_le_bytes());
-	poke(&path, layout().entry_offset(3), &[9]);
 	drop(core);
-	assert_eq!(open(&path).index.next_sequence(), 901);
+	// Slot 3 holds item 4's free entry. A free entry with a valid length counts,
+	// whatever its sequence.
+	poke(&path, layout().entry_offset(3) + 8, &900u64.to_le_bytes());
+	assert_eq!(open(&path).index.next_sequence(), Some(901));
+}
+
+#[test]
+fn test_an_invalid_entrys_sequence_does_not_count() {
+	// An entry that open frees as invalid carries no trustworthy sequence; one at or
+	// near u64::MAX would otherwise use up every sequence after it.
+	let damage: [(&str, u8, Option<u32>); 4] = [
+		("state 9", 9, None),
+		("state 255", 255, None),
+		("live, length 0", 1, Some(0)),
+		("free, length past the slot", 0, Some(SLOT as u32 + 1)),
+	];
+	for (what, state, length) in damage {
+		let (_dir, path) = temp_path();
+		let mut core = open(&path);
+		for tag in 0..3 {
+			core.append_text(&item(4, tag)).unwrap();
+		}
+		drop(core);
+		let entry = layout().entry_offset(2);
+		poke(&path, entry + 8, &u64::MAX.to_le_bytes());
+		poke(&path, entry, &[state]);
+		if let Some(length) = length {
+			poke(&path, entry + 4, &length.to_le_bytes());
+		}
+		let mut core = open(&path);
+		assert_eq!(core.index.next_sequence(), Some(3), "{what}");
+		assert_eq!(core.append_text(&item(4, 7)).unwrap(), 3, "{what}");
+		assert_eq!(core.append_text(&item(4, 8)).unwrap(), 4, "{what}");
+	}
 }
 
 #[test]

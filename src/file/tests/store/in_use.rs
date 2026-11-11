@@ -165,3 +165,26 @@ fn test_two_paths_in_one_directory_are_two_stores() {
 	assert_eq!(available(&mut a), vec![json!("a")]);
 	assert_eq!(available(&mut b), vec![json!("b")]);
 }
+
+#[cfg(unix)]
+#[test]
+fn test_a_store_on_a_symlink_to_a_missing_file_creates_the_file_at_its_target() {
+	let (_dir, real) = temp_path();
+	let link = real.with_file_name("link.tdb");
+	std::os::unix::fs::symlink("store.tdb", &link).unwrap();
+	let mut store = store(&link, 100);
+	append_all(&mut store, &tagged(0..2));
+	assert!(real.is_file(), "the file is created where the link points");
+	assert!(std::fs::symlink_metadata(&link)
+		.unwrap()
+		.file_type()
+		.is_symlink());
+	// The target's own path is the same store.
+	let mut second = FileStore::with_hook(config(&real, SLOT, 100), untouchable());
+	assert!(matches!(second.append(json!(1)), Err(Error::InUse)));
+	drop(second);
+	drop(store);
+	// The next run finds the items through either spelling.
+	assert_eq!(reopened(&link), tagged(0..2));
+	assert_eq!(available(&mut super::store(&real, 100)), tagged(0..2));
+}

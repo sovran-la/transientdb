@@ -18,6 +18,7 @@ mod pending;
 mod remove;
 mod reuse;
 mod send;
+mod sequence;
 mod shrink;
 mod two_stores;
 

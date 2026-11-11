@@ -8,7 +8,7 @@ fn test_a_new_index_has_every_slot_free() {
 	assert_eq!(index.slots(), 3);
 	assert_eq!(index.live_len(), 0);
 	assert_eq!(index.free().collect::<Vec<_>>(), vec![0, 1, 2]);
-	assert_eq!(index.next_sequence(), 9);
+	assert_eq!(index.next_sequence(), Some(9));
 	assert_eq!(index.oldest(), None);
 }
 
@@ -111,30 +111,55 @@ fn test_add_slot_counts_whole_slots_and_frees_any_skipped() {
 #[test]
 fn test_sequences_are_never_handed_out_twice() {
 	let mut index = SlotIndex::new(0, 1);
-	assert_eq!(index.take_sequence(), 1);
-	assert_eq!(index.take_sequence(), 2);
-	assert_eq!(index.next_sequence(), 3);
+	assert_eq!(index.take_sequence().unwrap(), 1);
+	assert_eq!(index.take_sequence().unwrap(), 2);
+	assert_eq!(index.next_sequence(), Some(3));
 }
 
 #[test]
-fn test_the_last_sequence_saturates_rather_than_wrapping_to_old_ones() {
-	// Only a damaged entry can carry a sequence this high; wrapping would hand out
-	// sequences of items that may still be stored.
+fn test_the_last_sequence_is_handed_out_once_then_none_is() {
+	// Only a damaged entry can carry a sequence this high. Wrapping would hand out
+	// sequences of items that may still be stored, and saturating would hand out the
+	// last one again and again.
 	let mut index = SlotIndex::new(0, 1);
-	index.set_next_sequence(u64::MAX);
-	assert_eq!(index.take_sequence(), u64::MAX);
-	assert_eq!(index.next_sequence(), u64::MAX);
+	index.set_next_sequence(Some(u64::MAX - 1));
+	assert_eq!(index.upcoming_sequence().unwrap(), u64::MAX - 1);
+	assert_eq!(index.take_sequence().unwrap(), u64::MAX - 1);
+	assert_eq!(index.take_sequence().unwrap(), u64::MAX);
+	assert_eq!(index.next_sequence(), None);
+	for _ in 0..2 {
+		let e = index.take_sequence().unwrap_err();
+		assert_eq!(e.kind(), std::io::ErrorKind::Other);
+		assert_eq!(e.to_string(), "sequence numbers exhausted");
+		assert_eq!(
+			index.upcoming_sequence().unwrap_err().to_string(),
+			"sequence numbers exhausted"
+		);
+		assert_eq!(index.next_sequence(), None);
+	}
+}
+
+#[test]
+fn test_renewing_restarts_only_exhausted_sequences() {
+	let mut index = SlotIndex::new(0, 1);
+	index.set_next_sequence(Some(7));
+	index.renew_exhausted_sequences();
+	assert_eq!(index.next_sequence(), Some(7), "not exhausted: carries on");
+	index.set_next_sequence(None);
+	index.renew_exhausted_sequences();
+	assert_eq!(index.next_sequence(), Some(1));
+	assert_eq!(index.take_sequence().unwrap(), 1);
 }
 
 #[test]
 fn test_clear_slots_keeps_the_sequence() {
 	let mut index = SlotIndex::new(2, 1);
-	index.take_sequence();
+	index.take_sequence().unwrap();
 	index.set_live(0, 1, 1);
 	index.clear_slots();
 	assert_eq!(index.slots(), 0);
 	assert_eq!(index.live_len(), 0);
 	assert_eq!(index.free().count(), 0);
-	assert_eq!(index.next_sequence(), 2);
+	assert_eq!(index.next_sequence(), Some(2));
 	assert_eq!(index.target(5), Target::New(0));
 }

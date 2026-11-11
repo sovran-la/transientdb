@@ -27,7 +27,9 @@ impl FileCore {
 			let mut bytes = [0u8; entry::LEN];
 			file.read_at(layout.entry_offset(slot), &mut bytes, Op::ReadEntry)?;
 			let entry = Entry::decode(&bytes);
-			highest = highest.max(entry.sequence);
+			if entry.has_valid_sequence(layout.slot_size) {
+				highest = highest.max(entry.sequence);
+			}
 			if !entry.is_valid_live(layout.slot_size) {
 				if entry.state != FREE {
 					cleared.push((slot, "its entry is neither free nor validly live"));
@@ -50,11 +52,19 @@ impl FileCore {
 		for (slot, why) in cleared {
 			core.clear_state(slot, why);
 		}
-		index.set_next_sequence(highest.saturating_add(1));
+		index.set_next_sequence(highest.checked_add(1));
 		core.index = index;
 		core.drop_excess();
-		if core.index.live_len() == 0 && len > HEADER_LEN {
-			core.cut_to_header();
+		// With no entry left in the file and nothing handed out yet, no item can share
+		// a sequence with a new one: sequences an entry used up may start again.
+		if core.index.live_len() == 0 && len > HEADER_LEN && core.cut_to_header() {
+			core.index.renew_exhausted_sequences();
+		}
+		if core.index.upcoming_sequence().is_err() {
+			core.log(format_args!(
+				"sequence numbers are exhausted: every append fails until the store is reset, \
+				 or emptied and opened again"
+			));
 		}
 		Ok(core)
 	}

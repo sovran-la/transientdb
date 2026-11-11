@@ -2,6 +2,7 @@
 
 use super::support::*;
 use crate::file::faults::Op;
+use crate::file::index::Target;
 use crate::file::layout::HEADER_LEN;
 use std::io::ErrorKind;
 
@@ -32,7 +33,7 @@ fn test_an_empty_or_too_long_item_is_refused_with_nothing_written() {
 	}
 	assert!(drain(&hook).is_empty());
 	assert_eq!(file_len(&path), HEADER_LEN);
-	assert_eq!(core.index.next_sequence(), 1);
+	assert_eq!(core.index.next_sequence(), Some(1));
 }
 
 #[test]
@@ -97,24 +98,40 @@ fn test_sequences_count_up_from_one() {
 
 #[test]
 fn test_a_failed_payload_write_changes_nothing() {
-	for (free_slot, what) in [(true, "into a free slot"), (false, "into a new slot")] {
+	let cases = [
+		("into a free slot", 10, Target::Free(1)),
+		("into a new slot", 10, Target::New(2)),
+		// Full: the oldest item is not dropped, and stays live in the index.
+		(
+			"into the oldest item's slot",
+			2,
+			Target::Oldest {
+				sequence: 1,
+				slot: 0,
+			},
+		),
+	];
+	for (what, max_items, target) in cases {
 		let (_dir, path) = temp_path();
-		let (mut core, hook) = open_with(&path, 10);
+		let (mut core, hook) = open_with(&path, max_items);
 		core.append_text(&item(5, 0)).unwrap();
 		core.append_text(&item(5, 1)).unwrap();
-		if free_slot {
+		if let Target::Free(_) = target {
 			// The newest item, in slot 1.
 			core.free(2).unwrap();
 		}
+		assert_eq!(core.index.target(max_items), target, "{what}");
+		let before = texts(&mut core);
 		let index = core.index.clone();
-		let len = file_len(&path);
+		let bytes = bytes_of(&path);
 		drain(&hook);
 		hook.lock().unwrap().fail(Op::Payload);
 		assert!(core.append_text(&item(5, 2)).is_err(), "{what}");
 		assert!(drain(&hook).is_empty(), "{what}");
 		assert_eq!(core.index, index, "{what}");
-		assert_eq!(file_len(&path), len, "{what}");
+		assert_eq!(bytes_of(&path), bytes, "{what}");
 		hook.lock().unwrap().fail.clear();
+		assert_eq!(texts(&mut core), before, "{what}");
 		core.append_text(&item(5, 3)).unwrap();
 		assert_eq!(texts(&mut open(&path)).last(), Some(&item(5, 3)), "{what}");
 	}

@@ -2,6 +2,7 @@
 //! which item, and which are free.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::ops::Bound;
 
 /// A live slot's item.
@@ -40,8 +41,9 @@ pub(super) struct SlotIndex {
 	free: BTreeSet<u64>,
 	/// The slots the file holds whole. Every one is live or free.
 	slots: u64,
-	/// The sequence the next append gets.
-	next_sequence: u64,
+	/// The sequence the next append gets, or `None` once every sequence has been
+	/// handed out.
+	next_sequence: Option<u64>,
 }
 
 impl SlotIndex {
@@ -52,7 +54,7 @@ impl SlotIndex {
 			live: BTreeMap::new(),
 			free: (0..slots).collect(),
 			slots,
-			next_sequence,
+			next_sequence: Some(next_sequence),
 		}
 	}
 
@@ -65,7 +67,7 @@ impl SlotIndex {
 	}
 
 	#[cfg(test)]
-	pub(super) fn next_sequence(&self) -> u64 {
+	pub(super) fn next_sequence(&self) -> Option<u64> {
 		self.next_sequence
 	}
 
@@ -113,16 +115,39 @@ impl SlotIndex {
 		}
 	}
 
-	pub(super) fn set_next_sequence(&mut self, next_sequence: u64) {
+	/// Sets the sequence the next append gets; `None` if none is left.
+	pub(super) fn set_next_sequence(&mut self, next_sequence: Option<u64>) {
 		self.next_sequence = next_sequence;
+	}
+
+	/// The sequence the next append gets, without taking it.
+	///
+	/// # Errors
+	/// An `Io` error once every sequence has been handed out: they never wrap or repeat,
+	/// so no two items can share one.
+	pub(super) fn upcoming_sequence(&self) -> io::Result<u64> {
+		self.next_sequence
+			.ok_or_else(|| io::Error::other("sequence numbers exhausted"))
 	}
 
 	/// Takes the next sequence. It is never handed out again, whether or not the
 	/// append it is for commits.
-	pub(super) fn take_sequence(&mut self) -> u64 {
-		let sequence = self.next_sequence;
-		self.next_sequence = sequence.saturating_add(1);
-		sequence
+	///
+	/// # Errors
+	/// As [`upcoming_sequence`](Self::upcoming_sequence), taking nothing.
+	pub(super) fn take_sequence(&mut self) -> io::Result<u64> {
+		let sequence = self.upcoming_sequence()?;
+		self.next_sequence = sequence.checked_add(1);
+		Ok(sequence)
+	}
+
+	/// Starts sequences again from 1 if every one has been handed out. Only for when the
+	/// file holds no entry and nothing handed out before can match a new item: right
+	/// after a store opens a file, or after a reset that starts a new claim epoch.
+	pub(super) fn renew_exhausted_sequences(&mut self) {
+		if self.next_sequence.is_none() {
+			self.next_sequence = Some(1);
+		}
 	}
 
 	/// Records that the file now holds slot `slot` whole, as a free slot if it was not

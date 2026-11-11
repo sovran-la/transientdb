@@ -77,14 +77,22 @@ fn test_a_damaged_item_is_freed_and_skipped_and_does_not_count() {
 
 #[test]
 fn test_a_store_whose_only_items_are_damaged_hands_out_nothing() {
-	let (_dir, path) = temp_path();
-	let mut store = store(&path, 100);
-	append_all(&mut store, &tagged(0..2));
-	for slot in 0..2 {
-		poke(&path, layout().payload_offset(slot) + 1, b"Z");
+	// `has_data` is true until a fetch finds the damage (spec differs, W2-R4): no
+	// payload is read before a fetch, in the store that wrote them or in the next one.
+	for reopen in [false, true] {
+		let (_dir, path) = temp_path();
+		let mut store = store(&path, 100);
+		append_all(&mut store, &tagged(0..2));
+		for slot in 0..2 {
+			poke(&path, layout().payload_offset(slot) + 1, b"Z");
+		}
+		if reopen {
+			drop(store);
+			store = super::store(&path, 100);
+		}
+		assert!(store.has_data(), "nothing is read until a fetch ({reopen})");
+		assert!(store.fetch(10, 100).unwrap().is_none(), "{reopen}");
+		assert!(!store.has_data(), "{reopen}");
+		assert_eq!(file_len(&path), crate::file::layout::HEADER_LEN, "{reopen}");
 	}
-	assert!(store.has_data(), "nothing is read until a fetch");
-	assert!(store.fetch(10, 100).unwrap().is_none());
-	assert!(!store.has_data());
-	assert_eq!(file_len(&path), crate::file::layout::HEADER_LEN);
 }

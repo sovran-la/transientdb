@@ -44,6 +44,14 @@ impl Entry {
 		self.state == LIVE && (1..=slot_size).contains(&self.length)
 	}
 
+	/// Whether open counts this entry's sequence toward the next one: a free or live
+	/// entry with a length a slot of `slot_size` bytes can hold. The sequence of any
+	/// other entry is as damaged as the rest of it, and counting it could exhaust the
+	/// sequences for every item after it.
+	pub(super) fn has_valid_sequence(&self, slot_size: u32) -> bool {
+		matches!(self.state, FREE | LIVE) && (1..=slot_size).contains(&self.length)
+	}
+
 	/// Whether `payload` is the payload this entry was written for.
 	pub(super) fn matches(&self, payload: &[u8]) -> bool {
 		payload.len() == self.length as usize && crc(self.sequence, payload) == self.crc

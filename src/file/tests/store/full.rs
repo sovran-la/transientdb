@@ -1,10 +1,11 @@
-//! A full store: the oldest item is dropped, fetched or not; a kill between the two
-//! writes of a drop; `max_items` raised and lowered between runs.
+//! A full store: the oldest item is dropped, fetched or not; a failed payload write into
+//! a held oldest item's slot; a kill between the two writes of a drop; `max_items` raised
+//! and lowered between runs.
 
 use super::*;
 use crate::contract::{append_all, available, tagged};
-use crate::file::faults::Faults;
-use crate::{DataStore, Items};
+use crate::file::faults::{Faults, Op};
+use crate::{DataStore, Error, Items};
 use serde_json::json;
 
 #[test]
@@ -147,4 +148,38 @@ fn test_max_items_lowered_and_raised_between_runs() {
 	assert_eq!(available(&mut store), tagged(10..11));
 	store.append(json!({"i": 11})).unwrap();
 	assert_eq!(stored(&mut store), tagged(11..12));
+}
+
+#[test]
+fn test_a_failed_payload_write_into_a_held_oldest_items_slot_keeps_it_held() {
+	// The review's probe for W2-R2: the append fails before the oldest item is dropped,
+	// so it is still stored and still held, and must not be handed out a second time.
+	for release in [false, true] {
+		let (_dir, path) = temp_path();
+		let (mut store, hook) = store_with(&path, 2);
+		append_all(&mut store, &tagged(0..2));
+		let held = store.fetch(1, 100).unwrap().unwrap();
+		assert_eq!(held.values(), tagged(0..1));
+		hook.lock().unwrap().fail(Op::Payload);
+		let result = store.append(json!({"i": 2}));
+		hook.lock().unwrap().fail.clear();
+		assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+		assert_eq!(stored(&mut store), tagged(0..2));
+		assert_eq!(store.ledger().lock().pending_count(), 1);
+		assert_eq!(available(&mut store), tagged(1..2));
+		if release {
+			// Given back, it is available again, oldest first.
+			drop(held);
+			assert_eq!(available(&mut store), tagged(0..2));
+			assert_eq!(stored(&mut store), tagged(0..2));
+		} else {
+			// Its Items still removes it.
+			store.remove(held).unwrap();
+			assert_eq!(stored(&mut store), tagged(1..2));
+			assert_eq!(available(&mut store), tagged(1..2));
+		}
+		let expected = stored(&mut store);
+		drop(store);
+		assert_eq!(reopened(&path), expected);
+	}
 }

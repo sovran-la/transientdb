@@ -76,7 +76,7 @@ fn test_reset_cuts_the_file_with_items_stored_or_not() {
 		assert_eq!(drain(&hook), vec![Op::Cut]);
 		assert_eq!(bytes_of(&path), encode(SLOT as u32, ID));
 		assert!(texts(&mut core).is_empty());
-		assert_eq!(core.append_text(&item(6, 9)).unwrap(), next);
+		assert_eq!(Some(core.append_text(&item(6, 9)).unwrap()), next);
 		assert_eq!(slots_of(&core), vec![0]);
 		drop(core);
 		assert_eq!(texts(&mut open(&path)), vec![item(6, 9)]);
@@ -133,7 +133,7 @@ fn test_open_cuts_a_file_with_no_live_item() {
 	assert_eq!(file_len(&path), HEADER_LEN);
 	assert_eq!(core.index.slots(), 0);
 	// The free entries' sequences were read before the cut.
-	assert_eq!(core.index.next_sequence(), 3);
+	assert_eq!(core.index.next_sequence(), Some(3));
 }
 
 #[test]

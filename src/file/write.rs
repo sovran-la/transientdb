@@ -25,7 +25,8 @@ impl FileCore {
 	/// error returned; when dropping, the oldest item is gone either way.
 	///
 	/// `text` must be 1 to `max_item_size` bytes; anything else is `InvalidInput`, with
-	/// nothing written.
+	/// nothing written. Once every sequence has been handed out, every append is an
+	/// `Io` error ("sequence numbers exhausted"), with nothing written.
 	pub(super) fn append_text(&mut self, text: &str) -> io::Result<u64> {
 		let payload = text.as_bytes();
 		let slot_size = self.layout.slot_size as usize;
@@ -38,6 +39,9 @@ impl FileCore {
 				),
 			));
 		}
+		// Checked before anything is written; the sequence is taken only once the payload
+		// is, below.
+		self.index.upcoming_sequence()?;
 		let target = self.index.target(self.max_items);
 		let slot = target.slot();
 		let payload_offset = self.layout.payload_offset(slot);
@@ -50,7 +54,7 @@ impl FileCore {
 			self.file.write_at(payload_offset, payload, Op::Payload)?;
 		}
 
-		let sequence = self.index.take_sequence();
+		let sequence = self.index.take_sequence()?;
 		let entry_offset = self.layout.entry_offset(slot);
 		let committed = self.file.write_at(
 			entry_offset,
@@ -141,8 +145,15 @@ impl FileCore {
 	}
 
 	/// Removes every item by cutting the file back to its header. Sequences carry on
-	/// from where they were. If the cut fails, that is logged and nothing changes.
+	/// from where they were, unless every one was handed out: then they start again
+	/// from 1, which is safe only because the caller starts a new claim epoch whenever
+	/// this returns true, so nothing handed out before can match a new item. If the cut
+	/// fails, that is logged and nothing changes.
 	pub(super) fn reset(&mut self) -> bool {
-		self.cut_to_header()
+		let cut = self.cut_to_header();
+		if cut {
+			self.index.renew_exhausted_sequences();
+		}
+		cut
 	}
 }

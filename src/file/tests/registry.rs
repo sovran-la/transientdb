@@ -117,3 +117,47 @@ fn test_a_panic_while_holding_a_lease_releases_it() {
 	assert!(result.is_err());
 	assert!(Lease::acquire(path).is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_to_a_missing_file_is_where_the_file_will_be() {
+	use std::os::unix::fs::symlink;
+	let dir = TempDir::new().unwrap();
+	let real = dir.path().join("real.tdb");
+	// Relative to the link's directory, as a link usually is.
+	let link = dir.path().join("link.tdb");
+	symlink("real.tdb", &link).unwrap();
+	// A link to that link, and an absolute link into a directory that is missing.
+	let chain = dir.path().join("chain.tdb");
+	symlink(&link, &chain).unwrap();
+	let deep = dir.path().join("a").join("b").join("deep.tdb");
+	let to_deep = dir.path().join("to-deep.tdb");
+	symlink(&deep, &to_deep).unwrap();
+
+	let expected = canonical(&real).unwrap();
+	assert_eq!(canonical(&link).unwrap(), expected);
+	assert_eq!(canonical(&chain).unwrap(), expected);
+	assert_eq!(canonical(&relative(&link)).unwrap(), expected);
+	assert!(!real.exists(), "nothing is created but parent directories");
+	assert_eq!(canonical(&to_deep).unwrap(), canonical(&deep).unwrap());
+	assert!(dir.path().join("a/b").is_dir());
+	assert!(!deep.exists());
+	// Once the file exists, every spelling gives the same path.
+	std::fs::write(&real, b"x").unwrap();
+	assert_eq!(canonical(&chain).unwrap(), expected);
+	assert_eq!(canonical(&real).unwrap(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_loop_is_an_error() {
+	use std::os::unix::fs::symlink;
+	let dir = TempDir::new().unwrap();
+	let a = dir.path().join("a.tdb");
+	let b = dir.path().join("b.tdb");
+	symlink(&b, &a).unwrap();
+	symlink(&a, &b).unwrap();
+	let e = canonical(&a).unwrap_err();
+	assert_ne!(e.kind(), ErrorKind::NotFound, "{e}");
+	assert!(!dir.path().join("a.tdb").exists());
+}
