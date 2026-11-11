@@ -64,6 +64,7 @@ impl SlotIndex {
 		self.slots
 	}
 
+	#[cfg(test)]
 	pub(super) fn next_sequence(&self) -> u64 {
 		self.next_sequence
 	}
@@ -85,6 +86,7 @@ impl SlotIndex {
 	}
 
 	/// Free slots, lowest first.
+	#[cfg(test)]
 	pub(super) fn free(&self) -> impl Iterator<Item = u64> + '_ {
 		self.free.iter().copied()
 	}

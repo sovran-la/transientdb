@@ -4,6 +4,7 @@ use super::core::FileCore;
 use super::entry::{self, Entry, LIVE};
 use super::faults::Op;
 use super::index::Live;
+use crate::serialize;
 use std::io;
 
 impl FileCore {
@@ -11,8 +12,8 @@ impl FileCore {
 	/// at most `count`, whose lengths total at most `max_bytes`. Stops at the first item
 	/// that would pass `max_bytes`, so items are never returned out of order.
 	///
-	/// Each item is checked as it is read: its CRC, that it is UTF-8 and well-formed
-	/// JSON. One that fails is freed, logged and skipped. One whose slot no longer holds
+	/// Each item is checked as it is read: its CRC, that it is UTF-8, and that it is
+	/// well-formed JSON within the depth `append` allows. One that fails is freed, logged and skipped. One whose slot no longer holds
 	/// it (only another process using the file can cause that) is forgotten, logged and
 	/// skipped, and its slot left as it is.
 	///
@@ -47,11 +48,6 @@ impl FileCore {
 		Ok(items)
 	}
 
-	/// Whether any live item is not `skipped`.
-	pub(super) fn has_unskipped(&self, mut skipped: impl FnMut(u64) -> bool) -> bool {
-		self.index.live().any(|(sequence, _)| !skipped(sequence))
-	}
-
 	/// Reads item `sequence` from its slot and checks it. `None` if it failed a check and
 	/// was dropped.
 	fn read_item(&mut self, sequence: u64, live: Live) -> io::Result<Option<String>> {
@@ -79,8 +75,8 @@ impl FileCore {
 			self.discard(sequence, "it is not UTF-8");
 			return Ok(None);
 		};
-		if serde_json::from_str::<serde::de::IgnoredAny>(&text).is_err() {
-			self.discard(sequence, "it is not well-formed JSON");
+		if let Err(unfit) = serialize::check_text(&text, self.layout.slot_size as usize) {
+			self.discard(sequence, &unfit.to_string());
 			return Ok(None);
 		}
 		Ok(Some(text))

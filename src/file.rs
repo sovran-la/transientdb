@@ -11,9 +11,7 @@
 //! - [`registry`]: the paths in use by stores in this process.
 //! - [`index`]: which slots are live, with which items, and which are free.
 //! - [`core`], [`scan`], [`write`] and [`read`]: what the store does to its file.
-
-// Until the store's public API is built on it, only the tests use this module.
-#![allow(dead_code)]
+//! - [`store`]: [`FileStore`] itself, which adds the registry and the claim ledger.
 
 mod config;
 mod core;
@@ -27,7 +25,11 @@ mod layout;
 mod read;
 mod registry;
 mod scan;
+mod store;
 mod write;
+
+pub use config::FileConfig;
+pub use store::FileStore;
 
 #[cfg(test)]
 mod tests {
@@ -48,6 +50,7 @@ mod tests {
 	mod registry;
 	mod reuse;
 	mod shrink;
+	mod store;
 	mod support;
 	mod two_cores;
 }

@@ -95,6 +95,8 @@ mod injection {
 		/// For each kind that is to fail, how many more times it succeeds first. A kind fails
 		/// every time once its count reaches 0, until it is taken out.
 		pub(crate) fail: HashMap<Op, usize>,
+		/// For each kind, how many more times it fails before it succeeds again.
+		pub(crate) fail_next: HashMap<Op, usize>,
 		/// Bytes that may still reach the file; `None` never cuts a write. The write that
 		/// would pass it writes only what is left, and then the store is killed.
 		pub(crate) write_budget: Option<usize>,
@@ -141,10 +143,22 @@ mod injection {
 			self.fail.insert(op, times);
 		}
 
-		/// Whether `op` may go ahead. Counts it down if it is set to fail later.
+		/// Makes the next `times` of `op` fail, and the ones after succeed.
+		pub(crate) fn fail_next(&mut self, op: Op, times: usize) {
+			self.fail_next.insert(op, times);
+		}
+
+		/// Whether `op` may go ahead. Counts it down if it is set to fail later, or to
+		/// fail a few more times.
 		pub(crate) fn check(&mut self, op: Op) -> io::Result<()> {
 			if self.killed {
 				return Err(super::killed());
+			}
+			if let Some(left) = self.fail_next.get_mut(&op) {
+				if *left > 0 {
+					*left -= 1;
+					return Err(injected(op));
+				}
 			}
 			match self.fail.get_mut(&op) {
 				Some(0) => Err(injected(op)),

@@ -3,21 +3,47 @@
 use super::header::MAX_ID_LEN;
 use std::path::PathBuf;
 
-/// Configuration for a FileStore.
+/// Configuration for a [`FileStore`](crate::FileStore).
 ///
-/// The file is never larger than `256 + (32 + max_item_size) * max_items` bytes.
+/// The file is never larger than `256 + (32 + max_item_size) * max_items` bytes, and is
+/// only as large as the queue has been deep: with `max_item_size = 8192` and
+/// `max_items = 2560` it may reach 21,053,696 bytes, but a queue never more than 50
+/// items deep keeps it at 411,456.
+///
+/// Put the file somewhere the OS keeps while the app is suspended: not in a temporary
+/// or cache directory, preferably in the app's own container, and with a
+/// data-protection class that allows access whenever the app can run. See
+/// [`FileStore`](crate::FileStore#where-to-put-the-file).
+///
+/// # Examples
+/// ```
+/// use transientdb::{FileConfig, FileStore};
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let store = FileStore::new(FileConfig {
+///     path: dir.path().join("queue").join("events.tdb"), // `queue/` is created
+///     id: "write-key".to_string(), // a file held for another id is discarded
+///     max_item_size: 8 * 1024,     // no item over 8 KiB serialized
+///     max_items: 1000,             // the 1001st append drops the oldest item
+/// });
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileConfig {
-	/// The store's file. Its parent directory is created if missing.
+	/// The store's file. Its parent directory is created if missing. Two stores in one
+	/// process must not use one file, however its path is spelled: the second does
+	/// nothing until the first is dropped.
 	pub path: PathBuf,
 	/// Whose data this is: a write key, for example. It is recorded in the file, and a
 	/// file recorded under a different id is discarded at open. 1 to 224 bytes.
 	pub id: String,
-	/// Largest serialized item, in bytes. This is the slot size, and it is part of the
-	/// file's layout.
+	/// The largest item the store accepts: its compact `serde_json` text, in bytes.
+	/// `append` rejects a larger item with [`Error::ItemTooLarge`](crate::Error). This is
+	/// the size of every slot in the file, so changing it discards the file. Must be 1 to
+	/// `u32::MAX`.
 	pub max_item_size: usize,
-	/// The most items the store holds at once. Appending past it drops the oldest item.
-	/// Not part of the file's layout: it can change between runs.
+	/// The most items the store holds at once. Appending past it drops the oldest item,
+	/// fetched or not. It can change between runs: lowered, the oldest items beyond it
+	/// are dropped when the file is opened. Must not be 0.
 	pub max_items: usize,
 }
 

@@ -1,23 +1,10 @@
 //! The process-wide registry of store files in use.
 
+use super::support::relative;
 use crate::file::registry::{canonical, Lease};
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use tempfile::TempDir;
-
-/// `path`, an absolute path, spelled relative to the current directory.
-fn relative(path: &Path) -> PathBuf {
-	let cwd = std::env::current_dir().unwrap();
-	let ups = cwd
-		.components()
-		.filter(|c| matches!(c, Component::Normal(_)))
-		.count();
-	let mut relative = PathBuf::new();
-	for _ in 0..ups {
-		relative.push("..");
-	}
-	relative.join(path.strip_prefix("/").unwrap())
-}
 
 #[test]
 fn test_a_path_is_held_by_one_lease_at_a_time() {

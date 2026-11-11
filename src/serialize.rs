@@ -36,7 +36,7 @@ pub(crate) fn item_text(item: Value, max_item_size: usize) -> Result<String> {
 
 /// Why stored text is not an item a store may hand out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
+#[cfg_attr(all(target_arch = "wasm32", not(feature = "web")), allow(dead_code))]
 pub(crate) enum Unfit {
 	/// Not one well-formed JSON value.
 	Malformed,
@@ -60,7 +60,7 @@ impl fmt::Display for Unfit {
 
 /// Checks text read back from storage: it must be within `max_item_size`, one
 /// well-formed JSON value, and no deeper than `append` allows.
-#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
+#[cfg_attr(all(target_arch = "wasm32", not(feature = "web")), allow(dead_code))]
 pub(crate) fn check_text(text: &str, max_item_size: usize) -> std::result::Result<(), Unfit> {
 	if text.len() > max_item_size {
 		return Err(Unfit::TooLarge {

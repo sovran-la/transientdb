@@ -3,10 +3,12 @@
 
 use rand::Rng;
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 use transientdb::TransientDB;
-use transientdb::{MemoryConfig, MemoryStore, Result};
+use transientdb::{FileConfig, FileStore, MemoryConfig, MemoryStore, Result};
 
 /// Executes a comprehensive stress test of the MemoryStore implementation under heavy concurrent load.
 /// This test runs for 30 seconds and simulates real-world usage patterns with multiple concurrent
@@ -55,17 +57,43 @@ use transientdb::{MemoryConfig, MemoryStore, Result};
 
 #[test]
 fn test_memory_store_stress() -> Result<()> {
-	use std::sync::atomic::{AtomicU64, Ordering};
-	use std::time::{Duration, Instant};
-
 	let config = MemoryConfig {
 		max_item_size: 8 * 1024,
 		max_items: 10_000,
 	};
 
 	let store = MemoryStore::new(config);
-	let db = Arc::new(TransientDB::new(store));
+	stress(
+		Arc::new(TransientDB::new(store)),
+		"Memory",
+		Duration::from_secs(10),
+	)
+}
 
+/// The same load on a FileStore, for half as long: every append and remove is a write
+/// to its file.
+#[test]
+fn test_file_store_stress() -> Result<()> {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("stress.tdb");
+	let store = FileStore::new(FileConfig {
+		path: path.clone(),
+		id: "stress".to_string(),
+		max_item_size: 1024,
+		max_items: 10_000,
+	});
+	stress(
+		Arc::new(TransientDB::new(store)),
+		"File",
+		Duration::from_secs(5),
+	)?;
+	// Drained: the file is back to its header.
+	assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
+	Ok(())
+}
+
+/// Runs the stress load described above on `db` for `test_duration`, then drains it.
+fn stress(db: Arc<TransientDB>, label: &str, test_duration: Duration) -> Result<()> {
 	// Tracking metrics
 	let total_appends = Arc::new(AtomicU64::new(0));
 	let total_fetches = Arc::new(AtomicU64::new(0));
@@ -73,7 +101,6 @@ fn test_memory_store_stress() -> Result<()> {
 	let errors_count = Arc::new(AtomicU64::new(0));
 
 	let mut handles = vec![];
-	let test_duration = Duration::from_secs(10);
 	let start_time = Instant::now();
 
 	// Append threads
@@ -205,7 +232,7 @@ fn test_memory_store_stress() -> Result<()> {
 	}
 
 	// Print final statistics
-	println!("=== Memory Store Stress Test Results ===");
+	println!("=== {label} Store Stress Test Results ===");
 	println!("Total Duration: {:?}", start_time.elapsed());
 	println!("Total Appends: {}", total_appends.load(Ordering::Relaxed));
 	println!("Total Fetches: {}", total_fetches.load(Ordering::Relaxed));

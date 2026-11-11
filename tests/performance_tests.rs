@@ -4,11 +4,12 @@
 use serde_json::json;
 use std::time::{Duration, Instant};
 use transientdb::TransientDB;
-use transientdb::{MemoryConfig, MemoryStore, Result};
+use transientdb::{FileConfig, FileStore, MemoryConfig, MemoryStore, Result};
 
 /* run these tests locally with:
 
 cargo test --release benchmark_memory_store -- --nocapture
+cargo test --release benchmark_file_store -- --nocapture
 
  */
 
@@ -59,14 +60,34 @@ fn benchmark_memory_store() -> Result<()> {
 	};
 
 	let store = MemoryStore::new(config);
-	let db = TransientDB::new(store);
+	benchmark(&TransientDB::new(store), NUM_EVENTS, Duration::from_secs(5))
+}
 
+/// The same on a FileStore, with fewer events: each one takes a slot of its file, and
+/// every append is two writes to it.
+#[test]
+fn benchmark_file_store() -> Result<()> {
+	println!("\n=== File Store Performance Test ===");
+
+	let dir = tempfile::tempdir().unwrap();
+	let events = NUM_EVENTS / 10;
+	let store = FileStore::new(FileConfig {
+		path: dir.path().join("benchmark.tdb"),
+		id: "benchmark".to_string(),
+		max_item_size: 256,
+		max_items: events, // room for every event: nothing is dropped
+	});
+	benchmark(&TransientDB::new(store), events, Duration::from_secs(2))
+}
+
+/// Appends `num_events` events to `db`, then fetches for up to `read_for` per batch size.
+fn benchmark(db: &TransientDB, num_events: usize, read_for: Duration) -> Result<()> {
 	// Write test
-	println!("\nWrite Test - {} events", NUM_EVENTS);
+	println!("\nWrite Test - {} events", num_events);
 	let mut write_latencies = LatencyStats::new();
 	let write_start = Instant::now();
 
-	for i in 0..NUM_EVENTS {
+	for i in 0..num_events {
 		let event = json!({
 			"id": i,
 			"timestamp": "2026-11-10T12:00:00.000Z",
@@ -93,7 +114,7 @@ fn benchmark_memory_store() -> Result<()> {
 	println!("Total time: {:?}", write_duration);
 	println!(
 		"Events per second: {:.2}",
-		NUM_EVENTS as f64 / write_duration.as_secs_f64()
+		num_events as f64 / write_duration.as_secs_f64()
 	);
 	println!("P50 latency: {:?}", write_latencies.p50);
 	println!("P95 latency: {:?}", write_latencies.p95);
@@ -108,10 +129,10 @@ fn benchmark_memory_store() -> Result<()> {
 		let read_start = Instant::now();
 		let mut total_events = 0;
 
-		// Read for 5 seconds or until no more data. Each fetch is released when it is
+		// Read for `read_for` or until no more data. Each fetch is released when it is
 		// dropped, so the next fetch reads the same oldest items again.
 		println!("\nBatch size: {}", batch_size);
-		while read_start.elapsed() < Duration::from_secs(5) {
+		while read_start.elapsed() < read_for {
 			let op_start = Instant::now();
 			if let Ok(Some(items)) = db.fetch(batch_size, 10 * 1024 * 1024) {
 				let values = items.values();

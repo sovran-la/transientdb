@@ -51,9 +51,6 @@ fn test_skipped_items_are_passed_over_and_do_not_count() {
 	let items = core.read_items(2, 8, |s| s % 2 == 1).unwrap();
 	assert_eq!(items, vec![(2, item(4, 1)), (4, item(4, 3))]);
 	assert!(core.read_items(5, 100, |_| true).unwrap().is_empty());
-	assert!(core.has_unskipped(|s| s != 3));
-	assert!(!core.has_unskipped(|_| true));
-	assert!(core.has_unskipped(|_| false));
 }
 
 #[test]

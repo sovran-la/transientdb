@@ -1,10 +1,11 @@
 //! Lightweight queues for transient data: append JSON items, fetch them, remove them once
 //! they are delivered.
 //!
-//! Every store implements [`DataStore`]. [`MemoryStore`] keeps its items in memory;
-//! `WebStore` (feature `web`, `wasm32` only) keeps them in IndexedDB as well, so they
-//! survive a page reload. [`TransientDB`] wraps any store behind a mutex so threads can
-//! share it.
+//! Every store implements [`DataStore`]. [`MemoryStore`] keeps its items in memory.
+//! `FileStore` (native targets only) keeps them in one file, so they survive the process
+//! and a kill at any point. `WebStore` (feature `web`, `wasm32` only) keeps them in
+//! IndexedDB as well, so they survive a page reload. [`TransientDB`] wraps any store
+//! behind a mutex so threads can share it.
 //!
 //! ```
 //! use serde_json::json;
@@ -45,6 +46,8 @@ mod web;
 use serde_json::Value;
 
 pub use error::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
+pub use file::{FileConfig, FileStore};
 pub use items::Items;
 pub use memory::{MemoryConfig, MemoryStore};
 pub use transient::TransientDB;

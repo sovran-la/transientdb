@@ -4,7 +4,7 @@ use crate::file::config::FileConfig;
 use crate::file::core::FileCore;
 use crate::file::faults::{Faults, Hook, Op};
 use crate::file::layout::{Layout, HEADER_LEN};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
 /// The id the tests' stores use.
@@ -115,4 +115,18 @@ pub(crate) fn poke(path: &Path, offset: u64, bytes: &[u8]) {
 /// The bytes of the file at `path`.
 pub(crate) fn bytes_of(path: &Path) -> Vec<u8> {
 	std::fs::read(path).unwrap()
+}
+
+/// `path`, an absolute path, spelled relative to the current directory.
+pub(crate) fn relative(path: &Path) -> PathBuf {
+	let cwd = std::env::current_dir().unwrap();
+	let ups = cwd
+		.components()
+		.filter(|c| matches!(c, Component::Normal(_)))
+		.count();
+	let mut relative = PathBuf::new();
+	for _ in 0..ups {
+		relative.push("..");
+	}
+	relative.join(path.strip_prefix("/").unwrap())
 }
