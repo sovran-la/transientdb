@@ -17,6 +17,7 @@ mod persistence;
 mod reopen;
 mod schema;
 mod support;
+mod upgrade;
 mod write_failure;
 
 macro_rules! web_check {

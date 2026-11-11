@@ -31,6 +31,8 @@ fn test_rejected_items_use_no_sequence_number() {
 	assert_eq!(seqs(&store), vec![1, 2]);
 }
 
+/// Running out takes 2^64 - 2 appends, so the public docs promise no error for it; the
+/// guard still refuses to wrap, should it ever be reached.
 #[test]
 fn test_sequence_numbers_stop_before_wrapping() {
 	let mut store = store(1024, 100);

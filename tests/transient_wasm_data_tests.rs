@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 use transientdb::{TransientDB, WebConfig, WebStore};
 use wasm_bindgen_test::*;
 
+mod common;
+use common::{available, settle};
+
 wasm_bindgen_test_configure!(run_in_browser);
 
 fn test_config(db_name: &str) -> WebConfig {
@@ -22,18 +25,6 @@ async fn db(db_name: &str) -> TransientDB {
 	let db = TransientDB::new(WebStore::new(test_config(db_name)).await);
 	db.reset();
 	db
-}
-
-/// Everything a fetch could hand over now, released at once.
-fn available(db: &TransientDB) -> Vec<Value> {
-	db.fetch(usize::MAX, usize::MAX)
-		.unwrap()
-		.map_or_else(Vec::new, |items| items.values())
-}
-
-/// Lets fire-and-forget IndexedDB writes complete.
-async fn settle() {
-	gloo_timers::future::TimeoutFuture::new(100).await;
 }
 
 // =============================================================================

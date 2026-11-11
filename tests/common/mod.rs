@@ -1,4 +1,4 @@
-//! Helpers shared by the `Items` integration tests.
+//! Helpers shared by the integration tests.
 
 #![allow(dead_code)] // each test crate uses only some of them
 
@@ -49,4 +49,25 @@ pub fn within_deadline<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Se
 		.unwrap_or_else(|_| panic!("{what} did not finish: deadlocked or panicked"));
 	handle.join().unwrap();
 	value
+}
+
+/// Lets fire-and-forget IndexedDB writes complete: waits 100 ms on a browser timer.
+///
+/// Not `gloo_timers`: with wasm-bindgen 0.2.95 (as locked) and a rustc that uses v0
+/// symbol names (1.99 does), a test binary in which both `gloo_timers` and this crate
+/// create a `Closure<dyn FnMut()>` gets two closure shims exported under one demangled
+/// name, and the browser rejects the module ("duplicate export"). Do not reintroduce
+/// it here. (The library's unit tests use `gloo_timers` safely: there it is a dependency
+/// of the crate under test, which reuses its shim instead of making a second one.)
+#[cfg(target_arch = "wasm32")]
+pub async fn settle() {
+	let timer = js_sys::Promise::new(&mut |resolve, _reject| {
+		web_sys::window()
+			.expect("a browser window")
+			.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
+			.expect("setTimeout");
+	});
+	wasm_bindgen_futures::JsFuture::from(timer)
+		.await
+		.expect("timer");
 }

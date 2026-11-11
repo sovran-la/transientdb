@@ -19,8 +19,8 @@ impl WebStore {
 	/// logged, the way FileStore discards what does not match at open:
 	///
 	/// - a record without the record shape (a sequence number in `1..=MAX_SEQ` and a
-	///   string), whose sequence number, if it has one, still counts, so no new item is
-	///   given it;
+	///   string), or one that cannot be read as JSON at all, whose sequence number, if it
+	///   has one, still counts, so no new item is given it;
 	/// - an item that is not well-formed JSON, is larger than `max_item_size` (stored under
 	///   a larger limit), or is nested too deeply;
 	/// - the oldest items beyond `max_items`, if more are stored (under a larger limit).

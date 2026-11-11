@@ -272,7 +272,7 @@ async fn test_memory_only_mode_keeps_working() {
 	let mut store = WebStore::new(config("test-persist-memory-only", 4096, 1000)).await;
 	// Simulate unavailable IndexedDB: no handle, so no writes are attempted.
 	store.db = None;
-	store.persistence_state = PersistenceState::MemoryOnly;
+	assert_eq!(store.persistence_state(), PersistenceState::MemoryOnly);
 	store.reset();
 	assert!(!store.is_persisted());
 

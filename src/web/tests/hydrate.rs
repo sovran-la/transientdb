@@ -162,3 +162,66 @@ async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reus
 	settle().await;
 	assert!(idb::read_all(&db).await.unwrap().is_empty());
 }
+
+/// Adds `records`, JavaScript values as another writer could store them, to `db`.
+async fn add_js(db: &IdbDatabase, records: &[js_sys::Object]) {
+	let transaction = db
+		.transaction_with_str_and_mode(idb::STORE_NAME, web_sys::IdbTransactionMode::Readwrite)
+		.unwrap();
+	let store = transaction.object_store(idb::STORE_NAME).unwrap();
+	for record in records {
+		store.add(record).unwrap();
+	}
+	idb::completion(&transaction).await.unwrap();
+}
+
+/// A record `{seq, text}` whose `text` is `text`.
+fn js_record(seq: f64, text: &JsValue) -> js_sys::Object {
+	let record = js_sys::Object::new();
+	js_sys::Reflect::set(&record, &"seq".into(), &seq.into()).unwrap();
+	js_sys::Reflect::set(&record, &"text".into(), text).unwrap();
+	record
+}
+
+/// A record whose value `JSON.stringify` rejects (a BigInt, a cycle) is not an item, but
+/// its key is still read: its sequence number counts, and it is deleted.
+#[wasm_bindgen_test]
+async fn test_records_that_cannot_be_read_as_json_still_count_and_are_discarded() {
+	let db_name = "test-hydrate-unreadable";
+	let Some(store) = persisted(db_name, 4096, 1000).await else {
+		return;
+	};
+	settle().await;
+	let db = store.db.clone().unwrap();
+	let cyclic = js_sys::Object::new();
+	js_sys::Reflect::set(&cyclic, &"me".into(), &cyclic).unwrap();
+	add_raw(&db, &[idb::record(3, "\"kept\"")]).await;
+	add_js(
+		&db,
+		&[
+			js_record(5.0, &js_sys::BigInt::from(10).into()),
+			js_record(40.0, &cyclic),
+		],
+	)
+	.await;
+
+	let mut reopened = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(reopened.is_persisted());
+	assert_eq!(queued(&reopened), vec![json!("kept")]);
+	// 40 is never given out again.
+	assert_eq!(reopened.queue.next_seq, 41);
+	// Both were deleted: the kept item is the only record left.
+	assert_eq!(flushed(&reopened).await, stored(&reopened));
+	let transaction = db.transaction_with_str(idb::STORE_NAME).unwrap();
+	let count = transaction
+		.object_store(idb::STORE_NAME)
+		.unwrap()
+		.count()
+		.unwrap();
+	assert_eq!(idb::await_request::<JsValue>(&count).await.unwrap(), 1);
+
+	reopened.append(json!("new")).unwrap();
+	assert_eq!(reopened.queue.items.back().unwrap().seq, 41);
+	reopened.reset();
+	settle().await;
+}

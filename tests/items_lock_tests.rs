@@ -144,3 +144,29 @@ fn test_drop_from_inside_a_store_call_on_the_same_thread() {
 	let checker = db.clone();
 	assert!(within_deadline("has_data dropping Items", move || checker.has_data()));
 }
+
+/// A store handed another store's `Items` drops it, releasing it to that store, before
+/// locking its own ledger. So two threads, each removing the other store's `Items`,
+/// never hold one ledger while waiting for the other.
+#[test]
+fn test_removing_each_others_items_on_two_threads() {
+	let (a, b) = (Arc::new(db_holding(4)), Arc::new(db_holding(4)));
+	let cross = |store: Arc<TransientDB>, other: Arc<TransientDB>| {
+		move || {
+			for _ in 0..20_000 {
+				if let Some(items) = other.fetch(2, 4096).unwrap() {
+					store.remove(items).unwrap();
+				}
+			}
+		}
+	};
+	let (one, two) = (cross(a.clone(), b.clone()), cross(b.clone(), a.clone()));
+	within_deadline("two threads removing each other's Items", move || {
+		let other_thread = thread::spawn(two);
+		one();
+		other_thread.join().unwrap();
+	});
+	// Each store's items went back to it every time; nothing was removed.
+	assert_eq!(available(&a), tagged(0..4));
+	assert_eq!(available(&b), tagged(0..4));
+}

@@ -25,12 +25,14 @@
 //! [`idb`]. Which items a fetch has handed out is kept in memory only: fetching and
 //! releasing write nothing.
 
+mod connect;
 mod hydrate;
 mod idb;
 
 use crate::queue::Queue;
 use crate::{serialize, DataStore, Items, Result};
 use serde_json::Value;
+use std::cell::Cell;
 use std::rc::Rc;
 use web_sys::IdbDatabase;
 
@@ -57,7 +59,10 @@ pub struct WebConfig {
 pub enum PersistenceState {
 	/// IndexedDB is available and working. Events persist across page refreshes.
 	Persisted,
-	/// IndexedDB is unavailable (private browsing, blocked by browser policy, etc).
+	/// IndexedDB is unavailable (private browsing, blocked by browser policy, etc), or
+	/// the database is held open at an older version by another page, or the store gave
+	/// up its connection so that another page could upgrade the database. See
+	/// [`WebStore`]'s "Database upgrades".
 	/// Events are held in memory only and will be lost on page refresh.
 	///
 	/// When in this state, callers should consider:
@@ -90,6 +95,24 @@ pub enum PersistenceState {
 /// A database written by an earlier version of this store, in an old record
 /// format, is emptied when first opened: its records are discarded.
 ///
+/// # Database upgrades
+///
+/// Upgrading a database waits for every other connection to it to close. A store never
+/// waits for that, and never makes another page wait:
+///
+/// - If another page holds the database open at an older version and does not close it
+///   (a page loaded before a deploy that brought a newer version of this store), opening
+///   gives up at once instead of waiting for that page to go away. The store starts in
+///   memory-only mode and logs a warning. The database is left as it was, to be upgraded
+///   by the next store opened once that page is gone.
+/// - If another page asks for a newer version of the database, or deletes it, this
+///   store closes its connection at once and carries on in memory-only mode, with every
+///   item it holds, and logs a warning. Its items stored in IndexedDB stay there for the
+///   newer version to deal with; nothing it does from then on is written.
+///
+/// So [`persistence_state()`](Self::persistence_state) can change from `Persisted` to
+/// `MemoryOnly` while the store is in use, but never back.
+///
 /// # Third-Party Context Warning
 ///
 /// Modern browsers increasingly restrict storage APIs in third-party contexts
@@ -102,8 +125,8 @@ pub struct WebStore {
 	queue: Queue,
 	/// IndexedDB database handle (None if unavailable/blocked)
 	db: Option<Rc<IdbDatabase>>,
-	/// Current persistence state
-	persistence_state: PersistenceState,
+	/// Set once `db` has closed itself for another page's upgrade; see [`connect`].
+	closed: Rc<Cell<bool>>,
 }
 
 impl WebStore {
@@ -135,44 +158,35 @@ impl WebStore {
 			queue: Queue::new(config.max_items, idb::MAX_SEQ),
 			config,
 			db: None,
-			persistence_state: PersistenceState::MemoryOnly,
+			closed: Rc::new(Cell::new(false)),
 		};
 
 		// Attempt to open IndexedDB - fall back to memory-only if it fails
-		match idb::open(&store.config.database_name).await {
-			Ok(db) => match store.hydrate(&db).await {
-				Ok(()) => {
-					store.db = Some(Rc::new(db));
-					store.persistence_state = PersistenceState::Persisted;
-				}
-				Err(e) => {
-					// Without the stored sequence numbers, new ones could collide with
-					// them, so writing to this database is not safe. Leave it untouched.
-					store.queue = Queue::new(store.config.max_items, idb::MAX_SEQ);
-					web_sys::console::warn_1(
-						&format!(
-							"Failed to hydrate from IndexedDB ({:?}), falling back to \
-							 memory-only storage.",
-							e
-						)
-						.into(),
-					);
-				}
-			},
+		let warn = |message: String| web_sys::console::warn_1(&message.into());
+		let db = match connect::open(&store.config.database_name).await {
+			Ok(db) => db,
 			Err(e) => {
-				web_sys::console::warn_1(
-					&format!(
-						"IndexedDB unavailable ({}), falling back to memory-only storage. \
-                         Events will not persist across page refreshes. \
-                         Consider increasing flush frequency.",
-						e
-					)
-					.into(),
-				);
-				// persistence_state already set to MemoryOnly
+				warn(format!(
+					"IndexedDB unavailable ({e}), falling back to memory-only storage. Events \
+					 will not persist across page refreshes. Consider increasing flush frequency."
+				));
+				return store;
+			}
+		};
+		// Before hydrating, so that a newer version asked for meanwhile is not blocked.
+		store.closed = connect::close_on_versionchange(&db);
+		match store.hydrate(&db).await {
+			Ok(()) => store.db = Some(Rc::new(db)),
+			Err(e) => {
+				// Without the stored sequence numbers, new ones could collide with them, so
+				// writing to this database is not safe. Leave it untouched.
+				db.close();
+				store.queue = Queue::new(store.config.max_items, idb::MAX_SEQ);
+				warn(format!(
+					"Failed to hydrate from IndexedDB ({e:?}), falling back to memory-only storage."
+				));
 			}
 		}
-
 		store
 	}
 
@@ -192,7 +206,10 @@ impl WebStore {
 	/// };
 	/// ```
 	pub fn persistence_state(&self) -> PersistenceState {
-		self.persistence_state
+		match self.live_db() {
+			Some(_) => PersistenceState::Persisted,
+			None => PersistenceState::MemoryOnly,
+		}
 	}
 
 	/// Returns `true` if IndexedDB persistence is available.
@@ -200,12 +217,17 @@ impl WebStore {
 	/// Convenience method equivalent to checking if
 	/// `persistence_state() == PersistenceState::Persisted`.
 	pub fn is_persisted(&self) -> bool {
-		self.persistence_state == PersistenceState::Persisted
+		self.persistence_state() == PersistenceState::Persisted
+	}
+
+	/// The connection to write to: `None` when there is none, or it has been closed.
+	fn live_db(&self) -> Option<&IdbDatabase> {
+		self.db.as_deref().filter(|_| !self.closed.get())
 	}
 
 	/// Fire-and-forget delete of `seqs` from IndexedDB
 	fn delete_from_idb(&self, seqs: &[u64]) {
-		let Some(db) = &self.db else { return };
+		let Some(db) = self.live_db() else { return };
 		if seqs.is_empty() {
 			return;
 		}
@@ -227,7 +249,7 @@ impl DataStore for WebStore {
 	fn append(&mut self, data: Value) -> Result<()> {
 		let text = serialize::item_text(data, self.config.max_item_size)?;
 		let (seq, dropped) = self.queue.push(text.clone())?;
-		if let Some(db) = &self.db {
+		if let Some(db) = self.live_db() {
 			idb::fire_and_forget("write", idb::add(db, seq, &text));
 		}
 		if let Some(dropped) = dropped {
@@ -256,7 +278,7 @@ impl DataStore for WebStore {
 	/// Removes every item, in memory and in IndexedDB.
 	fn reset(&mut self) {
 		self.queue.reset();
-		if let Some(db) = &self.db {
+		if let Some(db) = self.live_db() {
 			idb::fire_and_forget("clear", idb::clear(db));
 		}
 	}

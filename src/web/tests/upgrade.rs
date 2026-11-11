@@ -1,0 +1,146 @@
+//! Other pages upgrading or deleting the database: a store never waits for them, and
+//! never makes them wait. It carries on in memory only instead.
+
+use super::schema::{add_raw, delete_database, factory};
+use super::*;
+use contract::{append_all, tagged};
+use std::cell::RefCell;
+use std::future::Future;
+use std::rc::Rc;
+use web_sys::{IdbOpenDbRequest, IdbRequest};
+
+/// Runs `future` in the background and returns its output if it finishes within about
+/// two seconds; `None` if it is still waiting by then.
+async fn within_two_seconds<T: 'static>(future: impl Future<Output = T> + 'static) -> Option<T> {
+	let slot = Rc::new(RefCell::new(None));
+	let out = slot.clone();
+	wasm_bindgen_futures::spawn_local(async move { *out.borrow_mut() = Some(future.await) });
+	for _ in 0..20 {
+		if slot.borrow().is_some() {
+			break;
+		}
+		settle().await;
+	}
+	let output = slot.borrow_mut().take();
+	output
+}
+
+/// Opens `db_name` at `version` the way another page would, without closing it when a
+/// newer version is asked for, creating the object store (keyed the way version 4 kept
+/// it) if there is none.
+async fn open_at(db_name: &'static str, version: u32) -> IdbDatabase {
+	let request: IdbOpenDbRequest = factory().open_with_u32(db_name, version).unwrap();
+	let on_upgrade = Closure::once(move |event: web_sys::IdbVersionChangeEvent| {
+		let request: IdbRequest = event.target().unwrap().unchecked_into();
+		let db: IdbDatabase = request.result().unwrap().unchecked_into();
+		if !db.object_store_names().contains(idb::STORE_NAME) {
+			let params = web_sys::IdbObjectStoreParameters::new();
+			params.set_key_path(&JsValue::from_str("key"));
+			db.create_object_store_with_optional_parameters(idb::STORE_NAME, &params)
+				.unwrap();
+		}
+	});
+	request.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
+	on_upgrade.forget();
+	idb::await_request::<IdbDatabase>(&request).await.unwrap()
+}
+
+/// `store` still does everything, in memory: it keeps what it holds, and fetches,
+/// removes and resets.
+fn assert_works_in_memory(store: &mut WebStore, held: Vec<Value>) {
+	assert_eq!(store.persistence_state(), PersistenceState::MemoryOnly);
+	assert!(!store.is_persisted());
+	assert_eq!(queued(store), held);
+	append_all(store, &[json!("added")]);
+	let items = store.fetch(held.len(), 4096).unwrap();
+	assert_eq!(items.as_ref().map_or_else(Vec::new, Items::values), held);
+	if let Some(items) = items {
+		store.remove(items).unwrap();
+	}
+	assert_eq!(queued(store), vec![json!("added")]);
+	store.reset();
+	assert!(!store.has_data());
+}
+
+/// A page loaded before a deploy holds the database open at the older version and does
+/// not close it. Opening a store does not wait for that page: it starts memory-only, and
+/// the database is left as it was until a store opens it after that page is gone.
+#[wasm_bindgen_test]
+async fn test_open_gives_up_while_an_older_version_is_held_open() {
+	let db_name = "test-upgrade-blocked";
+	delete_database(db_name).await;
+	let old = open_at(db_name, idb::DB_VERSION - 1).await;
+	add_raw(&old, &[json!({"key": 0, "value": "old"})]).await;
+
+	let opened = within_two_seconds(WebStore::new(config(db_name, 4096, 1000))).await;
+	let mut store = opened.expect("WebStore::new waited for the old connection to close");
+	assert!(store.db.is_none());
+	assert_works_in_memory(&mut store, vec![]);
+
+	// The old page goes away. The abandoned request's upgrade is aborted, not done: the
+	// next open, queued behind it, finds the old version and its record untouched.
+	old.close();
+	let request = factory().open(db_name).unwrap();
+	let after = idb::await_request::<IdbDatabase>(&request).await.unwrap();
+	assert_eq!(after.version(), f64::from(idb::DB_VERSION - 1));
+	assert_eq!(
+		idb::read_all(&after).await.unwrap(),
+		vec![json!({"key": 0, "value": "old"})]
+	);
+	after.close();
+
+	// A store opened now upgrades it as usual.
+	let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(store.is_persisted());
+	assert_eq!(
+		store.db.as_ref().unwrap().version(),
+		f64::from(idb::DB_VERSION)
+	);
+	assert!(!store.has_data());
+	append_all(&mut store, &tagged(0..2));
+	assert_eq!(flushed(&store).await, stored(&store));
+	store.reset();
+	settle().await;
+}
+
+/// Another page asks for a newer version while a store is open. The store closes its
+/// connection rather than block that page, and carries on in memory only; nothing it
+/// does afterwards reaches IndexedDB.
+#[wasm_bindgen_test]
+async fn test_store_closes_its_connection_for_a_newer_version() {
+	let db_name = "test-upgrade-versionchange";
+	delete_database(db_name).await;
+	let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(store.is_persisted());
+	append_all(&mut store, &tagged(0..2));
+
+	let newer = within_two_seconds(open_at(db_name, idb::DB_VERSION + 1)).await;
+	let newer = newer.expect("the store's connection blocked the newer version");
+	assert_works_in_memory(&mut store, tagged(0..2));
+
+	// The writes issued before the close landed; none after it did, the reset included.
+	let records = idb::read_all(&newer).await.unwrap();
+	let texts: Vec<String> = records
+		.iter()
+		.map(|r| idb::parse_record(r).unwrap().1)
+		.collect();
+	assert_eq!(texts, [r#"{"i":0}"#, r#"{"i":1}"#]);
+	newer.close();
+	delete_database(db_name).await;
+}
+
+/// Deleting the database elsewhere is not blocked either.
+#[wasm_bindgen_test]
+async fn test_store_closes_its_connection_for_a_delete() {
+	let db_name = "test-upgrade-delete";
+	let mut store = fresh_store(db_name, 4096, 1000).await;
+	assert!(store.is_persisted());
+	append_all(&mut store, &tagged(0..1));
+
+	let deleted = within_two_seconds(delete_database(db_name)).await;
+	assert!(
+		deleted.is_some(),
+		"the store's connection blocked the delete"
+	);
+	assert_works_in_memory(&mut store, tagged(0..1));
+}

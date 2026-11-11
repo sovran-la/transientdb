@@ -52,7 +52,9 @@ impl MemoryStore {
 			panic!("max_items = 0? So... you want a store that stores nothing? That's what /dev/null is for.");
 		}
 		Self {
-			// Sequence numbers never wrap; the last one keeps one value spare.
+			// Sequence numbers never wrap; the last one keeps one value spare. Running out
+			// takes 2^64 - 2 appends, which cannot happen in practice; if it ever did,
+			// `append` would fail with `Io` rather than give two items one number.
 			queue: Queue::new(config.max_items, u64::MAX - 1),
 			config,
 		}
@@ -64,9 +66,9 @@ impl DataStore for MemoryStore {
 	///
 	/// # Errors
 	/// [`Error::ItemTooDeep`](crate::Error) or [`Error::ItemTooLarge`](crate::Error),
-	/// changing nothing, as described on [`DataStore::append`]. An `Io` error, changing
-	/// nothing, if the store has used up its sequence numbers (after 2^64 - 2 appends):
-	/// they never wrap, so no two items can share one.
+	/// changing nothing, as described on [`DataStore::append`]. No other error: each item
+	/// gets the next `u64` sequence number, and at one append per nanosecond those last
+	/// more than 580 years, so they cannot run out in practice.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let text = serialize::item_text(data, self.config.max_item_size)?;
 		self.queue.push(text)?;

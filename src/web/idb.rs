@@ -1,5 +1,5 @@
 //! IndexedDB plumbing for `WebStore`: the database schema, its record format, and the
-//! requests the store issues.
+//! requests the store issues. Opening the database is in [`connect`](super::connect).
 //!
 //! Every record holds one stored item as `{ "seq": <number>, "text": "<item>" }` in the
 //! object store [`STORE_NAME`], whose key path is `seq` with no auto-increment. `seq` is
@@ -33,12 +33,12 @@ use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransa
 /// Version 5 stores `{seq, text}` and nothing about batches.
 pub(super) const DB_VERSION: u32 = 5;
 pub(super) const STORE_NAME: &str = "events";
-const KEY_PATH: &str = "seq";
+pub(super) const KEY_PATH: &str = "seq";
 const TEXT_FIELD: &str = "text";
 /// The last sequence number the store gives out: `Number.MAX_SAFE_INTEGER`, 2^53 - 1.
 pub(super) const MAX_SEQ: u64 = (1 << 53) - 1;
 
-fn js_error(what: &str, e: JsValue) -> Error {
+pub(super) fn js_error(what: &str, e: JsValue) -> Error {
 	Error::other(format!("{what}: {e:?}"))
 }
 
@@ -66,55 +66,12 @@ pub(super) fn record_key(record: &Value) -> Option<JsValue> {
 	js_sys::JSON::parse(&record.get(KEY_PATH)?.to_string()).ok()
 }
 
-/// Opens (or creates, or upgrades) the database `name` at [`DB_VERSION`].
-///
-/// Upgrading from an older version deletes every object store it has and creates the
-/// current one empty: old records are discarded, not migrated.
-pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
-	let window = web_sys::window().ok_or_else(|| Error::other("No window object"))?;
-	let factory = window
-		.indexed_db()
-		.map_err(|e| js_error("IndexedDB error", e))?
-		.ok_or_else(|| Error::other("IndexedDB not available"))?;
-	let open_request = factory
-		.open_with_f64(name, DB_VERSION as f64)
-		.map_err(|e| js_error("Failed to open DB", e))?;
-
-	let on_upgrade = Closure::once(move |event: web_sys::IdbVersionChangeEvent| {
-		let Some(request) = event.target().map(|t| t.unchecked_into::<IdbRequest>()) else {
-			return;
-		};
-		if let Err(e) = create_schema(&request) {
-			web_sys::console::warn_1(&format!("IndexedDB upgrade failed: {e:?}").into());
-			// Aborting fails the open request, so the store falls back to memory-only.
-			if let Some(transaction) = request.transaction() {
-				let _ = transaction.abort();
-			}
-		}
-	});
-	open_request.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
-	on_upgrade.forget();
-
-	await_request::<IdbDatabase>(&open_request).await
-}
-
-/// Replaces whatever object stores an older version left with an empty current one.
-fn create_schema(request: &IdbRequest) -> std::result::Result<(), JsValue> {
-	let db: IdbDatabase = request.result()?.unchecked_into();
-	let names = db.object_store_names();
-	let old: Vec<String> = (0..names.length()).filter_map(|i| names.item(i)).collect();
-	for name in old {
-		db.delete_object_store(&name)?;
-	}
-	let params = web_sys::IdbObjectStoreParameters::new();
-	params.set_key_path(&JsValue::from_str(KEY_PATH));
-	db.create_object_store_with_optional_parameters(STORE_NAME, &params)?;
-	Ok(())
-}
-
 /// Every record in the object store, in key order, as JSON.
 ///
-/// A record that cannot be read back as JSON is skipped with a warning.
+/// A record that `JSON.stringify` or `serde_json` rejects (a BigInt or a cycle in it, say)
+/// comes back as `{"seq": <its key>}` alone: not a stored item, but its key still counts
+/// and the record can still be deleted. Only a key that cannot be read either is skipped,
+/// with a warning.
 pub(super) async fn read_all(db: &IdbDatabase) -> Result<Vec<Value>> {
 	let transaction = db
 		.transaction_with_str_and_mode(STORE_NAME, IdbTransactionMode::Readonly)
@@ -127,16 +84,22 @@ pub(super) async fn read_all(db: &IdbDatabase) -> Result<Vec<Value>> {
 
 	let mut records = Vec::with_capacity(array.length() as usize);
 	for record in array.iter() {
-		let json = js_sys::JSON::stringify(&record)
-			.ok()
-			.and_then(|s| s.as_string())
-			.and_then(|s| serde_json::from_str::<Value>(&s).ok());
-		match json {
+		let key_only = || {
+			let key = js_sys::Reflect::get(&record, &JsValue::from_str(KEY_PATH)).ok()?;
+			Some(json!({ (KEY_PATH): as_json(&key)? }))
+		};
+		match as_json(&record).or_else(key_only) {
 			Some(json) => records.push(json),
 			None => web_sys::console::warn_1(&"Skipping an unreadable IndexedDB record".into()),
 		}
 	}
 	Ok(records)
+}
+
+/// `value` as JSON, if `JSON.stringify` and `serde_json` both accept it.
+fn as_json(value: &JsValue) -> Option<Value> {
+	let text = js_sys::JSON::stringify(value).ok()?.as_string()?;
+	serde_json::from_str(&text).ok()
 }
 
 /// Starts a read/write transaction on the object store.
@@ -265,7 +228,11 @@ pub(super) async fn await_request<T: JsCast>(request: &IdbRequest) -> Result<T> 
 	receiver
 		.await
 		.map_err(|_| Error::other("Channel closed"))??;
+	result_of(request)
+}
 
+/// The result of a request that has succeeded.
+pub(super) fn result_of<T: JsCast>(request: &IdbRequest) -> Result<T> {
 	request
 		.result()
 		.map_err(|e| js_error("Result error", e))?
