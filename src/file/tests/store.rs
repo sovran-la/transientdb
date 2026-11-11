@@ -15,6 +15,7 @@ mod io;
 mod kill;
 mod open;
 mod pending;
+mod rejected;
 mod remove;
 mod reuse;
 mod send;

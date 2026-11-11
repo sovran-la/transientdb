@@ -35,6 +35,7 @@ macro_rules! for_each_check {
 		$m!(item_of_exactly_max_item_size_is_accepted, 32, 8);
 		$m!(item_over_max_item_size_is_rejected, 32, 8);
 		$m!(rejected_item_changes_nothing, 32, 3);
+		$m!(rejected_item_is_rejected_the_same_way_in_every_state, 32, 3);
 		$m!(depth_at_the_limit_is_accepted_and_reads_back, 1 << 20, 64);
 		$m!(
 			depth_over_the_limit_is_rejected_without_overflow,

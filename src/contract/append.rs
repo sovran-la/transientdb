@@ -53,6 +53,68 @@ pub(crate) fn rejected_item_changes_nothing(store: &mut dyn DataStore) {
 	assert_eq!(available(store), [&kept[1..], &[json!("next")]].concat());
 }
 
+/// Asserts that `store`, whose `max_item_size` is `max_item_size`, rejects an item larger
+/// than that with [`Error::ItemTooLarge`], giving the item's size and the limit. Holds in
+/// any state a store can be in, including one where it could store nothing.
+pub(crate) fn assert_rejects_oversized_items(store: &mut dyn DataStore, max_item_size: usize) {
+	for len in [
+		max_item_size + 1,
+		max_item_size + 2,
+		max_item_size * 8 + 100,
+	] {
+		let err = store.append(item_of_len(len, 0)).unwrap_err();
+		assert!(
+			matches!(err, Error::ItemTooLarge { size, max } if size == len && max == max_item_size),
+			"{len} bytes: {err:?}"
+		);
+	}
+}
+
+/// Asserts that `store` rejects an item nested past the limit with [`Error::ItemTooDeep`],
+/// in every shape and however deep, without overflowing the stack, and before its size is
+/// looked at. Holds in any state a store can be in, including one where it could store
+/// nothing.
+pub(crate) fn assert_rejects_too_deep_items(store: &mut dyn DataStore) {
+	for shape in SHAPES {
+		for depth in [100_000, MAX_ITEM_DEPTH + 1, MAX_ITEM_DEPTH + 2] {
+			let err = store.append(nested(depth, shape, json!(0))).unwrap_err();
+			assert!(
+				matches!(err, Error::ItemTooDeep),
+				"{shape:?} {depth}: {err:?}"
+			);
+		}
+	}
+	let deep_and_large = nested(MAX_ITEM_DEPTH + 1, Shape::Objects, json!("x".repeat(4096)));
+	assert!(matches!(
+		store.append(deep_and_large),
+		Err(Error::ItemTooDeep)
+	));
+}
+
+pub(crate) fn rejected_item_is_rejected_the_same_way_in_every_state(store: &mut dyn DataStore) {
+	let check = |store: &mut dyn DataStore, state: &str, expected: &[Value]| {
+		assert_rejects_oversized_items(store, 32);
+		assert_rejects_too_deep_items(store);
+		assert_eq!(available(store), expected, "{state}");
+	};
+	check(store, "empty", &[]);
+	append_all(store, &tagged(0..2));
+	check(store, "holding items", &tagged(0..2));
+	store.append(json!({"i": 2})).unwrap();
+	check(store, "full", &tagged(0..3));
+	let oldest = store.fetch(1, 1000).unwrap().unwrap();
+	check(store, "full, the oldest pending", &tagged(1..3));
+	let rest = store.fetch(10, 1000).unwrap().unwrap();
+	check(store, "everything pending", &[]);
+	drop(rest);
+	store.remove(oldest).unwrap();
+	check(store, "after a remove", &tagged(1..3));
+	store.reset();
+	check(store, "after a reset", &[]);
+	store.append(json!("next")).unwrap();
+	assert_eq!(available(store), vec![json!("next")]);
+}
+
 /// Each shape at the deepest accepted depth, around a scalar, an empty array and an empty
 /// object.
 fn deepest_items() -> Vec<Value> {

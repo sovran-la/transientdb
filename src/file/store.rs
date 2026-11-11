@@ -182,16 +182,19 @@ impl DataStore for FileStore {
 	///
 	/// # Errors
 	/// [`Error::ItemTooDeep`] or [`Error::ItemTooLarge`], writing nothing, as described
-	/// on [`DataStore::append`]. [`Error::InUse`], doing nothing, while another store in
+	/// on [`DataStore::append`]. The item is checked before the file is touched, so these
+	/// are returned for a bad item even while the store cannot use its file, and come
+	/// before the errors below. [`Error::InUse`], doing nothing, while another store in
 	/// this process is using the file. [`Error::Io`] if the file cannot be written: the
 	/// item is not stored, and every other item is as it was, except that a write that
 	/// failed while dropping the oldest item may have dropped it. Also [`Error::Io`],
 	/// writing nothing, once a damaged file has used up every sequence number: until the
 	/// store is reset, or every item is removed and a new store opens the file again.
 	fn append(&mut self, data: Value) -> Result<()> {
-		let max_item_size = self.config.max_item_size;
+		// The item first: a bad one is rejected the same way whatever state the file is in,
+		// and a deep one is taken apart without recursion before anything can drop it.
+		let text = serialize::item_text(data, self.config.max_item_size)?;
 		let (core, ledger) = self.parts()?;
-		let text = serialize::item_text(data, max_item_size)?;
 		let oldest = match core.index.target(core.max_items) {
 			Target::Oldest { sequence, .. } => Some(sequence),
 			_ => None,
