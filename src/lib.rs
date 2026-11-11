@@ -89,7 +89,8 @@ pub trait DataStore {
 	/// returned [`Items`] holds at least one item.
 	///
 	/// An item is checked when it is appended, and what is fetched is what was stored: each
-	/// item's text is the JSON its `append` serialized, and is not parsed again.
+	/// item's text is the JSON its `append` serialized (see [`Items`] for text something
+	/// else wrote to the storage), and is not parsed again.
 	///
 	/// Fetching deletes nothing, but the items handed out are not returned by another
 	/// fetch until their `Items` is released, so consecutive fetches never return the same

@@ -76,8 +76,8 @@ are removed.
 
 ## Store by store
 
-**FileStore.** As specified in `FILE_STORE_SPEC.md`, all of it, including the
-test requirements. Native targets only.
+**FileStore.** As specified in `FILE_STORE_SPEC.md`, all of it, including its
+testing section. Native targets only.
 
 **MemoryStore.** Holds each item as its serialized JSON text, with a sequence
 number. Same append checks as FileStore (size, depth), same fetch order, same
