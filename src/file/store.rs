@@ -186,8 +186,8 @@ impl DataStore for FileStore {
 	/// this process is using the file. [`Error::Io`] if the file cannot be written: the
 	/// item is not stored, and every other item is as it was, except that a write that
 	/// failed while dropping the oldest item may have dropped it. Also [`Error::Io`],
-	/// writing nothing, once a damaged file has used up every sequence number, until
-	/// the store is reset.
+	/// writing nothing, once a damaged file has used up every sequence number: until the
+	/// store is reset, or every item is removed and a new store opens the file again.
 	fn append(&mut self, data: Value) -> Result<()> {
 		let max_item_size = self.config.max_item_size;
 		let (core, ledger) = self.parts()?;

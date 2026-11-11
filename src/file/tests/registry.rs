@@ -161,3 +161,74 @@ fn test_a_symlink_loop_is_an_error() {
 	assert_ne!(e.kind(), ErrorKind::NotFound, "{e}");
 	assert!(!dir.path().join("a.tdb").exists());
 }
+
+/// `canonical(path)` fails with the error for a link to a missing directory, naming `link`.
+#[cfg(unix)]
+fn assert_refused_at(path: &Path, link: &Path) {
+	let e = canonical(path).unwrap_err();
+	assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+	let expected = format!(
+		"{} is a symbolic link to a missing directory",
+		link.display()
+	);
+	assert_eq!(e.to_string(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_to_a_missing_directory_in_the_path_is_refused() {
+	use std::os::unix::fs::symlink;
+	let dir = TempDir::new().unwrap();
+	let gone = dir.path().join("moved-away");
+	// Relative and absolute links, and a link to a link that dangles.
+	let data = dir.path().join("data");
+	symlink("moved-away", &data).unwrap();
+	let absolute = dir.path().join("absolute");
+	symlink(&gone, &absolute).unwrap();
+	let chain = dir.path().join("chain");
+	symlink(&data, &chain).unwrap();
+	for link in [&data, &absolute, &chain] {
+		// The link is the parent, or further up the path.
+		assert_refused_at(&link.join("events.tdb"), link);
+		assert_refused_at(&link.join("a").join("b").join("events.tdb"), link);
+		assert_refused_at(&relative(&link.join("events.tdb")), &relative(link));
+	}
+	assert!(!gone.exists(), "nothing is created where the link points");
+	assert!(!dir.path().join("a").exists());
+
+	// Once the directory is back, the path resolves through the link.
+	std::fs::create_dir(&gone).unwrap();
+	let real = canonical(&gone.join("events.tdb")).unwrap();
+	assert_eq!(canonical(&data.join("events.tdb")).unwrap(), real);
+	assert_eq!(canonical(&chain.join("events.tdb")).unwrap(), real);
+	assert!(!real.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_dangling_directory_link_reached_through_another_link_is_refused() {
+	use std::os::unix::fs::symlink;
+	let dir = TempDir::new().unwrap();
+	let real = dir.path().join("real");
+	std::fs::create_dir(&real).unwrap();
+	symlink(dir.path().join("missing"), real.join("inner")).unwrap();
+	let outer = dir.path().join("outer");
+	symlink(&real, &outer).unwrap();
+	let inner = outer.join("inner");
+	assert_refused_at(&inner.join("x").join("s.tdb"), &inner);
+	assert!(!dir.path().join("missing").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_directory_link_loop_is_not_called_a_missing_directory() {
+	use std::os::unix::fs::symlink;
+	let dir = TempDir::new().unwrap();
+	let a = dir.path().join("a");
+	let b = dir.path().join("b");
+	symlink(&b, &a).unwrap();
+	symlink(&a, &b).unwrap();
+	let e = canonical(&a.join("s.tdb")).unwrap_err();
+	assert!(!e.to_string().contains("missing directory"), "{e}");
+	assert!(!e.to_string().is_empty());
+}

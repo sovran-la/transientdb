@@ -236,3 +236,44 @@ fn test_a_path_that_is_a_directory_fails_every_call_and_changes_nothing() {
 	let mut second = FileStore::new(config(dir.path(), SLOT, 10));
 	assert!(matches!(second.append(json!(1)), Err(Error::InUse)));
 }
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_to_a_missing_directory_fails_every_call_until_it_is_back() {
+	let (dir, _) = temp_path();
+	let gone = dir.path().join("moved-away");
+	let data = dir.path().join("data");
+	std::os::unix::fs::symlink("moved-away", &data).unwrap();
+	let path = data.join("events.tdb");
+	let mut store = store(&path, 100);
+	let message = format!(
+		"I/O error: {} is a symbolic link to a missing directory",
+		data.display()
+	);
+	for _ in 0..2 {
+		match store.append(json!(1)) {
+			Err(e @ Error::Io(_)) => assert_eq!(e.to_string(), message),
+			other => panic!("{other:?}"),
+		}
+		assert!(
+			matches!(store.fetch(1, 100), Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput)
+		);
+		assert!(!store.has_data());
+		store.reset();
+	}
+	assert!(!gone.exists(), "nothing is created where the link points");
+	// The path is not held: another store on it is refused for the same reason.
+	let mut second = super::store(&path, 100);
+	assert!(matches!(second.append(json!(1)), Err(Error::Io(_))));
+	drop(second);
+
+	// Once the directory is back, the next call opens the file there.
+	std::fs::create_dir(&gone).unwrap();
+	append_all(&mut store, &tagged(0..2));
+	assert!(gone.join("events.tdb").is_file());
+	drop(store);
+	assert_eq!(
+		available(&mut super::store(&gone.join("events.tdb"), 100)),
+		tagged(0..2)
+	);
+}

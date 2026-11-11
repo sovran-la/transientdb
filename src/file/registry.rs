@@ -26,7 +26,8 @@ fn in_use() -> MutexGuard<'static, BTreeSet<PathBuf>> {
 /// the parent is, and the file name appended, so the result is the path the file will
 /// have once created. A symbolic link to a file that does not exist yet is followed, so
 /// the result is where the link points: the file is created there, and a store given
-/// the target's own path is the same store.
+/// the target's own path is the same store. A symbolic link to a directory that does not
+/// exist, in the path to the file, is an `InvalidInput` error, and nothing is created.
 pub(super) fn canonical(path: &Path) -> io::Result<PathBuf> {
 	let mut path = path.to_path_buf();
 	// A loop, or a chain longer than the OS follows, fails to canonicalize. The bound
@@ -53,6 +54,7 @@ pub(super) fn canonical(path: &Path) -> io::Result<PathBuf> {
 			path = parent.join(std::fs::read_link(&path)?);
 			continue;
 		}
+		refuse_dangling_directory_link(parent)?;
 		std::fs::create_dir_all(parent)?;
 		return Ok(parent.canonicalize()?.join(name));
 	}
@@ -60,6 +62,33 @@ pub(super) fn canonical(path: &Path) -> io::Result<PathBuf> {
 		io::ErrorKind::InvalidInput,
 		format!("{}: too many symbolic links", path.display()),
 	))
+}
+
+/// Fails with `InvalidInput` if the directory `create_dir_all(parent)` would stop at is a
+/// symbolic link to something missing: it would fail with a misleading "File exists".
+///
+/// That is the deepest ancestor of `parent` (or `parent` itself) that exists as an entry.
+/// Nothing is created where the link points: a stale link more likely names a moved or
+/// unmounted directory than one to make.
+fn refuse_dangling_directory_link(parent: &Path) -> io::Result<()> {
+	let Some((dir, meta)) = parent
+		.ancestors()
+		.find_map(|dir| Some((dir, std::fs::symlink_metadata(dir).ok()?)))
+	else {
+		return Ok(());
+	};
+	// A loop, or a target that cannot be read, is left to `create_dir_all` to report.
+	let target_missing = std::fs::metadata(dir).is_err_and(|e| e.kind() == io::ErrorKind::NotFound);
+	if meta.file_type().is_symlink() && target_missing {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!(
+				"{} is a symbolic link to a missing directory",
+				dir.display()
+			),
+		));
+	}
+	Ok(())
 }
 
 /// The most symbolic links [`canonical`] follows to a file that does not exist yet.
