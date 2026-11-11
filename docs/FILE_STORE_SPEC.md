@@ -1,6 +1,6 @@
 # FileStore Specification
 
-**Status:** Draft, not implemented
+**Status:** Implemented in 0.4.0
 **Date:** 2026-11-10
 **Supersedes:** `LEDGER_SPEC.md` and `STORAGE_PROPOSAL.md` (March 2026)
 
@@ -17,9 +17,9 @@ any item. A removed item's slot is reused by a later append, and the file grows
 by one slot only when no slot is free. Nothing in the file is ever moved,
 rewritten, finished or renamed, so there is nothing to recover or compact.
 
-It is intended to replace DirectoryStore. It stores items and returns items. It
-knows nothing about how the caller sends them: there is no envelope, no wire
-format and no batch file.
+It replaces DirectoryStore. It stores items and returns items. It knows nothing
+about how the caller sends them: there is no envelope, no wire format and no
+batch file.
 
 ## Goals
 
@@ -71,7 +71,8 @@ bytes. A queue that has never been more than 50 items deep is a 411,456 byte
 file.
 
 `new` panics, in the manner of the other stores, if `max_item_size` or `max_items`
-is 0, or if `id` is empty or longer than 224 bytes.
+is 0, if `max_item_size` is larger than `u32::MAX`, or if `id` is empty or longer
+than 224 bytes.
 
 The id says whose data the file holds; the path says where it is. Opening the
 same path with a new id is how a caller says "what was queued here is no longer
@@ -170,30 +171,45 @@ there are no slots yet, and nothing is synced or renamed.
 
 ### Open
 
-1. Take the lock (see [Locking](#locking)).
+1. Take the path (see [One store per file](#one-store-per-file)).
 2. Read and check the header. If it is not exactly the header this build would
    write for this config, the file is deleted, logged, and created again (see
    below).
 3. Work out the number of slots from the file's length and read each slot's
    entry.
 4. Any entry whose state is not `0` or `1`, or that is live with a length outside
-   `1..=slot_size`, is treated as free and its state byte cleared.
-5. `next sequence` = highest sequence in any entry (live or free) + 1.
+   `1..=slot_size`, is treated as free and its state byte cleared. So is a live
+   entry whose sequence is already live in a lower slot.
+5. `next sequence` = highest sequence in any entry that is free or live with a
+   length in `1..=slot_size`, + 1. The sequence of any other entry is as damaged
+   as the rest of it and does not count.
 6. If more items are live than `max_items` allows (the limit was lowered), the
    oldest are dropped until they fit, and that is logged.
+7. If no item is live and the file holds any slot, the file is cut back to its
+   header (see [Shrinking](#shrinking)).
 
-No payload is read at open.
+No payload is read at open. Every entry is read before anything is written, so
+an error reading one leaves the file as it was. The writes of steps 4, 6 and 7
+are logged if they fail, not returned: the slots they concern are free either
+way, and the next open sees the same.
+
+Sequence numbers never wrap or repeat. If the entries leave none to hand out
+(only a damaged file can), every `append` fails with `Io`, writing nothing,
+until the store is reset or a store opens the file with no live item. Either
+way no entry is left and nothing handed out can match a new item, so sequences
+start again from 1.
 
 #### A file that does not match
 
 An existing file is discarded, with every item in it, when any of these differs
 from what the store would create:
 
-- the magic or the header CRC (the file is damaged, cut short, or is not a
-  FileStore file),
+- its length, the magic or the header CRC (the file is damaged, cut short, or
+  is not a FileStore file),
 - the format version, older or newer,
 - the id,
-- the slot size (`max_item_size`).
+- the slot size (`max_item_size`),
+- any reserved byte, or any byte of the id's padding, that is not zero.
 
 The store logs one line naming the file and the reason, deletes it, and creates
 a fresh one. `new` does not fail for this. There is no migration and no attempt
@@ -204,22 +220,30 @@ it is handled by step 6 above. Neither discards the file.
 
 ### append
 
-1. Serialize the item compactly, after the same depth check the other stores use.
-   Longer than `max_item_size`: `InvalidInput`, nothing written.
+1. Check the item and serialize it compactly, as every store does: nested too
+   deeply, `ItemTooDeep`; longer than `max_item_size`, `ItemTooLarge`. Nothing
+   is written. This comes before the file is touched, so a bad item gets the
+   same error while the store cannot use its file (see
+   [One store per file](#one-store-per-file)), and a deep one is taken apart
+   without recursion.
 2. Choose a slot:
    - if `max_items` items are already live, the oldest item's slot (see
      [When the store is full](#when-the-store-is-full));
    - otherwise the free slot with the lowest index;
    - otherwise a new slot at the end of the file.
-3. Write the payload into the slot.
+3. Write the payload into the slot. A new slot's payload is written
+   zero-padded to the full slot size.
 4. Write the slot's entry with state `1`. **This write is the commit point.**
 
 If step 3 fails, the entry was never touched and the slot is still free. If step 4
 fails, the store writes state `0` and returns the error. Nothing is rolled back
-because nothing else changed.
+because nothing else changed. When the slot was the oldest item's, that item is
+gone either way.
 
-Growing needs no separate step. Writing the payload of a new slot extends the
-file past the slot's entry, which reads as zeros, that is, as free, until step 4.
+Growing needs no separate step. The padded payload write extends the file by one
+whole slot, so the file always ends on a slot boundary and the new slot is
+counted at the next open, however short the item. Until step 4 the slot's entry
+reads as zeros, that is, as free.
 
 Using the lowest free slot first keeps the file as short as the queue has been
 deep.
@@ -315,9 +339,11 @@ same thing.
 
 Takes an `Items` back and removes what is in it. If it was issued by this store
 instance, then for each item: if an entry is live with its sequence, write state
-`0` and clear its pending mark. Anything else is ignored and is not an error:
-another store's `Items`, an item already dropped. A failed write is logged; the
-item stays live and becomes available again.
+`0` and clear its pending mark. Anything else is ignored and is not an error: an
+item already dropped, or another store's `Items`, which is released back to that
+store. Every item is tried. A failed write is logged, and that item stays stored
+and becomes available again; once every item has been tried, `remove` returns
+the first failure as `Io`.
 
 `remove` consumes the `Items`, so the same fetch cannot be removed twice.
 
@@ -337,12 +363,15 @@ There is none. FileStore has no batch boundaries.
 
 Cuts the file back to its header, which removes every slot at once, and clears
 the in-memory state, pending marks included. An `Items` fetched before the reset
-matches nothing afterwards: removing or releasing it does nothing.
+matches nothing afterwards: removing or releasing it does nothing. If the cut
+fails, that is logged and nothing changes. A store that cannot use its file does
+nothing.
 
 ### has_data
 
 True if any item is available, that is, if a fetch could return something.
-Pending items do not count.
+Pending items do not count. No payload is read for it, so a damaged item counts
+until a fetch finds it and frees it.
 
 ## Errors
 
@@ -369,7 +398,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 What a caller does with each: `ItemTooLarge` and `ItemTooDeep` mean this item
 will never be stored, so drop it or report it. `InUse` means two stores were
 made for one file, which is a mistake in the caller's setup: use the other one.
-`Io` is the only one worth retrying.
+`Io` is the only one worth retrying, unless sequence numbers are exhausted (see
+[Open](#open)).
 
 Only the store's own operations return a `Result`. Nothing on `Items` does.
 
@@ -398,9 +428,9 @@ an I/O error from `append`, and nothing is dropped for it.
 
 The file grows as the queue deepens and is cut back in exactly one case: when no
 item is live. Then every slot is free, so the file is truncated to its 256 byte
-header. That happens after a `remove`, a drop or a freed damaged item takes the
-last live item, and on `reset`. A pending item is still live, so nothing is cut
-while a request is in flight.
+header. That happens after a `remove`, a failed append or a freed damaged item
+takes the last live item, on `reset`, and at open when no item is live. A
+pending item is still live, so nothing is cut while a request is in flight.
 
 This is one `set_len` call. It moves nothing, and whether or not it completes,
 the file is valid: before it, every slot is free; after it, there are none. If
@@ -416,9 +446,11 @@ A file is used by one store at a time. The store does not try to make two
 stores on one file work together. It makes the second one do nothing, and say so.
 
 **Within a process.** The crate keeps a process-wide set of the canonical paths
-in use. A store that finds its path free takes it, opens the file as described
-under Open, and holds the path until it is dropped. A store that finds its path
-taken is still created, and `new` succeeds, but it does not touch the file: it
+in use, so a relative path, one through `..` and one through a symbolic link all
+name the same store. A hard link is a different path to the same file, and is
+not detected. A store that finds its path free takes it, opens the file as
+described under Open, and holds the path until it is dropped. A store that finds
+its path taken is still created, and `new` succeeds, but it does not touch the file: it
 does not open it, check its header, or discard it for not matching. On that
 store:
 
@@ -460,9 +492,11 @@ the file around backgrounding. Four rules keep that true:
   A buffered writer would hold accepted items in memory that a kill discards.
 - **No lock is held**, so the termination described above does not apply.
 - **An I/O error changes nothing.** If the OS refuses a read or a write, the call
-  returns `Error::Io` and the store is exactly as it was, ready for the next
-  call. This matters where the file's data-protection class makes it unreadable
-  while the device is locked: calls fail for that time and work again after.
+  returns `Error::Io` and the store is as it was, ready for the next call. The
+  one exception is an append into a full store, which may have dropped the
+  oldest item. This matters where the file's data-protection class makes it
+  unreadable while the device is locked: calls fail for that time and work again
+  after.
 - **Nothing is cached that the file could contradict** except which slots are
   live, and only this process changes that.
 
@@ -496,32 +530,17 @@ A plain process kill loses nothing that `append` returned `Ok` for.
 
 ## Relationship to the other stores
 
-FileStore is specified here against the `DataStore` trait as it should be in
-0.4.0, not as it is in 0.3.0. The trait changes are:
-
-- `fetch(count: usize, max_bytes: usize) -> Result<Option<Items>>`: both limits
-  required, and items returned instead of a wrapped batch.
-- Fetched items are pending: not returned again until released. In 0.3.0 a
-  later fetch returned them again.
-- `remove(items: Items)`: takes what fetch returned, not a list of removables.
-- `has_data` means "a fetch could return something".
-- `end_batch` removed.
-- `DataResult`, `Equivalent` and the `Output` associated type removed, and with
-  `Output` the type parameter on `TransientDB`.
-- The crate's own `Error` in place of `std::io::Error`.
-
-MemoryStore and WebStore do not match this yet. As of 0.3.0 they take an
-`Envelope` in their config and return one wrapped `Value` per fetch. Bringing
-them in line, removing `Envelope`, and removing DirectoryStore are all part of
-the same breaking release and need their own spec. FileStore ships with it, not
-before.
+MemoryStore and WebStore have the same surface as FileStore: the same
+`DataStore` trait, the same two limits, and the same `Items`, `Error` and
+`Result`. [`PLAN_0_4_0.md`](PLAN_0_4_0.md) describes each of them.
 
 ## Testing
 
-Requirements for the implementation, in addition to the usual behavior tests:
+The tests cover, in addition to the usual behavior tests:
 
-- Fault injection on every write (payload, entry, state byte, reset), reusing the
-  approach in `src/directory/data_file.rs`.
+- Fault injection on every read and write (header, payload, entry, state byte,
+  cut, the file's length, entries, items, open, create, delete), through
+  `src/file/faults.rs`.
 - A kill at every byte boundary of an append, simulated by truncating the write,
   both into an existing slot and into a new one at the end of the file.
 - Slot reuse: removal in every order, then appends, checking that the lowest free
