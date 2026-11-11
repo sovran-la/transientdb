@@ -46,7 +46,9 @@ batch file.
 
 ```rust
 pub struct FileConfig {
-    /// The store's file. Its parent directory is created if missing.
+    /// The store's file. Its parent directory is created if missing, unless
+    /// the path goes through a symbolic link to a missing directory (see
+    /// [A store that cannot open its file](#a-store-that-cannot-open-its-file)).
     pub path: PathBuf,
     /// Whose data this is: a write key, for example. It is recorded in the
     /// file, and a file recorded under a different id is discarded at open.
@@ -126,7 +128,7 @@ The header is written when the file is created and never modified.
 | 0 | state | `0` free, `1` live |
 | 1..4 | reserved | zero |
 | 4..8 | length | payload bytes, `1..=slot_size` |
-| 8..16 | sequence | `u64`, unique per item, starts at 1, never reused |
+| 8..16 | sequence | `u64`, unique per item, starts at 1 (see [Open](#open)) |
 | 16..20 | CRC-32 | of sequence, length, then the payload bytes |
 | 20..32 | reserved | zero |
 
@@ -193,11 +195,30 @@ an error reading one leaves the file as it was. The writes of steps 4, 6 and 7
 are logged if they fail, not returned: the slots they concern are free either
 way, and the next open sees the same.
 
-Sequence numbers never wrap or repeat. If the entries leave none to hand out
+Sequence numbers never wrap, and a sequence is never given out again while any
+entry or `Items` could still name it. If the entries leave none to hand out
 (only a damaged file can), every `append` fails with `Io`, writing nothing,
-until the store is reset or a store opens the file with no live item. Either
-way no entry is left and nothing handed out can match a new item, so sequences
-start again from 1.
+until the store is reset or a store opens the file with no live item. Only then
+do sequences start again from 1: no entry is left and nothing handed out can
+match a new item.
+
+#### A store that cannot open its file
+
+`new` does not fail when the file cannot be opened: a directory is in its place,
+data protection keeps it closed while the device is locked, or the path cannot be
+read. Nor does it fail when the path goes through a symbolic link to a missing
+directory; then nothing is created, and the error is `Io` (kind `InvalidInput`)
+naming the link. The store logs the error and is created without its file. On
+that store:
+
+- `append`, `fetch` and `remove` return `Error::Io` and do nothing,
+- `has_data` is false,
+- `reset` does nothing, and logs why.
+
+A bad item is still rejected first, as `ItemTooLarge` or `ItemTooDeep` (see
+[append](#append)). Every call tries again to open the file, and once it can,
+the store carries on as normal from then on. A path it took before the open
+failed stays taken (see [One store per file](#one-store-per-file)).
 
 #### A file that does not match
 
@@ -224,6 +245,7 @@ it is handled by step 6 above. Neither discards the file.
    deeply, `ItemTooDeep`; longer than `max_item_size`, `ItemTooLarge`. Nothing
    is written. This comes before the file is touched, so a bad item gets the
    same error while the store cannot use its file (see
+   [A store that cannot open its file](#a-store-that-cannot-open-its-file) and
    [One store per file](#one-store-per-file)), and a deep one is taken apart
    without recursion.
 2. Choose a slot:
@@ -235,10 +257,11 @@ it is handled by step 6 above. Neither discards the file.
    zero-padded to the full slot size.
 4. Write the slot's entry with state `1`. **This write is the commit point.**
 
-If step 3 fails, the entry was never touched and the slot is still free. If step 4
-fails, the store writes state `0` and returns the error. Nothing is rolled back
-because nothing else changed. When the slot was the oldest item's, that item is
-gone either way.
+If step 3 fails, the entry was never touched. A free or new slot is still free.
+The oldest item's slot still holds that item under its entry, although its
+payload may be damaged, which its next fetch catches. If step 4 fails, the store
+writes state `0` and returns the error; when the slot was the oldest item's, that
+item is gone. Nothing is rolled back because nothing else changed.
 
 Growing needs no separate step. The padded payload write extends the file by one
 whole slot, so the file always ends on a slot boundary and the new slot is
@@ -569,6 +592,10 @@ The tests cover, in addition to the usual behavior tests:
   and `remove`, reports no data, and leaves the file untouched even when its
   config would not match; after the first is dropped, its next call takes the
   file and works.
+- A store that cannot open its file, because of an open error, a directory in its
+  place or a symbolic link to a missing directory: every call fails or does
+  nothing as listed under Open, a bad item is rejected first, nothing is created
+  where the link points, and the next call after the cause is gone opens the file.
 - An I/O error on every read and write leaves the store usable, with the same
   items, for the next call.
 - Two stores on one file without the registry (as two processes would be),
