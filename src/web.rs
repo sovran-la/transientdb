@@ -97,16 +97,16 @@ pub enum PersistenceState {
 ///
 /// # Database upgrades
 ///
-/// Upgrading a database waits for every other connection to it to close. A store never
-/// waits for that, and never makes another page wait:
+/// Upgrading a database waits for every other connection to it to close. A store waits
+/// at most about a second for that, and never makes another page wait:
 ///
 /// - If another page holds the database open at an older version and does not close it
 ///   (a page loaded before a deploy that brought a newer version of this store), opening
-///   gives up after a short wait (about a second) instead of waiting for that page to go
-///   away. The store starts in memory-only mode and logs a warning. The database is left
-///   as it was, to be upgraded by the next store opened once that page is gone. A
-///   connection that is only finishing its last writes before it closes is waited for,
-///   and the store opens normally.
+///   gives up after about a second instead of waiting for that page to go away. The
+///   store starts in memory-only mode and logs a warning. The database is left as it
+///   was, to be upgraded by the next store opened once that page is gone. A connection
+///   that is closing, finishing its last writes, is waited for if it closes within that
+///   second, and the store opens normally.
 /// - If another page asks for a newer version of the database, or deletes it, this
 ///   store closes its connection at once and carries on in memory-only mode, with every
 ///   item it holds, and logs a warning. Its items stored in IndexedDB stay there for the

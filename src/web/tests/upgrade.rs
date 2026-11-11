@@ -1,5 +1,5 @@
-//! Other pages upgrading or deleting the database: a store never waits for them, and
-//! never makes them wait. It carries on in memory only instead.
+//! Other pages upgrading or deleting the database: a store waits at most about a second
+//! for them, and never makes them wait. It carries on in memory only instead.
 
 use super::schema::{add_raw, delete_database, factory};
 use super::*;
@@ -166,6 +166,50 @@ async fn test_open_succeeds_when_the_holder_closes_during_the_wait() {
 	});
 
 	assert_opens_upgraded(db_name).await;
+}
+
+/// The older page closes its connection just before the open's wait runs out, and the
+/// upgrade, which has a lot of old data to delete, is still committing when it does:
+/// opening uses that upgrade instead of giving up on a database it has just upgraded.
+///
+/// Whether the commit spans the end of the wait depends on timing, so this cannot pass
+/// by mistake but need not catch a regression on every run.
+#[wasm_bindgen_test]
+async fn test_open_uses_an_upgrade_that_started_before_the_wait_ran_out() {
+	let db_name = "test-upgrade-late-close";
+	delete_database(db_name).await;
+	let old = open_at(db_name, idb::DB_VERSION - 1).await;
+	let filler = "x".repeat(1000);
+	let records: Vec<Value> = (0..10_000)
+		.map(|key| json!({"key": key, "value": filler}))
+		.collect();
+	add_raw(&old, &records).await;
+	let on_versionchange = Closure::once({
+		let old = old.clone();
+		move |_event: web_sys::IdbVersionChangeEvent| {
+			wasm_bindgen_futures::spawn_local(async move {
+				let close_at = connect::BLOCKED_GRACE_MS - 25;
+				gloo_timers::future::TimeoutFuture::new(close_at as u32).await;
+				old.close();
+			});
+		}
+	});
+	old.set_onversionchange(Some(on_versionchange.as_ref().unchecked_ref()));
+	on_versionchange.forget();
+
+	let store = WebStore::new(config(db_name, 4096, 1000)).await;
+	let persisted = store.is_persisted();
+	drop(store);
+	let request = factory().open(db_name).unwrap();
+	let after = idb::await_request::<IdbDatabase>(&request).await.unwrap();
+	let version = after.version();
+	after.close();
+	assert_eq!(version, f64::from(idb::DB_VERSION));
+	assert!(
+		persisted,
+		"the store gave up on the database it had just upgraded"
+	);
+	delete_database(db_name).await;
 }
 
 /// Another page asks for a newer version while a store is open. The store closes its

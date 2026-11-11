@@ -1,7 +1,8 @@
 //! Opening a `WebStore`'s database, and giving it up when another connection needs it.
 //!
 //! An IndexedDB upgrade waits until every other connection to the database has closed.
-//! Two rules keep a store from waiting on others, or making them wait on it:
+//! Two rules keep a store from waiting on others for more than about a second, and from
+//! ever making them wait on it:
 //!
 //! - The store's connection closes itself as soon as a newer version, or a delete, of
 //!   its database is requested elsewhere (`versionchange`). The store then keeps working
@@ -9,12 +10,13 @@
 //! - Opening gives up if it is still `blocked` after a short wait ([`BLOCKED_GRACE_MS`]).
 //!   The wait lets a connection that is already closing finish: `close()` takes effect
 //!   only once that connection's running transactions are done, and until then it blocks
-//!   the upgrade. A connection that does not close, such as a page loaded before a deploy
-//!   that raised [`DB_VERSION`], holds the database until that page goes away, so waiting
-//!   longer would only hang the caller. The store then works in memory only. The
-//!   abandoned request is left harmless: if it later gets to upgrade, the upgrade is
-//!   aborted, so the database stays exactly as it was for the next open; if it ever
-//!   succeeds, the connection is closed at once.
+//!   the upgrade. Once the upgrade has started, the wait is over: `success` or `error`
+//!   follows when it commits or fails. A connection that does not close, such as a page
+//!   loaded before a deploy that raised [`DB_VERSION`], holds the database until that
+//!   page goes away, so waiting longer would only hang the caller. The store then works
+//!   in memory only. The abandoned request is left harmless: if it later gets to
+//!   upgrade, the upgrade is aborted, so the database stays exactly as it was for the
+//!   next open; if it ever succeeds, the connection is closed at once.
 
 use super::idb::{js_error, result_of, DB_VERSION, KEY_PATH, STORE_NAME};
 use std::cell::{Cell, RefCell};
@@ -34,10 +36,11 @@ pub(super) const BLOCKED_GRACE_MS: i32 = 1000;
 /// `Some` until `open` has its answer: success, failure, or giving up when blocked.
 type Waiting = Rc<RefCell<Option<futures_channel::oneshot::Sender<Result<()>>>>>;
 
-/// Gives `open` its answer, unless it has one already. Returns whether it was waiting.
+/// Gives `open` its answer, unless it has one already. Returns whether `open` was still
+/// waiting for it: `false` too if the caller has dropped `open`'s future.
 fn answer(waiting: &Waiting, outcome: Result<()>) -> bool {
 	let sender = waiting.borrow_mut().take();
-	sender.map(|sender| sender.send(outcome)).is_some()
+	sender.is_some_and(|sender| sender.send(outcome).is_ok())
 }
 
 /// Opens (or creates, or upgrades) the database `name` at [`DB_VERSION`].
@@ -58,13 +61,19 @@ pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 
 	let (sender, receiver) = futures_channel::oneshot::channel();
 	let waiting: Waiting = Rc::new(RefCell::new(Some(sender)));
+	// Set once this open's upgrade has started: the blockers are gone by then.
+	let upgrading = Rc::new(Cell::new(false));
 
 	let on_blocked = Closure::once({
-		let waiting = waiting.clone();
+		let (waiting, upgrading) = (waiting.clone(), upgrading.clone());
 		move |_event: web_sys::Event| {
 			// `success`, or `error`, answers first if the blocking connection closes in time.
 			wasm_bindgen_futures::spawn_local(async move {
 				delay(BLOCKED_GRACE_MS).await;
+				if upgrading.get() {
+					// The upgrade may still be committing; its `success` or `error` answers.
+					return;
+				}
 				let gave_up = answer(
 					&waiting,
 					Err(Error::other("blocked by an open older version")),
@@ -85,7 +94,10 @@ pub(super) async fn open(name: &str) -> Result<IdbDatabase> {
 				return;
 			};
 			let outcome = match *waiting.borrow() {
-				Some(_) => create_schema(&request),
+				Some(_) => {
+					upgrading.set(true);
+					create_schema(&request)
+				}
 				None => Err("the open was given up when it was blocked".into()),
 			};
 			if let Err(e) = outcome {
@@ -187,4 +199,33 @@ pub(super) fn close_on_versionchange(db: &IdbDatabase) -> Rc<Cell<bool>> {
 	db.set_onversionchange(Some(on_versionchange.as_ref().unchecked_ref()));
 	on_versionchange.forget();
 	closed
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use wasm_bindgen_test::wasm_bindgen_test;
+
+	fn waiting() -> (Waiting, futures_channel::oneshot::Receiver<Result<()>>) {
+		let (sender, receiver) = futures_channel::oneshot::channel();
+		(Rc::new(RefCell::new(Some(sender))), receiver)
+	}
+
+	#[wasm_bindgen_test]
+	fn test_answer_is_given_once() {
+		let (waiting, mut receiver) = waiting();
+		assert!(answer(&waiting, Ok(())));
+		assert!(!answer(&waiting, Err(Error::other("late"))));
+		assert!(matches!(receiver.try_recv(), Ok(Some(Ok(())))));
+	}
+
+	/// A caller that dropped `open`'s future is not waiting: the connection a later
+	/// `success` brings is closed rather than left open with no one to close it.
+	#[wasm_bindgen_test]
+	fn test_answer_reports_a_dropped_open_as_not_waiting() {
+		let (waiting, receiver) = waiting();
+		drop(receiver);
+		assert!(!answer(&waiting, Ok(())));
+		assert!(waiting.borrow().is_none());
+	}
 }
