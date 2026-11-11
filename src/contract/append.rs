@@ -71,12 +71,12 @@ pub(crate) fn assert_rejects_oversized_items(store: &mut dyn DataStore, max_item
 }
 
 /// Asserts that `store` rejects an item nested past the limit with [`Error::ItemTooDeep`],
-/// in every shape and however deep, without overflowing the stack, and before its size is
-/// looked at. Holds in any state a store can be in, including one where it could store
-/// nothing.
-pub(crate) fn assert_rejects_too_deep_items(store: &mut dyn DataStore) {
+/// in every shape and up to `deepest` levels deep, without overflowing the stack, and
+/// before its size is looked at. Holds in any state a store can be in, including one
+/// where it could store nothing.
+pub(crate) fn assert_rejects_too_deep_items(store: &mut dyn DataStore, deepest: usize) {
 	for shape in SHAPES {
-		for depth in [100_000, MAX_ITEM_DEPTH + 1, MAX_ITEM_DEPTH + 2] {
+		for depth in [deepest, MAX_ITEM_DEPTH + 1, MAX_ITEM_DEPTH + 2] {
 			let err = store.append(nested(depth, shape, json!(0))).unwrap_err();
 			assert!(
 				matches!(err, Error::ItemTooDeep),
@@ -94,7 +94,7 @@ pub(crate) fn assert_rejects_too_deep_items(store: &mut dyn DataStore) {
 pub(crate) fn rejected_item_is_rejected_the_same_way_in_every_state(store: &mut dyn DataStore) {
 	let check = |store: &mut dyn DataStore, state: &str, expected: &[Value]| {
 		assert_rejects_oversized_items(store, 32);
-		assert_rejects_too_deep_items(store);
+		assert_rejects_too_deep_items(store, 100_000);
 		assert_eq!(available(store), expected, "{state}");
 	};
 	check(store, "empty", &[]);

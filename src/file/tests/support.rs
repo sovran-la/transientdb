@@ -132,38 +132,6 @@ pub(crate) fn bytes_of(path: &Path) -> Vec<u8> {
 	std::fs::read(path).unwrap()
 }
 
-/// The variable naming the one test a child process started by [`isolated`] runs.
-const ISOLATED_TEST: &str = "TRANSIENTDB_ISOLATED_TEST";
-
-/// Runs `body` for the test named `test` (its full path, from `module_path!()`) in a
-/// child process running only that test, and fails if the child does not pass it. A
-/// stack overflow aborts a whole process, so a test that would overflow on a regression
-/// fails on its own instead of taking the rest of the test binary with it.
-///
-/// `test` is typed by hand, so it must be the calling test's own name. A name that
-/// matches no test runs nothing in the child, and fails. But a test copied from another
-/// that keeps the original's name runs the original in the child, which passes, so the
-/// copy passes without its own body ever running.
-pub(crate) fn isolated(test: &str, body: impl FnOnce()) {
-	let name = test.split_once("::").map_or(test, |(_, name)| name);
-	if std::env::var(ISOLATED_TEST).as_deref() == Ok(name) {
-		body();
-		return;
-	}
-	let output = std::process::Command::new(std::env::current_exe().unwrap())
-		.args([name, "--exact", "--test-threads=1", "--nocapture"])
-		.env(ISOLATED_TEST, name)
-		.output()
-		.unwrap();
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	let stderr = String::from_utf8_lossy(&output.stderr);
-	assert!(
-		output.status.success() && stdout.contains("test result: ok. 1 passed"),
-		"{name} failed in its own process ({}):\n{stdout}\n{stderr}",
-		output.status
-	);
-}
-
 /// `path`, an absolute path, spelled relative to the current directory.
 pub(crate) fn relative(path: &Path) -> PathBuf {
 	let cwd = std::env::current_dir().unwrap();

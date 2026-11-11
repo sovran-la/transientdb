@@ -1,7 +1,7 @@
 //! An item `append` must reject is rejected as every store rejects it, even by a store
 //! that cannot use its file: one whose path another store holds, or whose file cannot be
 //! opened. The item is checked before the file is touched, so the error names the item,
-//! nothing is written, and a deeply nested item cannot overflow the stack.
+//! and nothing is written.
 
 use super::*;
 use crate::contract::{self, append_all, available, tagged};
@@ -99,40 +99,22 @@ fn test_a_store_without_its_file_rejects_an_oversized_item_as_any_store_does() {
 	}
 }
 
-#[test]
-fn test_a_store_without_its_file_rejects_a_too_deep_item_without_overflowing() {
-	let test = concat!(
-		module_path!(),
-		"::test_a_store_without_its_file_rejects_a_too_deep_item_without_overflowing"
-	);
-	isolated(test, || {
-		for why in [Without::InUse, Without::Unopenable] {
-			let mut case = case(why);
-			contract::assert_rejects_too_deep_items(&mut case.store);
-			assert_untouched_then_usable(case, why, |store| {
-				contract::assert_rejects_too_deep_items(store)
-			});
-		}
-	});
-}
+/// Deeper than `append` allows, so that rejecting it is the check under test, and shallow
+/// enough that dropping it the ordinary, recursive way is safe: an item nested in objects
+/// takes about 1 KiB of stack per level to drop in a debug build, so this one takes about
+/// half a MiB of the 2 MiB a test thread gets, and no more on a 32-bit target. A store that
+/// took its file before checking the item would fail here with the wrong error rather
+/// than abort the test binary. That the check itself does not recurse, however deep the
+/// item, is tested on stores that have their file.
+const DEEP: usize = 500;
 
-/// The child exits with a failure before its test can finish, as it does when it aborts:
-/// the parent fails, and nothing else. A plain exit, not a real abort, so that no run
-/// leaves a crash report behind; the deep-item test above aborts its child if the bug it
-/// guards against comes back.
 #[test]
-#[should_panic(expected = "failed in its own process")]
-fn test_an_isolated_test_whose_process_exits_with_a_failure_fails() {
-	let test = concat!(
-		module_path!(),
-		"::test_an_isolated_test_whose_process_exits_with_a_failure_fails"
-	);
-	isolated(test, || std::process::exit(1));
-}
-
-/// A name that matches no test runs nothing in the child, which is not a pass.
-#[test]
-#[should_panic(expected = "failed in its own process")]
-fn test_an_isolated_test_that_runs_nothing_fails() {
-	isolated("transientdb::no::such::test", || {});
+fn test_a_store_without_its_file_rejects_a_too_deep_item_before_touching_the_file() {
+	for why in [Without::InUse, Without::Unopenable] {
+		let mut case = case(why);
+		contract::assert_rejects_too_deep_items(&mut case.store, DEEP);
+		assert_untouched_then_usable(case, why, |store| {
+			contract::assert_rejects_too_deep_items(store, DEEP)
+		});
+	}
 }
