@@ -1,5 +1,7 @@
 /target
 /tools/release/target
+/examples/web/target
+/examples/web/pkg
 
 .DS_Store
 

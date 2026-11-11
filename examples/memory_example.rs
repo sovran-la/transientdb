@@ -1,7 +1,6 @@
 use serde_json::json;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use transientdb::{MemoryConfig, MemoryStore, Result, TransientDB};
+use std::time::{SystemTime, UNIX_EPOCH};
+use transientdb::{Error, MemoryConfig, MemoryStore, Result, TransientDB};
 
 fn memory_store_example() -> Result<()> {
 	// Create a memory store configuration.
@@ -33,22 +32,42 @@ fn memory_store_example() -> Result<()> {
 		});
 
 		db.append(event)?;
-		thread::sleep(Duration::from_millis(100)); // Simulate time between events
+	}
+
+	// An event the store can never hold is rejected, and nothing is stored for it. Drop it
+	// or report it; retrying will not help.
+	match db.append(json!({"event_type": "upload", "data": "x".repeat(10 * 1024)})) {
+		Err(e @ Error::ItemTooLarge { .. }) => println!("Dropped an event: {e}"),
+		other => panic!("expected ItemTooLarge, got {other:?}"),
 	}
 
 	// Fetch events two at a time, at most 64KB of them, and wrap each batch in the
 	// request body this (imaginary) service expects.
 	println!("Fetching and processing events...");
+	let mut attempt = 0;
 	while let Some(items) = db.fetch(2, 64 * 1024)? {
 		let body = format!("{{\"events\":{},\"source\":\"sensor-7\"}}", items.json());
-		println!("Sending {} events: {body}", items.len());
+		attempt += 1;
 
-		// After a successful send, remove the fetched items. Had the send failed,
-		// dropping `items` would have given them back for a later fetch.
+		// Pretend the second request fails.
+		if attempt == 2 {
+			println!(
+				"Sending {} events failed; keeping them for a retry",
+				items.len()
+			);
+			// Releasing gives them back: the next fetch returns them, in order. Dropping
+			// `items` does the same.
+			items.release();
+			continue;
+		}
+
+		println!("Sending {} events: {body}", items.len());
+		// After a successful send, remove the fetched items.
 		db.remove(items)?;
 		println!("Removed processed events from store");
 	}
 
+	assert!(!db.has_data());
 	Ok(())
 }
 
