@@ -105,7 +105,7 @@ async fn test_both_limits_lowered_at_once() {
 }
 
 /// Records without the record shape are discarded; records with it are kept, whatever
-/// their text, as an item's text was checked when it was appended.
+/// their text says, as an item's text was checked when it was appended.
 #[wasm_bindgen_test]
 async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reused() {
 	let db_name = "test-hydrate-not-items";
@@ -143,7 +143,6 @@ async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reus
 	let kept: Vec<(u64, String)> = [
 		(1, json!({"n": u64::MAX}).to_string()),
 		(5, "not json".to_string()),
-		(6, String::new()),
 		(7, "{\"a\":1} trailing".to_string()),
 		(8, "42.0".to_string()),
 		(9, too_deep),
@@ -171,6 +170,43 @@ async fn test_records_that_are_not_items_are_discarded_and_their_seqs_never_reus
 	reopened.reset();
 	settle().await;
 	assert!(idb::read_all(&db).await.unwrap().is_empty());
+}
+
+/// No `append` stores empty text, and FileStore cannot hold it, so a record with it is not
+/// an item: it is discarded, deleted from IndexedDB and logged, and its sequence number
+/// still counts.
+#[wasm_bindgen_test]
+async fn test_a_record_with_empty_text_is_discarded_and_its_seq_still_counts() {
+	let db_name = "test-hydrate-empty-text";
+	let Some(store) = persisted(db_name, 4096, 1000).await else {
+		return;
+	};
+	settle().await;
+	let db = store.db.clone().unwrap();
+	add_raw(&db, &[idb::record(3, "\"kept\""), idb::record(7, "")]).await;
+
+	crate::web::hydrate::WARNINGS.take();
+	let mut reopened = WebStore::new(config(db_name, 4096, 1000)).await;
+	assert!(reopened.is_persisted());
+	assert_eq!(
+		crate::web::hydrate::WARNINGS.take(),
+		["Discarding an IndexedDB record that is not a stored item"]
+	);
+	let kept = vec![(3, "\"kept\"".to_string())];
+	assert_eq!(stored(&reopened), kept);
+	// 7 is above every kept sequence, and is never given out again.
+	assert_eq!(reopened.queue.next_seq, 8);
+	// It was deleted: the kept item is the only record left.
+	assert_eq!(flushed(&reopened).await, kept);
+
+	reopened.append(json!("new")).unwrap();
+	assert_eq!(reopened.queue.items.back().unwrap().seq, 8);
+	settle().await;
+	let again = WebStore::new(config(db_name, 4096, 1000)).await;
+	let new = (8, json!("new").to_string());
+	assert_eq!(stored(&again), [kept, vec![new]].concat());
+	reopened.reset();
+	settle().await;
 }
 
 /// Adds `records`, JavaScript values as another writer could store them, to `db`.

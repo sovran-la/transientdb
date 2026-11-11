@@ -280,7 +280,7 @@ A file that does not match the config (another id or `max_item_size`, another fo
 ### WebStore (WASM)
 - Browser-based storage using IndexedDB, behind an in-memory queue
 - Async construction, sync operations: every write to IndexedDB is fire-and-forget, issued during the call that causes it, so writes land in call order
-- Loads what IndexedDB holds when it opens, in append order, without parsing it again: an item was checked when it was appended. A record that is not an item (no usable sequence number and text), an item larger than `max_item_size`, and the oldest beyond `max_items` are discarded and logged to the console
+- Loads what IndexedDB holds when it opens, in append order, without parsing it again: an item was checked when it was appended. A record that is not an item (no usable sequence number and non-empty text), an item larger than `max_item_size`, and the oldest beyond `max_items` are discarded and logged to the console
 - Items are persisted as JSON text, so after a reload an integer above 2^53 or a float such as `42.0` comes back exactly as appended
 - Which items are fetched is kept in memory only, so after a reload every stored item can be fetched again
 - A failed IndexedDB write is not an error: it is logged, and the item is still queued in memory

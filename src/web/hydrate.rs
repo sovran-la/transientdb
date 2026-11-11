@@ -6,7 +6,16 @@ use wasm_bindgen::JsValue;
 use web_sys::IdbDatabase;
 
 fn warn(message: &str) {
+	#[cfg(test)]
+	WARNINGS.with_borrow_mut(|warnings| warnings.push(message.to_owned()));
 	web_sys::console::warn_1(&message.into());
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Every warning hydrating has logged, for tests to check and clear.
+	pub(super) static WARNINGS: std::cell::RefCell<Vec<String>> =
+		const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl WebStore {
@@ -19,7 +28,7 @@ impl WebStore {
 	/// IndexedDB and logged:
 	///
 	/// - a record without the record shape (a sequence number in `1..=MAX_SEQ` and a
-	///   string), or one that cannot be read as JSON at all, whose sequence number, if it
+	///   non-empty string), or one that cannot be read as JSON at all, whose sequence number, if it
 	///   has one, still counts, so no new item is given it;
 	/// - an item larger than `max_item_size` (stored under a larger limit);
 	/// - the oldest items beyond `max_items`, if more are stored (under a larger limit).

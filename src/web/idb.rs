@@ -54,11 +54,12 @@ pub(super) fn record_seq(record: &Value) -> Option<u64> {
 }
 
 /// The sequence number and text of a record, if it has the record shape: a sequence
-/// number and a string. Whether the text is a fit item is the store's to check.
+/// number and a non-empty string. No `append` stores empty text, so a record with it
+/// is not an item. Whether the text is a fit item otherwise is the store's to check.
 pub(super) fn parse_record(record: &Value) -> Option<(u64, String)> {
 	let seq = record_seq(record)?;
 	let text = record.get(TEXT_FIELD)?.as_str()?;
-	Some((seq, text.to_owned()))
+	(!text.is_empty()).then(|| (seq, text.to_owned()))
 }
 
 /// The key a record is stored under, whatever it is, for deleting the record.
