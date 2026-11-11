@@ -91,7 +91,7 @@ struct State {
 
 impl FileStore {
 	/// Creates a store on the file at `config.path`, creating the file and its parent
-	/// directory if they are missing.
+	/// directory if they are missing (see [`FileConfig::path`]).
 	///
 	/// A file written for another `id` or `max_item_size`, an older or newer format, or
 	/// one that is damaged or is not a FileStore file, is deleted with everything in it,

@@ -181,3 +181,25 @@ fn test_lowering_max_items_keeps_the_file_long_until_it_is_emptied() {
 	assert_eq!(file_len(&path), len_of(2));
 	assert_eq!(texts(&mut core), vec![item(6, 13), item(6, 14)]);
 }
+
+#[test]
+fn test_lowering_max_items_keeps_the_file_long_when_survivors_are_in_low_slots() {
+	let (_dir, path) = temp_path();
+	let (mut core, _) = open_with(&path, 5);
+	let mut seqs = Vec::new();
+	for tag in 0..5 {
+		seqs.push(core.append_text(&item(6, tag)).unwrap());
+	}
+	// Slots 0 and 1 are freed and refilled, so the two newest items sit below slot 2.
+	assert!(core.free(seqs[0]).unwrap());
+	assert!(core.free(seqs[1]).unwrap());
+	core.append_text(&item(6, 5)).unwrap();
+	core.append_text(&item(6, 6)).unwrap();
+	assert_eq!(slots_of(&core), vec![2, 3, 4, 0, 1]);
+	drop(core);
+	// Lowered to 2: the survivors fit in max_items slots, but the file is not cut to
+	// them.
+	let (mut core, _) = open_with(&path, 2);
+	assert_eq!(texts(&mut core), vec![item(6, 5), item(6, 6)]);
+	assert_eq!(file_len(&path), len_of(5));
+}
