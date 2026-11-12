@@ -2,7 +2,6 @@
 
 **Status:** Implemented in 0.4.0
 **Date:** 2026-11-10
-**Supersedes:** `LEDGER_SPEC.md` and `STORAGE_PROPOSAL.md` (March 2026)
 
 Unsettled points are collected under [Open questions](#open-questions).
 

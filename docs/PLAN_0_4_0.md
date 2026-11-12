@@ -105,7 +105,6 @@ in memory, so after a reload every stored item is available again.
 ## Not in scope
 
 - The version number, `release.sh`, `tools/release`, tags and publishing.
-- `LEDGER_SPEC.md` and `STORAGE_PROPOSAL.md` at the repository root.
 - Any other repository, including twilio-data-core2.
 - Shrinking a file that still holds items, or compaction.
 
