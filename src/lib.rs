@@ -1,125 +1,116 @@
-mod batch;
-mod directory;
-mod envelope;
+//! Lightweight queues for transient data: append JSON items, fetch them, remove them once
+//! they are delivered.
+//!
+//! Every store implements [`DataStore`]. [`MemoryStore`] keeps its items in memory.
+//! `FileStore` (native targets only) keeps them in one file, so they survive the process
+//! and a kill at any point. `WebStore` (feature `web`, `wasm32` only) keeps them in
+//! IndexedDB as well, so they survive a page reload. [`TransientDB`] wraps any store
+//! behind a mutex so threads can share it.
+//!
+//! ```
+//! use serde_json::json;
+//! use transientdb::{MemoryConfig, MemoryStore, TransientDB};
+//!
+//! let db = TransientDB::new(MemoryStore::new(MemoryConfig {
+//!     max_item_size: 8 * 1024,
+//!     max_items: 1000,
+//! }));
+//! db.append(json!({"event": "login"})).unwrap();
+//!
+//! if let Some(items) = db.fetch(100, 64 * 1024).unwrap() {
+//!     let body = format!("{{\"batch\":{}}}", items.json());
+//!     // ... send `body`. On success:
+//!     db.remove(items).unwrap();
+//!     // On failure, drop `items` instead: a later fetch returns them again.
+//! }
+//! assert!(!db.has_data());
+//! ```
+
+mod claims;
+#[cfg(test)]
+mod contract;
+mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod file;
 #[cfg(test)]
 mod item_samples;
+mod items;
 mod memory;
+mod queue;
+mod serialize;
 mod transient;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod web;
 
 use serde_json::Value;
-use std::any::Any;
-use std::fmt::Debug;
-use std::io::Result;
 
-pub use directory::{DirectoryConfig, DirectoryStore};
-pub use envelope::Envelope;
+pub use error::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
+pub use file::{FileConfig, FileStore};
+pub use items::Items;
 pub use memory::{MemoryConfig, MemoryStore};
 pub use transient::TransientDB;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use web::{PersistenceState, WebConfig, WebStore};
 
-/// A new identity for a store instance, unique within the process. A store carries it
-/// in every removable it issues, so its `remove` can ignore another instance's.
-pub(crate) fn next_store_id() -> u64 {
-	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-	NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Represents the result of a data fetch operation.
-/// Contains either raw data bytes or paths to data files, along with items that can be removed.
-#[derive(Debug)]
-pub struct DataResult<T> {
-	pub data: Option<T>,
-	pub removable: Option<Vec<Box<dyn Equivalent>>>,
-}
-
-/// Trait for types that can be compared for equality and downcasted.
-/// Used primarily for tracking removable items in the data stores.
-pub trait Equivalent: Any + Debug + Send {
-	/// Checks if this item equals another Equivalent item
-	fn equals(&self, other: &dyn Equivalent) -> bool;
-
-	/// Allows downcasting to concrete type
-	fn as_any(&self) -> &dyn Any;
-}
-
-/// A trait for implementing persistent data stores that support batched operations.
-/// Provides a common interface for storing, retrieving, and managing data with support
-/// for size limits and batch processing.
+/// A queue of JSON items: append them, fetch them, and remove them once delivered.
+///
+/// Every store takes the same two limits, `max_item_size` and `max_items`, so an item
+/// one store accepts, every store accepts.
 pub trait DataStore {
-	/// The type of data returned by fetch operations.
-	type Output;
-
-	/// Checks if the store contains any data that can be fetched.
-	fn has_data(&self) -> bool;
-
-	/// Removes all data from the store and resets it to initial state.
-	fn reset(&mut self);
-
-	/// Appends a new item to the store.
+	/// Appends an item.
 	///
-	/// # Arguments
-	/// * `data` - JSON value to store
+	/// The item is stored as its compact `serde_json` text. A store already holding
+	/// `max_items` items drops its oldest one to make room, whether or not that one has
+	/// been fetched; appending never fails for being full. An `Items` holding a dropped
+	/// item still removes or releases the rest normally.
 	///
 	/// # Errors
-	/// The built-in stores return `ErrorKind::InvalidInput`, and store nothing, for an
-	/// item too large to fit by itself under the store's configured byte limit, envelope
-	/// included. Such an item could never be delivered.
-	///
-	/// They also return `ErrorKind::InvalidInput`, and store nothing, for an item nested
-	/// more than 125 levels deep in arrays and objects (each `[]` or `{}` is a level).
-	/// `serde_json` cannot read a deeper item back from a batch, so neither could the
-	/// store's own recovery or the consumer. The check does not recurse, so even a
-	/// pathologically deep item is rejected without overflowing the stack.
+	/// [`Error::ItemTooDeep`], storing nothing, for an item nested more than 125 levels
+	/// deep in arrays and objects (each `[]` or `{}` is a level): `serde_json` could not
+	/// read it back once a caller puts the items in a request body. The check does not
+	/// recurse, so even a pathologically deep item is rejected without overflowing the
+	/// stack. Otherwise [`Error::ItemTooLarge`], storing nothing, for an item whose text
+	/// is longer than `max_item_size` bytes. A store with storage of its own may also
+	/// return the errors it documents.
 	fn append(&mut self, data: Value) -> Result<()>;
 
-	/// Fetches a batch of data from the store, respecting optional count and size limits.
+	/// Hands out the oldest items, in the order they were appended: at most `count` of
+	/// them, whose text totals at most `max_bytes` bytes.
 	///
-	/// # Arguments
-	/// * `count` - Optional maximum number of items to fetch
-	/// * `max_bytes` - Optional maximum total size in bytes to fetch
+	/// `max_bytes` counts item bytes only: whatever the caller puts around or between the
+	/// items is the caller's to account for. The items are taken in order, stopping at
+	/// the first one that does not fit; a smaller item behind it does not jump the queue.
 	///
-	/// In the built-in stores byte limits are hard ceilings on the whole batch, envelope
-	/// and separators included. `MemoryStore` and `WebStore` apply `max_bytes` (or their
-	/// configured `max_fetch_size`) to the returned batch; `DirectoryStore` applies it to
-	/// the total size of the returned files, each of which is at most `max_file_size`.
+	/// Returns `Ok(None)` when there is nothing to hand over: nothing is waiting, `count`
+	/// is 0, or the oldest waiting item alone is larger than `max_bytes`. Otherwise the
+	/// returned [`Items`] holds at least one item.
 	///
-	/// A batch also never crosses a boundary set by [`end_batch`](Self::end_batch).
-	/// `MemoryStore` and `WebStore` stop their batch at the first boundary, so a fetch can
-	/// return fewer items than asked for while more are stored; `DirectoryStore` ends a
-	/// file there.
+	/// An item is checked when it is appended, and what is fetched is what was stored: each
+	/// item's text is the JSON its `append` serialized (see [`Items`] for text something
+	/// else wrote to the storage), and is not parsed again.
 	///
-	/// Returns the fetched data along with items that can be passed to `remove()`.
-	/// Fetching removes nothing: the data stays in the store, and a later fetch returns it
-	/// again, until those items are passed to `remove()`.
-	fn fetch(
-		&mut self,
-		count: Option<usize>,
-		max_bytes: Option<usize>,
-	) -> Result<Option<DataResult<Self::Output>>>;
+	/// Fetching deletes nothing, but the items handed out are not returned by another
+	/// fetch until their `Items` is released, so consecutive fetches never return the same
+	/// item. Pass the `Items` to [`remove`](Self::remove) once its items are delivered, or
+	/// drop it (or call [`Items::release`]) to have them returned by a later fetch.
+	fn fetch(&mut self, count: usize, max_bytes: usize) -> Result<Option<Items>>;
 
-	/// Removes previously fetched data from the store.
+	/// Deletes the items in an `Items` this store handed out.
 	///
-	/// # Arguments
-	/// * `data` - Slice of removable items from a previous fetch operation
-	///
-	/// The built-in stores act only on removables issued by the same store instance
-	/// (for `DirectoryStore`, on paths to its own finished files) and silently ignore
-	/// anything else, returning `Ok`, as they do for items already removed.
-	fn remove(&mut self, data: &[Box<dyn Equivalent>]) -> Result<()>;
+	/// Items no longer stored (dropped to make room since the fetch) are skipped. An
+	/// `Items` from another store, or from before a [`reset`](Self::reset), matches
+	/// nothing: it is ignored, which is not an error. Another store's `Items` is released
+	/// back to that store.
+	fn remove(&mut self, items: Items) -> Result<()>;
 
-	/// Ends the current batch: items appended before this call and items appended after
-	/// it are never returned in the same batch. A batch is one file for `DirectoryStore`
-	/// and one fetched `Value` for `MemoryStore` and `WebStore`.
-	///
-	/// When nothing has been appended since the store was created, since the last
-	/// `end_batch`, or since everything was removed or reset, there is nothing to end:
-	/// the call does nothing and returns `Ok(())`. Calling it several times in a row is
-	/// the same as calling it once. It never creates an empty batch, fetches nothing,
-	/// returns no data, and removes nothing.
-	fn end_batch(&mut self) -> Result<()>;
+	/// Deletes every item, fetched or not. An `Items` fetched before the reset matches
+	/// nothing afterwards: removing or releasing it does nothing.
+	fn reset(&mut self);
+
+	/// Whether a fetch could return something: some item is stored and not held by an
+	/// unreleased `Items`.
+	fn has_data(&self) -> bool;
 }

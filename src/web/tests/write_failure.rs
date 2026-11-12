@@ -2,58 +2,48 @@
 //! and later writes still persist. Each write is its own transaction, so a failure
 //! never leaves a partial record.
 
-use super::support::*;
 use super::*;
-
-fn tagged(range: std::ops::Range<i64>) -> Vec<Value> {
-	range.map(|i| json!({"i": i})).collect()
-}
+use contract::{append_all, tagged};
 
 #[wasm_bindgen_test]
 async fn test_failed_write_leaves_memory_and_other_records_intact() {
 	let db_name = "test-write-failure";
-	let mut store = fresh_store(db_name, 4096).await;
-	if !store.is_persisted() {
-		web_sys::console::log_1(&"Skipping write failure test - no persistence".into());
+	let Some(mut store) = persisted(db_name, 4096, 1000).await else {
 		return;
-	}
+	};
 	let before = tagged(0..3);
-	for item in &before {
-		store.append(item.clone()).unwrap();
-	}
+	append_all(&mut store, &before);
 	settle().await;
 
-	// Occupy the key the next append will be stored under, so its add fails with a
-	// constraint error and its transaction aborts.
+	// Occupy the sequence number the next append will be stored under, so its add fails
+	// with a constraint error and its transaction aborts.
 	let blocker = json!("already stored under this key");
 	let db = store.db.clone().unwrap();
-	let occupied = idb::add(&db, store.next_key, store.current_batch, &blocker).unwrap();
+	let occupied = idb::add(&db, store.queue.next_seq, &blocker.to_string()).unwrap();
 	idb::completion(&occupied).await.unwrap();
 
 	let failed = json!({"i": "fails to persist"});
 	store.append(failed.clone()).unwrap();
 	let after = tagged(3..6);
-	for item in &after {
-		store.append(item.clone()).unwrap();
-	}
+	append_all(&mut store, &after);
 	settle().await;
 
 	// Memory is the source of truth and is unaffected: every append is queued in order.
 	let all = [before.clone(), vec![failed], after.clone()].concat();
 	assert_eq!(queued(&store), all);
-	let result = store.fetch(None, None).unwrap().unwrap();
-	assert_eq!(checked_batch(&result, 4096), all);
+	let fetched = store.fetch(100, 4096).unwrap().unwrap();
+	assert_eq!(fetched.values(), all);
 
 	// IndexedDB keeps every other record, and the writes after the failure persisted.
 	assert_eq!(
-		hydrated(db_name, 4096).await,
+		hydrated(db_name).await,
 		[before.clone(), vec![blocker.clone()], after.clone()].concat()
 	);
 
 	// Removing items, the failed one included, still works in both places. Removing
 	// the failed item deletes its key, the one the blocking record was put under.
-	store.remove(&result.removable.unwrap()).unwrap();
+	store.remove(fetched).unwrap();
 	settle().await;
 	assert!(!store.has_data());
-	assert!(hydrated(db_name, 4096).await.is_empty());
+	assert!(hydrated(db_name).await.is_empty());
 }

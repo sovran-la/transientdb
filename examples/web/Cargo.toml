@@ -23,3 +23,7 @@ features = [
     "HtmlElement",
     "Window",
 ]
+
+# `#[wasm_bindgen]` expands to code that checks this cfg; declare it, as the library does.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(wasm_bindgen_unstable_test_coverage)"] }

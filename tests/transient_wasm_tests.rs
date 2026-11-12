@@ -6,20 +6,32 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use serde_json::{json, Value};
-use transientdb::{Envelope, TransientDB, WebConfig, WebStore};
+use serde_json::json;
+use transientdb::{TransientDB, WebConfig, WebStore};
 use wasm_bindgen_test::*;
+
+mod common;
+use common::{available, settle};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 fn test_config(db_name: &str) -> WebConfig {
 	WebConfig {
-		envelope: Envelope::default(),
 		database_name: db_name.to_string(),
-		max_items: Some(1000),
-		max_fetch_size: 1024 * 1024,
-		max_fetch_items: None,
+		max_item_size: 64 * 1024,
+		max_items: 1000,
 	}
+}
+
+/// A TransientDB over a WebStore on `db_name`, emptied of anything a previous run left.
+async fn fresh_db(config: WebConfig) -> TransientDB {
+	let db = TransientDB::new(WebStore::new(config).await);
+	db.reset();
+	db
+}
+
+async fn db(db_name: &str) -> TransientDB {
+	fresh_db(test_config(db_name)).await
 }
 
 // =============================================================================
@@ -37,39 +49,25 @@ async fn test_transientdb_creation() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_empty_state() {
-	let store = WebStore::new(test_config("test-empty")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-empty").await;
 	assert!(!db.has_data(), "New TransientDB should be empty");
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_append_single() {
-	let store = WebStore::new(test_config("test-append-single")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-append-single").await;
 	db.append(json!({"event": "test", "value": 42})).unwrap();
 	assert!(db.has_data(), "Should have data after append");
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_append_multiple() {
-	let store = WebStore::new(test_config("test-append-multi")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-append-multi").await;
 	for i in 0..10 {
 		db.append(json!({"index": i})).unwrap();
 	}
 	assert!(db.has_data());
-
-	// Fetch and verify count
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 10, "Should have 10 items");
-	} else {
-		panic!("Expected data but got none");
-	}
+	assert_eq!(db.fetch(100, 64 * 1024).unwrap().unwrap().len(), 10);
 }
 
 // =============================================================================
@@ -78,75 +76,66 @@ async fn test_transientdb_append_multiple() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_fetch_empty() {
-	let store = WebStore::new(test_config("test-fetch-empty")).await;
-	let db = TransientDB::new(store);
-
-	let result = db.fetch(None, None).unwrap();
-	assert!(result.is_none(), "Fetch on empty store should return None");
+	let db = db("test-fetch-empty").await;
+	assert!(db.fetch(100, 64 * 1024).unwrap().is_none());
+	assert!(db.fetch(0, 0).unwrap().is_none());
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_fetch_with_count_limit() {
-	let store = WebStore::new(test_config("test-fetch-count")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-fetch-count").await;
 	for i in 0..20 {
 		db.append(json!({"index": i})).unwrap();
 	}
-
-	// Fetch only 5 items
-	if let Some(result) = db.fetch(Some(5), None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 5, "Should respect count limit");
-
-		// Verify we got the first 5 (FIFO order)
-		for (i, item) in items.iter().enumerate() {
-			assert_eq!(item["index"], i as i64);
-		}
-	} else {
-		panic!("Expected data");
+	let items = db.fetch(5, 64 * 1024).unwrap().unwrap().values();
+	assert_eq!(items.len(), 5, "Should respect count limit");
+	for (i, item) in items.iter().enumerate() {
+		assert_eq!(item["index"], i as i64);
 	}
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_fetch_with_byte_limit() {
-	let store = WebStore::new(test_config("test-fetch-bytes")).await;
-	let db = TransientDB::new(store);
-
-	// Add items with predictable sizes
+	let db = db("test-fetch-bytes").await;
 	for i in 0..20 {
-		let padding = "x".repeat(100);
-		db.append(json!({
-			"index": i,
-			"padding": padding
-		}))
-		.unwrap();
+		db.append(json!({"index": i, "padding": "x".repeat(100)}))
+			.unwrap();
 	}
-
-	// Fetch with small byte limit - should get fewer items
-	if let Some(result) = db.fetch(None, Some(500)).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert!(items.len() < 20, "Byte limit should restrict item count");
-		assert!(!items.is_empty(), "Should get at least one item");
-	} else {
-		panic!("Expected data");
-	}
+	// The first ten items are 124 bytes each: four fit in 500, a fifth does not.
+	let fetched = db.fetch(100, 500).unwrap().unwrap();
+	assert_eq!((fetched.len(), fetched.byte_len()), (4, 496));
+	drop(fetched);
+	assert_eq!(db.fetch(100, 495).unwrap().unwrap().len(), 3);
 }
 
 #[wasm_bindgen_test]
-async fn test_transientdb_fetch_preserves_data() {
-	let store = WebStore::new(test_config("test-fetch-preserves")).await;
-	let db = TransientDB::new(store);
-
+async fn test_transientdb_fetch_holds_items_back_until_released() {
+	let db = db("test-fetch-holds-back").await;
 	db.append(json!({"key": "value"})).unwrap();
 
-	// Fetch without removing
-	let _ = db.fetch(None, None).unwrap();
+	let items = db.fetch(10, 1024).unwrap().unwrap();
+	// Still stored, but not handed out again.
+	assert!(!db.has_data());
+	assert!(db.fetch(10, 1024).unwrap().is_none());
+	drop(items);
+	assert!(db.has_data(), "a dropped fetch gives its items back");
+}
 
-	// Data should still be there
-	assert!(db.has_data(), "Fetch should not remove data");
+#[wasm_bindgen_test]
+async fn test_transientdb_pending_items_are_available_after_a_reload() {
+	let db_name = "test-transient-reload";
+	let first = db(db_name).await;
+	for i in 0..3 {
+		first.append(json!({"index": i})).unwrap();
+	}
+	let held = first.fetch(10, 1024).unwrap().unwrap();
+	settle().await;
+
+	let second = TransientDB::new(WebStore::new(test_config(db_name)).await);
+	assert_eq!(available(&second).len(), 3, "pending is not persisted");
+	drop(held);
+	first.reset();
+	settle().await;
 }
 
 // =============================================================================
@@ -155,49 +144,26 @@ async fn test_transientdb_fetch_preserves_data() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_remove() {
-	let store = WebStore::new(test_config("test-remove")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-remove").await;
 	db.append(json!({"test": "data"})).unwrap();
-	assert!(db.has_data());
-
-	// Fetch and remove
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		if let Some(removable) = result.removable {
-			db.remove(&removable).unwrap();
-		}
-	}
-
+	let items = db.fetch(10, 1024).unwrap().unwrap();
+	db.remove(items).unwrap();
 	assert!(!db.has_data(), "Should be empty after remove");
+	assert!(available(&db).is_empty());
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_partial_remove() {
-	let store = WebStore::new(test_config("test-partial-remove")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-partial-remove").await;
 	for i in 0..10 {
 		db.append(json!({"index": i})).unwrap();
 	}
+	let items = db.fetch(3, 64 * 1024).unwrap().unwrap();
+	db.remove(items).unwrap();
 
-	// Fetch and remove only 3 items
-	if let Some(result) = db.fetch(Some(3), None).unwrap() {
-		if let Some(removable) = result.removable {
-			db.remove(&removable).unwrap();
-		}
-	}
-
-	// Should have 7 items left
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 7, "Should have 7 items remaining");
-
-		// First item should now be index 3
-		assert_eq!(items[0]["index"], 3);
-	} else {
-		panic!("Expected remaining data");
-	}
+	let remaining = available(&db);
+	assert_eq!(remaining.len(), 7, "Should have 7 items remaining");
+	assert_eq!(remaining[0]["index"], 3);
 }
 
 // =============================================================================
@@ -206,136 +172,25 @@ async fn test_transientdb_partial_remove() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_reset() {
-	let store = WebStore::new(test_config("test-reset")).await;
-	let db = TransientDB::new(store);
-
-	for i in 0..10 {
+	let db = db("test-reset").await;
+	for i in 0..5 {
 		db.append(json!({"index": i})).unwrap();
 	}
-	assert!(db.has_data());
-
+	let held = db.fetch(2, 1024).unwrap().unwrap();
 	db.reset();
 	assert!(!db.has_data(), "Should be empty after reset");
+	// An Items from before the reset matches nothing.
+	db.remove(held).unwrap();
+	assert!(!db.has_data());
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_reset_then_append() {
-	let store = WebStore::new(test_config("test-reset-append")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-reset-append").await;
 	db.append(json!({"before": "reset"})).unwrap();
 	db.reset();
 	db.append(json!({"after": "reset"})).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 1);
-		assert_eq!(items[0]["after"], "reset");
-	} else {
-		panic!("Expected data");
-	}
-}
-
-// =============================================================================
-// JSON Type Handling
-// =============================================================================
-
-#[wasm_bindgen_test]
-async fn test_transientdb_json_types() {
-	let store = WebStore::new(test_config("test-json-types")).await;
-	let db = TransientDB::new(store);
-
-	// Test all JSON types
-	db.append(json!(null)).unwrap();
-	db.append(json!(true)).unwrap();
-	db.append(json!(false)).unwrap();
-	db.append(json!(42)).unwrap();
-	db.append(json!(42.5)).unwrap();
-	db.append(json!("string")).unwrap();
-	db.append(json!(["array", "of", "values"])).unwrap();
-	db.append(json!({"object": "value"})).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 8, "All JSON types should be stored");
-	}
-}
-
-#[wasm_bindgen_test]
-async fn test_transientdb_nested_json() {
-	let store = WebStore::new(test_config("test-nested-json")).await;
-	let db = TransientDB::new(store);
-
-	let nested = json!({
-		"level1": {
-			"level2": {
-				"level3": {
-					"value": "deep",
-					"array": [1, 2, {"nested": true}]
-				}
-			}
-		}
-	});
-
-	db.append(nested.clone()).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0], nested);
-	}
-}
-
-#[wasm_bindgen_test]
-async fn test_transientdb_unicode() {
-	let store = WebStore::new(test_config("test-unicode")).await;
-	let db = TransientDB::new(store);
-
-	db.append(json!({
-		"emoji": "🦀💥👾",
-		"chinese": "你好世界",
-		"arabic": "مرحبا بالعالم",
-		"mixed": "Hello 世界 🌍"
-	}))
-	.unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0]["emoji"], "🦀💥👾");
-		assert_eq!(items[0]["chinese"], "你好世界");
-	}
-}
-
-// =============================================================================
-// Batch Metadata
-// =============================================================================
-
-#[wasm_bindgen_test]
-async fn test_transientdb_batch_structure() {
-	let store = WebStore::new(WebConfig {
-		envelope: Envelope::new("items")
-			.field("source", "test-key")
-			.timestamp("sentAt"),
-		..test_config("test-batch-structure")
-	})
-	.await;
-	let db = TransientDB::new(store);
-
-	db.append(json!({"test": "data"})).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-
-		// Verify batch structure
-		assert!(batch.get("items").is_some(), "Missing 'items' field");
-		assert!(batch.get("sentAt").is_some(), "Missing 'sentAt' field");
-		assert!(batch.get("source").is_some(), "Missing 'source' field");
-		assert_eq!(batch["source"].as_str(), Some("test-key"), "Wrong source");
-		assert_eq!(batch.as_object().unwrap().len(), 3);
-	}
+	assert_eq!(available(&db), vec![json!({"after": "reset"})]);
 }
 
 // =============================================================================
@@ -344,50 +199,29 @@ async fn test_transientdb_batch_structure() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_fifo_order() {
-	let store = WebStore::new(test_config("test-fifo")).await;
-	let db = TransientDB::new(store);
-
+	let db = db("test-fifo").await;
 	for i in 0..5 {
 		db.append(json!({"order": i})).unwrap();
 	}
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-
-		for (i, item) in items.iter().enumerate() {
-			assert_eq!(item["order"], i as i64, "Items should be in FIFO order");
-		}
+	for (i, item) in available(&db).iter().enumerate() {
+		assert_eq!(item["order"], i as i64, "Items should be in FIFO order");
 	}
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_max_items_eviction() {
-	let config = WebConfig {
-		envelope: Envelope::default(),
-		database_name: "test-max-items".to_string(),
-		max_items: Some(5), // Small limit
-		max_fetch_size: 1024 * 1024,
-		max_fetch_items: None,
-	};
-	let store = WebStore::new(config).await;
-	let db = TransientDB::new(store);
-
-	// Add more items than max
+	let db = fresh_db(WebConfig {
+		max_items: 5,
+		..test_config("test-max-items")
+	})
+	.await;
 	for i in 0..10 {
 		db.append(json!({"index": i})).unwrap();
 	}
-
-	// Should only have last 5 items
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 5, "Should only have max_items");
-
-		// Should be items 5-9 (oldest evicted)
-		assert_eq!(items[0]["index"], 5);
-		assert_eq!(items[4]["index"], 9);
-	}
+	let items = available(&db);
+	assert_eq!(items.len(), 5, "Should only have max_items");
+	assert_eq!(items[0]["index"], 5);
+	assert_eq!(items[4]["index"], 9);
 }
 
 // =============================================================================
@@ -396,233 +230,76 @@ async fn test_transientdb_max_items_eviction() {
 
 #[wasm_bindgen_test]
 async fn test_transientdb_rapid_append() {
-	let store = WebStore::new(test_config("test-rapid-append")).await;
-	let db = TransientDB::new(store);
-
-	// Rapid-fire appends
+	let db = db("test-rapid-append").await;
 	for i in 0..100 {
 		db.append(json!({"rapid": i})).unwrap();
 	}
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items.len(), 100);
-	}
+	assert_eq!(available(&db).len(), 100);
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_rapid_fetch_remove_cycle() {
-	let store = WebStore::new(test_config("test-rapid-cycle")).await;
-	let db = TransientDB::new(store);
-
-	// Multiple append/fetch/remove cycles
+	let db = db("test-rapid-cycle").await;
 	for cycle in 0..10 {
-		// Append batch
 		for i in 0..10 {
 			db.append(json!({"cycle": cycle, "item": i})).unwrap();
 		}
-
-		// Fetch and remove all
-		while db.has_data() {
-			if let Some(result) = db.fetch(Some(5), None).unwrap() {
-				if let Some(removable) = result.removable {
-					db.remove(&removable).unwrap();
-				}
-			}
+		while let Some(items) = db.fetch(5, 64 * 1024).unwrap() {
+			db.remove(items).unwrap();
 		}
 	}
-
 	assert!(!db.has_data(), "Should be empty after all cycles");
 }
 
 #[wasm_bindgen_test]
 async fn test_transientdb_interleaved_operations() {
-	let store = WebStore::new(test_config("test-interleaved")).await;
-	let db = TransientDB::new(store);
-
-	// Interleave appends and partial removes
+	let db = db("test-interleaved").await;
+	// Interleave appends and partial removes: every 5 items, remove 2
 	for i in 0..20 {
 		db.append(json!({"index": i})).unwrap();
-
-		// Every 5 items, remove 2
 		if i > 0 && i % 5 == 0 {
-			if let Some(result) = db.fetch(Some(2), None).unwrap() {
-				if let Some(removable) = result.removable {
-					db.remove(&removable).unwrap();
-				}
-			}
+			let items = db.fetch(2, 64 * 1024).unwrap().unwrap();
+			db.remove(items).unwrap();
 		}
 	}
-
-	// Should have some items remaining
-	assert!(db.has_data());
-}
-
-// =============================================================================
-// Edge Cases
-// =============================================================================
-
-#[wasm_bindgen_test]
-async fn test_transientdb_empty_object() {
-	let store = WebStore::new(test_config("test-empty-obj")).await;
-	let db = TransientDB::new(store);
-
-	db.append(json!({})).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0], json!({}));
-	}
+	// Three rounds of two removed: the oldest six.
+	let left: Vec<i64> = available(&db)
+		.iter()
+		.map(|v| v["index"].as_i64().unwrap())
+		.collect();
+	assert_eq!(left, (6..20).collect::<Vec<_>>());
 }
 
 #[wasm_bindgen_test]
-async fn test_transientdb_empty_array() {
-	let store = WebStore::new(test_config("test-empty-arr")).await;
-	let db = TransientDB::new(store);
-
-	db.append(json!([])).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0], json!([]));
-	}
-}
-
-#[wasm_bindgen_test]
-async fn test_transientdb_large_payload() {
-	let store = WebStore::new(test_config("test-large")).await;
-	let db = TransientDB::new(store);
-
-	// Create a large JSON object
-	let mut large = json!({});
-	for i in 0..100 {
-		large[format!("field_{}", i)] = json!({
-			"value": "x".repeat(100),
-			"number": i
-		});
-	}
-
-	db.append(large.clone()).unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0]["field_50"]["number"], 50);
-	}
-}
-
-#[wasm_bindgen_test]
-async fn test_transientdb_special_characters() {
-	let store = WebStore::new(test_config("test-special-chars")).await;
-	let db = TransientDB::new(store);
-
-	db.append(json!({
-		"quotes": "He said \"hello\"",
-		"backslash": "path\\to\\file",
-		"newlines": "line1\nline2\r\nline3",
-		"tabs": "col1\tcol2",
-		"null_char": "before\u{0000}after"
-	}))
-	.unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0]["quotes"], "He said \"hello\"");
-		assert_eq!(items[0]["newlines"], "line1\nline2\r\nline3");
-	}
-}
-
-#[wasm_bindgen_test]
-async fn test_transientdb_numeric_edge_cases() {
-	let store = WebStore::new(test_config("test-numeric")).await;
-	let db = TransientDB::new(store);
-
-	db.append(json!({
-		"zero": 0,
-		"negative": -42,
-		"float": 1.23456789012345,
-		"large": 9007199254740991_i64,  // Max safe JS integer
-		"small_float": 0.0000001
-	}))
-	.unwrap();
-
-	if let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		assert_eq!(items[0]["zero"], 0);
-		assert_eq!(items[0]["negative"], -42);
-	}
-}
-
-// =============================================================================
-// Fetch Item Limit
-// =============================================================================
-
-#[wasm_bindgen_test]
-async fn test_transientdb_fetch_item_limit() {
-	let mut config = test_config("test-transient-item-limit");
-	config.max_fetch_items = Some(8);
-	let store = WebStore::new(config).await;
-	let db = TransientDB::new(store);
-	// Discard anything hydrated from a previous run.
-	db.reset();
-
-	for i in 0..20 {
+async fn test_transientdb_large_store_never_drops() {
+	let db = fresh_db(WebConfig {
+		max_items: 3000,
+		..test_config("test-transientdb-large")
+	})
+	.await;
+	for i in 0..3000 {
 		db.append(json!({"index": i})).unwrap();
 	}
-
-	// A count above the limit is clamped, below it wins.
-	let batch: Value = db.fetch(Some(100), None).unwrap().unwrap().data.unwrap();
-	assert_eq!(batch["items"].as_array().unwrap().len(), 8);
-	let batch: Value = db.fetch(Some(3), None).unwrap().unwrap().data.unwrap();
-	assert_eq!(batch["items"].as_array().unwrap().len(), 3);
-
-	let mut sizes = Vec::new();
 	let mut seen = Vec::new();
-	while let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		let items = batch["items"].as_array().unwrap();
-		let removable = result.removable.unwrap();
-		assert_eq!(items.len(), removable.len());
-		sizes.push(items.len());
-		seen.extend(items.iter().map(|v| v["index"].as_i64().unwrap()));
-		db.remove(&removable).unwrap();
+	while let Some(items) = db.fetch(256, 16 * 1024).unwrap() {
+		seen.extend(items.values().iter().map(|v| v["index"].as_i64().unwrap()));
+		db.remove(items).unwrap();
 	}
-	assert_eq!(sizes, vec![8, 8, 4]);
-	assert_eq!(seen, (0..20).collect::<Vec<_>>());
+	assert_eq!(seen, (0..3000).collect::<Vec<_>>());
 	assert!(!db.has_data());
 }
 
 #[wasm_bindgen_test]
-async fn test_transientdb_unbounded_store_never_drops() {
-	let mut config = test_config("test-transientdb-unbounded");
-	config.max_items = None;
-	config.max_fetch_size = 16 * 1024;
-	let store = WebStore::new(config).await;
-	let db = TransientDB::new(store);
-	// Discard anything hydrated from a previous run.
-	db.reset();
-
-	for i in 0..3000 {
+async fn test_transientdb_fetch_count_walks_the_store() {
+	let db = db("test-transient-count-walk").await;
+	for i in 0..20 {
 		db.append(json!({"index": i})).unwrap();
 	}
-
-	let mut seen = Vec::new();
-	while let Some(result) = db.fetch(None, None).unwrap() {
-		let batch: Value = result.data.unwrap();
-		seen.extend(
-			batch["items"]
-				.as_array()
-				.unwrap()
-				.iter()
-				.map(|v| v["index"].as_i64().unwrap()),
-		);
-		db.remove(&result.removable.unwrap()).unwrap();
+	let mut sizes = Vec::new();
+	while let Some(items) = db.fetch(8, 64 * 1024).unwrap() {
+		sizes.push(items.len());
+		db.remove(items).unwrap();
 	}
-	assert_eq!(seen, (0..3000).collect::<Vec<_>>());
+	assert_eq!(sizes, vec![8, 8, 4]);
 	assert!(!db.has_data());
 }
