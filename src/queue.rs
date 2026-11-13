@@ -41,20 +41,35 @@ impl Queue {
 	}
 
 	/// Appends `text` under the next sequence number and, if that takes the queue past
-	/// `max_items`, drops the oldest item, available or pending. Returns the new item's
-	/// sequence number and the dropped one's.
+	/// `max_items`, drops the oldest items, available or pending, until it holds
+	/// `max_items`. Returns the new item's sequence number and the dropped ones', oldest
+	/// first: at most one, unless [`adopt`](Self::adopt) has taken the queue past
+	/// `max_items` since it was last trimmed.
 	///
 	/// # Errors
 	/// An `Io` error, changing nothing, once sequence numbers are exhausted: they never
 	/// wrap, so no two items can share one.
-	pub(crate) fn push(&mut self, text: String) -> Result<(u64, Option<u64>)> {
+	pub(crate) fn push(&mut self, text: String) -> Result<(u64, Vec<u64>)> {
+		let seq = self.adopt(text)?;
+		Ok((seq, self.drop_oldest_beyond(self.max_items)))
+	}
+
+	/// Appends `text` under the next sequence number, as `push` does, but drops nothing:
+	/// the queue may hold more than `max_items` until [`drop_oldest_beyond`] is called.
+	/// For items taken over from storage, which are trimmed once all are in.
+	///
+	/// [`drop_oldest_beyond`]: Self::drop_oldest_beyond
+	///
+	/// # Errors
+	/// As `push`.
+	pub(crate) fn adopt(&mut self, text: String) -> Result<u64> {
 		let seq = self.next_seq;
 		if seq > self.max_seq {
 			return Err(Error::Io(io::Error::other("sequence numbers exhausted")));
 		}
 		self.next_seq = seq + 1;
 		self.items.push_back(Stored { seq, text });
-		Ok((seq, self.drop_oldest_beyond(self.max_items).pop()))
+		Ok(seq)
 	}
 
 	/// Adds an item read back from storage. Items must be restored in sequence order;

@@ -261,9 +261,7 @@ impl DataStore for WebStore {
 		if let Some(db) = self.live_db() {
 			idb::fire_and_forget("write", idb::add(db, seq, &text));
 		}
-		if let Some(dropped) = dropped {
-			self.delete_from_idb(&[dropped]);
-		}
+		self.delete_from_idb(&dropped);
 		Ok(())
 	}
 
