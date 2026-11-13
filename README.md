@@ -199,9 +199,12 @@ async fn start() -> transientdb::Result<(TransientDB, Duration)> {
         database_name: "my-app-events".into(),
         max_item_size: 8 * 1024,
         max_items: 1000,
+        // Take over what closed tabs left unsent this often (and once now)
+        orphan_interval: Duration::from_secs(30),
     };
 
-    // Create the store (async - opens IndexedDB and loads what it holds)
+    // Create the store (async - opens IndexedDB, takes this tab's lock, and
+    // adopts what earlier tabs and page loads left unsent)
     let store = WebStore::new(config).await;
 
     // Check persistence state - IndexedDB may be unavailable
@@ -280,25 +283,51 @@ A file that does not match the config (another id or `max_item_size`, another fo
 ### WebStore (WASM)
 - Browser-based storage using IndexedDB, behind an in-memory queue
 - Async construction, sync operations: every write to IndexedDB is fire-and-forget, issued during the call that causes it, so writes land in call order
-- Loads what IndexedDB holds when it opens, in append order, without parsing it again: an item was checked when it was appended. A record that is not an item (no usable sequence number and non-empty text), an item larger than `max_item_size`, and the oldest beyond `max_items` are discarded and logged to the console
+- Each tab keeps, sends and removes its own items; items left by a tab that is gone are adopted by a live one (see [Several tabs](#several-tabs))
 - Items are persisted as JSON text, so after a reload an integer above 2^53 or a float such as `42.0` comes back exactly as appended
-- Which items are fetched is kept in memory only, so after a reload every stored item can be fetched again
+- Which items are fetched is kept in memory only, so items adopted after a reload can all be fetched again
 - A failed IndexedDB write is not an error: it is logged, and the item is still queued in memory
 - `remove` only counts an `Items` this instance handed out, even if another `WebStore` is open on the same database
 - A database in a record format this version does not write is emptied, not converted, when a store first opens it. An open blocked by another page (see [Database upgrades](#database-upgrades)) leaves it as it was, for a later open
+- Needs a secure context (https, or `localhost`) to persist: it relies on Web Locks
 - Ideal for web applications and browser-based analytics
 - Requires the `web` feature flag
 
 **WebConfig:**
-- `database_name`: Name of the IndexedDB database (use unique names per store)
+- `database_name`: Name of the IndexedDB database (use unique names per store; every tab of a page opens the same one)
 - `max_item_size`: Largest item, in bytes; see [Limits](#limits)
-- `max_items`: Most items held; past it the oldest is dropped, in memory and in IndexedDB
+- `max_items`: Most items one tab holds, its own and those it adopted; past it the oldest is dropped, in memory and in IndexedDB
+- `orphan_interval`: How often the store looks for items left by tabs that are gone, besides once when it opens. `Duration::from_secs(30)` is a good default. Must not be zero
 
 **Persistence States:**
 - `PersistenceState::Persisted` - IndexedDB available, data survives page refresh
-- `PersistenceState::MemoryOnly` - data lost on refresh. The store is in this mode when IndexedDB is unavailable (private browsing, third-party context, storage blocked) or unreadable, when another page holds the database open at an older version, and from the moment another page asks for a newer version of the database or deletes it
+- `PersistenceState::MemoryOnly` - data lost on refresh. The store is in this mode when IndexedDB is unavailable (private browsing, third-party context, storage blocked) or unreadable, when Web Locks are unavailable (not a secure context, or a browser from before 2022), when another page holds the database open at an older version, and from the moment another page asks for a newer version of the database or deletes it. A memory-only store writes nothing and adopts nothing
 
 The store falls back to memory-only mode by itself and logs a warning to the console; it works the same way otherwise. `persistence_state()` and `is_persisted()` tell you which mode it is in now. That can change from `Persisted` to `MemoryOnly` while the store is in use, but never back, so a choice made from it at startup can go stale. A `TransientDB` does not give its store back, so an app that adjusts to the mode as it changes uses the `WebStore` itself (it implements `DataStore`) and checks again before each flush. When in memory-only mode, consider increasing flush frequency to minimize data loss window.
+
+#### Several tabs
+
+Every tab of a page opens the same database. Each `WebStore` instance is a tab of its own: it gets a random tab id when it is created (a reloaded page is a new tab), keeps its records under that id, and fetches, sends and removes only its own items. Live tabs never see each other's items, so nothing is sent twice, and `max_items` is per tab.
+
+Items left behind by a tab that is gone (closed, crashed, discarded by the browser, reloaded) are *orphans*. A live tab adopts them: it moves them under its own id, behind the items it already holds, and sends them as its own. A store adopts once when it opens, before `new` returns (so a reloaded page picks up what it left at once), and then every `orphan_interval` until it is dropped. Adopted items count toward the adopting tab's `max_items`; past it the oldest are dropped and logged. A record that is not an item, or an item larger than `max_item_size`, is discarded and logged when it is adopted. Items from different tabs have no order relative to each other.
+
+Each store holds the [Web Lock](https://developer.mozilla.org/docs/Web/API/Web_Locks_API) `transientdb:{database_name}:tab:{tab id}` for as long as it lives, and the browser releases it when the page goes away. Adopting a tab's items takes its lock first, so a live tab's items are never adopted, and two tabs never adopt the same items. Dropping a store releases its lock, so its items become orphans.
+
+The lock costs some back/forward cache eligibility. Measured in Firefox 160, a page holding a Web Lock is never kept in the back/forward cache. Measured in Chrome 157, it is kept, but evicted as soon as another page of the origin requests its lock, which an adoption pass does only if the cached page has items stored. Safari is not yet measured.
+
+`reset()` clears this tab's items and every record in the database, every tab's, as for a logout or an opt-out. Other live tabs keep what they already hold in memory.
+
+#### Flushing when the page closes
+
+A send started while the page is closing cannot report back, so the store cannot learn whether it succeeded. For the last batch, remove the items *before* sending them:
+
+```rust
+let body = items.json();
+store.remove(items)?; // the IndexedDB delete is issued during this call
+navigator.send_beacon_with_opt_str(url, Some(&body))?;
+```
+
+If the beacon fails, that batch is lost (at most once, the last batch only). If the delete does not commit before the page is gone, the batch is adopted by another tab or the reloaded page and sent again. Do the main flush on `visibilitychange` to `hidden`, while the page is still alive, and keep this for what is left.
 
 #### Database upgrades
 
@@ -349,9 +378,9 @@ What `Io` means for FileStore, operation by operation:
 - `fetch`: nothing is handed out; a later fetch returns the same items.
 - `remove`: every item is tried; those that could not be deleted stay stored and are fetched again.
 
-MemoryStore never returns `InUse` or `Io`: each item takes the next of its `u64` sequence numbers, which at one append per nanosecond last more than 580 years. WebStore never returns `InUse`, and returns `Io`, storing nothing, only once it has used up its sequence numbers: after 2^53 - 1 appends (the most an IndexedDB number key holds exactly), or at once (or within a few appends) if the database holds a record numbered at or near that limit, which only something else writing to the database could put there. Retrying does not help. The next number is set only when the store opens, above every record numbered 1 to 2^53 - 1, and `reset()` clears the database without rewinding it, so this lasts until such a record is gone from the database (`reset()` deletes it) and a store is opened on it again, as on a page reload.
+MemoryStore never returns `InUse` or `Io`: each item takes the next of its `u64` sequence numbers, which at one append per nanosecond last more than 580 years. WebStore never returns `InUse`, and returns `Io`, storing nothing, only once the instance has used up its sequence numbers: after 2^53 - 1 appends and adopted items (the most an IndexedDB number key holds exactly). Each instance numbers its own items from 1, and `reset()` does not rewind them, so retrying does not help; a new instance, as on a page reload, starts again.
 
-Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. FileStore logs each of these, every item a full store drops included. MemoryStore and WebStore drop the oldest item without logging it; WebStore logs what it discards when it opens, and each fallback to memory-only mode.
+Things a store handles itself are not errors: a full store, a FileStore file that does not match, a damaged item, an unavailable IndexedDB. FileStore logs each of these, every item a full store drops included. MemoryStore and WebStore drop the oldest item without logging it; WebStore logs what it discards or drops when it adopts orphaned items, and each fallback to memory-only mode.
 
 ```rust
 use serde_json::Value;
@@ -378,7 +407,7 @@ The library includes an extensive test suite covering:
 - Edge cases, boundaries and error conditions
 - FileStore under a kill at every byte of a write, injected I/O errors, and damaged or mismatched files
 - Performance under load
-- WebStore in headless Chrome and Firefox
+- WebStore in headless Chrome and Firefox, several tabs on one database included: orphans adopted, racing adopters, live tabs left alone, and a reset or a drop in the middle of an adoption
 
 Run the tests using:
 

@@ -129,6 +129,11 @@ pub enum PersistenceState {
 ///
 /// [Web Lock]: https://developer.mozilla.org/docs/Web/API/Web_Locks_API
 ///
+/// The liveness lock affects the back/forward cache. Measured in Firefox 160, a page that
+/// holds a Web Lock is not kept in it at all. Measured in Chrome 157, it is kept, but
+/// evicted as soon as another page of the origin requests its lock, which an adoption
+/// pass does only if the cached page has items stored.
+///
 /// # Flushing when the page closes
 ///
 /// A send started while the page is closing cannot report back, so the store cannot learn

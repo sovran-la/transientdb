@@ -142,3 +142,51 @@ main flush on `visibilitychange` to `hidden`, while the page is still alive.
 - **bfcache.** Some browsers keep pages that hold Web Locks out of the back/forward cache.
   Verify in Chrome, Firefox and Safari what the liveness lock costs a host page's bfcache
   eligibility before shipping.
+
+## Implementation notes
+
+Recorded when the spec was implemented (branch `bsneed/webstore-tabs`).
+
+- **Open points, as implemented.** Adopted items go behind the tab's own items (new
+  seqs). `reset` clears every record in the database, as 0.4.0 did.
+- **Web Locks binding.** `web-sys` 0.3 gates `LockManager` behind
+  `--cfg web_sys_unstable_apis`, which every dependent crate would have to set, so
+  `src/web/lock.rs` binds `navigator.locks.request` directly with `wasm-bindgen`.
+- **Adoption transaction.** One tab's records are read (`getAll` and `getAllKeys` on the
+  `tab` index) and rewritten inside the keys request's success handler, so the
+  transaction never depends on promise microtasks staying inside it. If the transaction
+  aborts, the items it queued are taken back out of memory, so nothing is held twice.
+- **Reset during a pass.** A reset issued after a move's transaction was created, but
+  before its reads return, makes the move adopt nothing; the reset's clear, ordered after
+  it, deletes the records.
+- **Over the cap mid-pass.** Between a move and the trim that ends the pass, the queue can
+  hold more than `max_items`; `Queue::push` therefore reports every item it drops, so an
+  append in that window deletes all of them from IndexedDB.
+- **Records under a non-string tab key** (only another writer could store one) are
+  discarded without a lock: no store's lock guards them, and deleting twice is harmless.
+- **Sequence numbers exhausted while adopting**: the rest of that orphan is left in place
+  for another tab.
+- **Missing `navigator.locks`** warns once per store opened (not once per page).
+
+### bfcache, measured
+
+Pages served from `localhost`, driven by WebDriver (headless): load page A, navigate to
+B, `history.back()`, and record `pageshow.persisted` (and Chrome's `notRestoredReasons`).
+An `unload` listener is the negative control. No web sources could be consulted when this
+was written, so these are measurements only.
+
+| Page A holds                          | Chrome 157       | Firefox 160      |
+|---------------------------------------|------------------|------------------|
+| nothing                               | restored         | restored         |
+| an `unload` listener (control)        | not restored     | not restored     |
+| a Web Lock                            | restored         | **not restored** |
+| an idle IndexedDB connection          | restored         | restored         |
+| a Web Lock and an IndexedDB connection| restored         | **not restored** |
+| a Web Lock that B requests (`ifAvailable`) | **evicted** (`weblocks-contention`); B granted | not restored; B granted |
+
+So in Firefox every page with a persisted `WebStore` loses the back/forward cache. In
+Chrome it keeps it unless another page of the origin requests its lock, which an adoption
+pass does only when the cached page has items stored. Safari was not measured:
+`safaridriver` needs "Allow remote automation" enabled in Safari's Developer settings.
+Releasing the lock on `pagehide` (persisted) and taking it again on `pageshow` would avoid
+the cost, at the price of a cached page's items being adoptable while it sits in the cache.
