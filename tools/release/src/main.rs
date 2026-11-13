@@ -57,9 +57,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		return Err("Failed to build release version".into());
 	}
 
+	// The web example is a crate of its own with its own lockfile, which records this
+	// crate's version. Bring it along, or the example's `--locked` build in CI fails as
+	// soon as the version changes.
+	let example_lock_status = Command::new("cargo")
+		.args([
+			"update",
+			"--manifest-path",
+			"examples/web/Cargo.toml",
+			"--package",
+			"transientdb",
+		])
+		.status()?;
+
+	if !example_lock_status.success() {
+		return Err("Failed to update the web example's lockfile".into());
+	}
+
 	// Git commands for version bump with combined commit
 	let release_commands = [
-		("git add Cargo.toml Cargo.lock", "Failed to stage files"),
+		(
+			"git add Cargo.toml Cargo.lock examples/web/Cargo.lock",
+			"Failed to stage files",
+		),
 		(
 			&format!("git commit -m \"Release version {}\"", new_version),
 			"Failed to commit version bump",
