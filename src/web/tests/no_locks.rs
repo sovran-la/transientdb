@@ -6,10 +6,10 @@ use contract::{append_all, tagged};
 use js_sys::{Object, Reflect};
 
 /// Hides `navigator.locks` behind an own property that is `undefined`, until dropped.
-struct NoLocks(web_sys::Navigator);
+pub(super) struct NoLocks(web_sys::Navigator);
 
 impl NoLocks {
-	fn hide() -> Self {
+	pub(super) fn hide() -> Self {
 		let navigator = web_sys::window().unwrap().navigator();
 		let descriptor = Object::new();
 		Reflect::set(&descriptor, &"value".into(), &JsValue::UNDEFINED).unwrap();
@@ -52,7 +52,8 @@ async fn test_without_web_locks_the_store_is_memory_only() {
 	);
 	// No connection, no lock, no adoption: the orphan is left alone.
 	assert!(store.shared.db.is_none());
-	assert!(store.liveness.is_none() && store.adoption.is_none());
+	assert!(store.shared.liveness.borrow().is_none());
+	assert!(store.adoption.is_none() && store.pageshow.is_none());
 	assert!(!store.has_data());
 	store.adopt_now().await;
 	assert!(!store.has_data());

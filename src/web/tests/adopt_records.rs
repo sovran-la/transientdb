@@ -182,7 +182,7 @@ async fn test_an_aborted_adoption_changes_nothing() {
 	drop(a);
 	// Occupy the key B's second adopted item would get: its add fails, which aborts the
 	// whole transaction, after the first was queued in memory.
-	let blocker = idb::add(&b.db(), b.tab(), 2, "\"blocker\"").unwrap();
+	let blocker = idb::add(&b.db(), &b.tab(), 2, "\"blocker\"").unwrap();
 	idb::completion(&blocker).await.unwrap();
 	warnings();
 	b.adopt_now().await;
@@ -193,7 +193,7 @@ async fn test_an_aborted_adoption_changes_nothing() {
 	assert_eq!(records(&b).await.len(), 5);
 
 	// With the blocker gone, the next pass adopts them all, under fresh numbers.
-	let gone = idb::delete(&b.db(), b.tab(), &[2]).unwrap();
+	let gone = idb::delete(&b.db(), &b.tab(), &[2]).unwrap();
 	idb::completion(&gone).await.unwrap();
 	b.adopt_now().await;
 	assert_eq!(queued(&b), tagged(0..4));

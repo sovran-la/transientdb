@@ -9,6 +9,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 mod adopt_invalid;
 mod adopt_records;
+mod bfcache;
+mod bfcache_listener;
+mod bfcache_races;
 mod capacity;
 mod close_flush;
 mod depth;

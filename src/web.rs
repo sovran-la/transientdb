@@ -38,6 +38,7 @@ mod connect;
 mod idb;
 mod interval;
 mod lock;
+mod pageshow;
 mod store;
 mod tab;
 mod takeover;
@@ -129,10 +130,24 @@ pub enum PersistenceState {
 ///
 /// [Web Lock]: https://developer.mozilla.org/docs/Web/API/Web_Locks_API
 ///
-/// The liveness lock affects the back/forward cache. Measured in Firefox 160, a page that
-/// holds a Web Lock is not kept in it at all. Measured in Chrome 157, it is kept, but
-/// evicted as soon as another page of the origin requests its lock, which an adoption
-/// pass does only if the cached page has items stored.
+/// # Back/forward cache
+///
+/// A page restored from the back/forward cache starts over as a new tab: the store
+/// releases its old lock, takes a new tab id and lock, and resets its queue in memory, so
+/// an `Items` fetched before matches nothing. Until the new lock is granted, appended
+/// items are kept in memory, and written once it is. It then adopts its own earlier items
+/// like any orphan's, unless another tab adopted them while the page was cached, in which
+/// case that tab sends them. A send in flight when the page was cached can therefore be
+/// sent again: delivery is at least once.
+///
+/// How browsers treat the liveness lock, as measured:
+///
+/// - Firefox does not cache a page holding a Web Lock, so a page with a persisted
+///   `WebStore` misses Firefox's back/forward cache.
+/// - Chrome caches it with its lock held, and may evict it when another tab requests the
+///   lock to adopt its items.
+/// - Safari caches it but releases its locks, so another tab may adopt its items while it
+///   is cached. Starting over is what keeps the restored page from sending them too.
 ///
 /// # Flushing when the page closes
 ///
@@ -196,19 +211,24 @@ pub enum PersistenceState {
 /// mode to be common.
 pub struct WebStore {
 	shared: Rc<Shared>,
-	/// This store's liveness lock, held until the store is dropped. `None` in memory-only
-	/// mode.
-	liveness: Option<lock::Held>,
 	/// The timer that runs an adoption pass every `orphan_interval`. `None` in memory-only
 	/// mode.
 	adoption: Option<interval::Interval>,
+	/// The `pageshow` listener that starts the store over as a new tab when the page is
+	/// restored from the back/forward cache. `None` in memory-only mode.
+	pageshow: Option<pageshow::Listener>,
 }
 
-/// What the store and its adoption passes share.
+/// What the store, its adoption passes and its `pageshow` listener share.
 struct Shared {
 	config: WebConfig,
-	/// This store's tab id, under which its records are kept.
-	tab: String,
+	/// This store's tab id, under which its records are kept. Changed only when the page
+	/// is restored from the back/forward cache; see [`pageshow`].
+	tab: RefCell<String>,
+	/// The liveness lock of `tab`, while it is held. Nothing is written under `tab`
+	/// without it: `None` in memory-only mode, and from a restore from the back/forward
+	/// cache until the new tab's lock is granted.
+	liveness: RefCell<Option<lock::Held>>,
 	/// The source of truth for sync operations. Never borrowed across an `await`.
 	queue: RefCell<Queue>,
 	/// IndexedDB database handle (None if unavailable/blocked)
@@ -219,9 +239,9 @@ struct Shared {
 	passing: Cell<bool>,
 	/// Set once the store is dropped, so that a pass still running stops.
 	dropped: Cell<bool>,
-	/// How many times the store has been reset: an adoption that began before a reset
-	/// adopts nothing, as the reset clears what it would.
-	resets: Cell<u64>,
+	/// How many times the store has been reset or started over as a new tab: an adoption
+	/// that began before either adopts nothing, as the queue it would adopt into is gone.
+	generation: Cell<u64>,
 	/// How many adoption passes have started, for tests.
 	#[cfg(test)]
 	passes: Cell<usize>,

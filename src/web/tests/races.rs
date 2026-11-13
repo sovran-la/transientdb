@@ -4,50 +4,6 @@
 
 use super::*;
 use contract::{append_all, tagged};
-use std::cell::Cell;
-use std::rc::Rc;
-
-/// `count` dead tabs on `db_name`, holding `per_tab` items each, all tagged by tab.
-async fn orphans(db_name: &str, count: usize, per_tab: usize) -> Vec<Value> {
-	let mut all = Vec::new();
-	let mut stores = Vec::new();
-	for t in 0..count {
-		let mut store = WebStore::new(config(db_name, 4096, 1 << 20)).await;
-		let items: Vec<Value> = (0..per_tab).map(|i| json!({"t": t, "i": i})).collect();
-		append_all(&mut store, &items);
-		all.extend(items);
-		stores.push(store);
-	}
-	all
-}
-
-/// Starts a pass of `store`'s in the background; the flag is set once it has finished.
-fn spawn_pass(store: &WebStore) -> Rc<Cell<bool>> {
-	let done = Rc::new(Cell::new(false));
-	let (shared, finished) = (store.shared.clone(), done.clone());
-	wasm_bindgen_futures::spawn_local(async move {
-		adopt::pass(&shared).await;
-		finished.set(true);
-	});
-	done
-}
-
-/// Waits, a few milliseconds at a time, until every flag is set.
-async fn until_all(flags: &[Rc<Cell<bool>>]) {
-	for _ in 0..1000 {
-		if flags.iter().all(|f| f.get()) {
-			return;
-		}
-		gloo_timers::future::TimeoutFuture::new(5).await;
-	}
-	panic!("a pass did not finish");
-}
-
-fn sorted(mut values: Vec<Value>) -> Vec<String> {
-	let mut texts: Vec<String> = values.drain(..).map(|v| v.to_string()).collect();
-	texts.sort();
-	texts
-}
 
 #[wasm_bindgen_test]
 async fn test_racing_adopters_each_get_an_orphan_exactly_once() {

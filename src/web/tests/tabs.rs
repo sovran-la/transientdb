@@ -160,7 +160,7 @@ async fn test_a_store_holds_its_lock_from_open_until_dropped() {
 	let Some(store) = persisted(db_name, 4096, 1000).await else {
 		return;
 	};
-	let name = lock::name(db_name, store.tab());
+	let name = lock::name(db_name, &store.tab());
 	assert!(lock::acquire(&name, true).await.unwrap().is_none());
 	drop(store);
 	for _ in 0..100 {

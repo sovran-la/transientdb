@@ -1,7 +1,8 @@
 //! Helpers shared by the WebStore tests.
 
 use super::*;
-use std::cell::Ref;
+use std::cell::{Cell, Ref};
+use std::rc::Rc;
 use std::time::Duration;
 
 /// Long enough that no interval pass runs during a test that does not ask for one.
@@ -53,8 +54,8 @@ impl WebStore {
 		self.shared.db.clone().unwrap()
 	}
 
-	pub(super) fn tab(&self) -> &str {
-		&self.shared.tab
+	pub(super) fn tab(&self) -> String {
+		self.shared.tab.borrow().clone()
 	}
 
 	/// Runs an adoption pass now, as the interval would.
@@ -132,4 +133,98 @@ pub(super) fn available(store: &mut WebStore) -> Vec<Value> {
 /// Takes every warning logged so far.
 pub(super) fn warnings() -> Vec<String> {
 	WARNINGS.take()
+}
+
+/// `count` dead tabs on `db_name`, holding `per_tab` items each, all tagged by tab.
+pub(super) async fn orphans(db_name: &str, count: usize, per_tab: usize) -> Vec<Value> {
+	let mut all = Vec::new();
+	let mut stores = Vec::new();
+	for t in 0..count {
+		let mut store = WebStore::new(config(db_name, 4096, 1 << 20)).await;
+		let items: Vec<Value> = (0..per_tab).map(|i| json!({"t": t, "i": i})).collect();
+		contract::append_all(&mut store, &items);
+		all.extend(items);
+		stores.push(store);
+	}
+	all
+}
+
+/// Starts a pass of `store`'s in the background; the flag is set once it has finished.
+pub(super) fn spawn_pass(store: &WebStore) -> Rc<Cell<bool>> {
+	let done = Rc::new(Cell::new(false));
+	let (shared, finished) = (store.shared.clone(), done.clone());
+	wasm_bindgen_futures::spawn_local(async move {
+		adopt::pass(&shared).await;
+		finished.set(true);
+	});
+	done
+}
+
+/// Waits, a few milliseconds at a time, until every flag is set.
+pub(super) async fn until_all(flags: &[Rc<Cell<bool>>]) {
+	for _ in 0..1000 {
+		if flags.iter().all(|f| f.get()) {
+			return;
+		}
+		gloo_timers::future::TimeoutFuture::new(5).await;
+	}
+	panic!("a pass did not finish");
+}
+
+pub(super) fn sorted(mut values: Vec<Value>) -> Vec<String> {
+	let mut texts: Vec<String> = values.drain(..).map(|v| v.to_string()).collect();
+	texts.sort();
+	texts
+}
+
+/// Dispatches `pageshow` on the window: `persisted`, as when the page is restored from the
+/// back/forward cache.
+pub(super) fn pageshow(persisted: bool) {
+	let init = web_sys::PageTransitionEventInit::new();
+	init.set_persisted(persisted);
+	let event = web_sys::PageTransitionEvent::new_with_event_init_dict("pageshow", &init).unwrap();
+	web_sys::window().unwrap().dispatch_event(&event).unwrap();
+}
+
+/// How many `pageshow` events stores' listeners have seen so far.
+pub(super) fn pageshows() -> usize {
+	pageshow::PAGESHOWS.get()
+}
+
+/// Waits, a few milliseconds at a time, until `store` holds its tab's lock and runs no
+/// adoption pass: it has finished starting over.
+pub(super) async fn started_over(store: &WebStore) {
+	for _ in 0..1000 {
+		if store.shared.liveness.borrow().is_some() && !store.shared.passing.get() {
+			return;
+		}
+		gloo_timers::future::TimeoutFuture::new(5).await;
+	}
+	panic!("the store did not finish starting over");
+}
+
+/// Whether the liveness lock of tab `tab` on `db_name` is held, by anyone. Asking takes
+/// it for a moment if it is free.
+pub(super) async fn lock_held(db_name: &str, tab: &str) -> bool {
+	let name = lock::name(db_name, tab);
+	lock::acquire(&name, true).await.unwrap().is_none()
+}
+
+/// Waits until the liveness lock of tab `tab` on `db_name` is free, failing if it never is.
+pub(super) async fn until_free(db_name: &str, tab: &str) {
+	for _ in 0..200 {
+		if !lock_held(db_name, tab).await {
+			return;
+		}
+		gloo_timers::future::TimeoutFuture::new(5).await;
+	}
+	panic!("the lock of tab {tab} is still held");
+}
+
+/// The values of the records `store`'s database holds under tab `tab`, in key order.
+pub(super) async fn values_under(store: &WebStore, tab: &str) -> Vec<Value> {
+	let records = records(store).await;
+	let mine = records.iter().filter(|r| r["tab"] == tab);
+	mine.map(|r| serde_json::from_str(r["text"].as_str().unwrap()).unwrap())
+		.collect()
 }

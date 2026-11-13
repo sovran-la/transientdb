@@ -6,7 +6,18 @@ use wasm_bindgen::{JsCast, JsValue};
 /// A new tab id: `crypto.randomUUID()`, or, where that is missing (an older browser),
 /// 16 random bytes as hex.
 pub(super) fn new_id() -> String {
+	#[cfg(test)]
+	if let Some(id) = NEXT_ID.take() {
+		return id;
+	}
 	random_uuid().unwrap_or_else(random_hex)
+}
+
+#[cfg(test)]
+thread_local! {
+	/// The id the next call to [`new_id`] returns, if set, for tests.
+	pub(super) static NEXT_ID: std::cell::RefCell<Option<String>> =
+		const { std::cell::RefCell::new(None) };
 }
 
 fn random_uuid() -> Option<String> {

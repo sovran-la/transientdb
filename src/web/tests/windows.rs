@@ -13,7 +13,7 @@ use std::rc::Rc;
 async fn orphan(db_name: &str, items: &[Value]) -> JsValue {
 	let mut store = WebStore::new(config(db_name, 4096, 1 << 20)).await;
 	append_all(&mut store, items);
-	JsValue::from_str(store.tab())
+	JsValue::from_str(&store.tab())
 }
 
 /// Starts `store` taking over `tab`'s records, and returns once the move's transaction

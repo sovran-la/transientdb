@@ -60,6 +60,15 @@ impl Drop for Held {
 	}
 }
 
+#[cfg(test)]
+impl Held {
+	/// Releases the lock while this still claims to hold it, as Safari does to a page it
+	/// puts in the back/forward cache. Dropping this afterwards changes nothing.
+	pub(super) fn lose(&self) {
+		let _ = self.release.call0(&JsValue::UNDEFINED);
+	}
+}
+
 /// What a request comes to: the lock, `None` if it was asked for only if available and is
 /// held elsewhere, or why the request failed.
 type Grant = std::result::Result<Option<Held>, String>;

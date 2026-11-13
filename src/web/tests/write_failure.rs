@@ -20,7 +20,7 @@ async fn test_failed_write_leaves_memory_and_other_records_intact() {
 	let blocker = json!("already stored under this key");
 	let db = store.db();
 	let next_seq = store.queue().next_seq;
-	let occupied = idb::add(&db, store.tab(), next_seq, &blocker.to_string()).unwrap();
+	let occupied = idb::add(&db, &store.tab(), next_seq, &blocker.to_string()).unwrap();
 	idb::completion(&occupied).await.unwrap();
 
 	let failed = json!({"i": "fails to persist"});

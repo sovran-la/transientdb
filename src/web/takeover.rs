@@ -62,7 +62,9 @@ pub(super) struct Taken {
 /// a record that is not a valid item, the record is discarded, with a warning.
 ///
 /// If the store is reset before the records are read, nothing is adopted: the reset's
-/// clear, ordered after this transaction, deletes them.
+/// clear, ordered after this transaction, deletes them. If the store starts over as a new
+/// tab before then, nothing is adopted either, and the records are left as they are, for
+/// the new tab's pass to adopt.
 ///
 /// The caller must hold `tab`'s liveness lock to adopt. If the transaction aborts,
 /// nothing changed in IndexedDB, and the items it had queued are taken out of memory
@@ -89,14 +91,14 @@ pub(super) async fn take_over(
 		.map_err(|e| js_error("GetAllKeys error", e))?;
 
 	let taken = Rc::new(RefCell::new(Taken::default()));
-	let resets = shared.resets.get();
+	let generation = shared.generation.get();
 	// The keys' request succeeds after the values' one, issued before it. Everything is
 	// done in its handler, while the transaction is active.
 	let on_keys = Closure::<dyn FnMut(web_sys::Event)>::new({
 		let (shared, taken, transaction) = (shared.clone(), taken.clone(), transaction.clone());
 		let keys_request = keys.clone();
 		move |_event: web_sys::Event| {
-			if shared.resets.get() != resets {
+			if shared.generation.get() != generation {
 				return;
 			}
 			let read = result_of::<Array>(&values).and_then(|values| {
@@ -114,6 +116,10 @@ pub(super) async fn take_over(
 		}
 	});
 	keys.set_onsuccess(Some(on_keys.as_ref().unchecked_ref()));
+	#[cfg(test)]
+	if let Some(hook) = BETWEEN_READS.take() {
+		hook();
+	}
 	let outcome = idb::completion(&transaction).await;
 	drop(on_keys);
 	let taken = taken.take();
@@ -175,8 +181,15 @@ fn rewrite(
 			.delete(&key)
 			.map_err(|e| js_error("Delete error", e))?;
 		store
-			.add(&idb::to_js(&idb::record(&shared.tab, seq, &text))?)
+			.add(&idb::to_js(&idb::record(&shared.tab.borrow(), seq, &text))?)
 			.map_err(|e| js_error("Add error", e))?;
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Called once, if set, by the next move, after it has issued its reads and before
+	/// their results come back, for tests.
+	pub(super) static BETWEEN_READS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }

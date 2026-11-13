@@ -1,7 +1,8 @@
 //! Opening a `WebStore`, and its `DataStore` operations.
 
 use super::{
-	adopt, connect, idb, interval, lock, tab, warn, PersistenceState, Shared, WebConfig, WebStore,
+	adopt, connect, idb, interval, lock, pageshow, tab, warn, PersistenceState, Shared, WebConfig,
+	WebStore,
 };
 use crate::queue::Queue;
 use crate::{serialize, DataStore, Items, Result};
@@ -15,12 +16,13 @@ impl Shared {
 		Self {
 			queue: RefCell::new(Queue::new(config.max_items, idb::MAX_SEQ)),
 			config,
-			tab: tab::new_id(),
+			tab: RefCell::new(tab::new_id()),
+			liveness: RefCell::new(None),
 			db,
 			closed,
 			passing: Cell::new(false),
 			dropped: Cell::new(false),
-			resets: Cell::new(0),
+			generation: Cell::new(0),
 			#[cfg(test)]
 			passes: Cell::new(0),
 		}
@@ -31,18 +33,49 @@ impl Shared {
 		self.db.as_ref().filter(|_| !self.closed.get())
 	}
 
-	/// Whether an adoption pass should go on: the store is still in use, and persisted.
+	/// The connection to write this tab's records with: [`live_db`](Self::live_db), while
+	/// the tab's liveness lock is held.
+	pub(super) fn tab_db(&self) -> Option<&IdbDatabase> {
+		self.live_db().filter(|_| self.liveness.borrow().is_some())
+	}
+
+	/// Whether an adoption pass should go on: the store is still in use, persisted, and
+	/// holds its tab's liveness lock.
 	pub(super) fn active(&self) -> bool {
-		!self.dropped.get() && self.live_db().is_some()
+		!self.dropped.get() && self.tab_db().is_some()
+	}
+
+	/// Fire-and-forget write of the item `text` under this tab's `seq` to IndexedDB.
+	pub(super) fn write_to_idb(&self, seq: u64, text: &str) {
+		let Some(db) = self.tab_db() else { return };
+		idb::fire_and_forget("write", idb::add(db, &self.tab.borrow(), seq, text));
 	}
 
 	/// Fire-and-forget delete of this tab's `seqs` from IndexedDB.
 	pub(super) fn delete_from_idb(&self, seqs: &[u64]) {
-		let Some(db) = self.live_db() else { return };
+		let Some(db) = self.tab_db() else { return };
 		if seqs.is_empty() {
 			return;
 		}
-		idb::fire_and_forget("delete", idb::delete(db, &self.tab, seqs));
+		idb::fire_and_forget("delete", idb::delete(db, &self.tab.borrow(), seqs));
+	}
+
+	/// Waits for the liveness lock of the tab `tab`, and holds it: `true`. `false`, the lock
+	/// released at once, if the store has been dropped or started over as another tab
+	/// meanwhile. Returns why if the lock is not granted.
+	pub(super) async fn hold_liveness(&self, tab: &str) -> std::result::Result<bool, String> {
+		let name = lock::name(&self.config.database_name, tab);
+		match lock::acquire(&name, false).await {
+			Ok(Some(held)) => {
+				let current = !self.dropped.get() && *self.tab.borrow() == tab;
+				if current {
+					*self.liveness.borrow_mut() = Some(held);
+				}
+				Ok(current)
+			}
+			Ok(None) => Err("Web Lock not granted".into()),
+			Err(e) => Err(format!("Web Lock request failed ({e})")),
+		}
 	}
 }
 
@@ -51,8 +84,9 @@ impl WebStore {
 	///
 	/// This opens (or creates) the IndexedDB database, takes this store's liveness lock,
 	/// and adopts the items of every tab that no longer exists (see "Several tabs" on
-	/// [`WebStore`]); it then adopts again every `orphan_interval` until it is dropped. A
-	/// new store owns nothing of its own.
+	/// [`WebStore`]); it then adopts again every `orphan_interval` until it is dropped, and
+	/// starts over as a new tab if the page is restored from the back/forward cache (see
+	/// "Back/forward cache" on [`WebStore`]). A new store owns nothing of its own.
 	///
 	/// An adopted item's text is not parsed again: it was checked when it was appended. A
 	/// stored record that is not an item (without a usable sequence number and a non-empty
@@ -81,11 +115,8 @@ impl WebStore {
 		}
 
 		let memory_only = |config: WebConfig, why: String| {
-			warn(&format!(
-				"{why}, falling back to memory-only storage. Events will not persist across \
-				 page refreshes. Consider increasing flush frequency."
-			));
-			Self::from_parts(Shared::new(config, None, Rc::new(Cell::new(false))), None)
+			warn_memory_only(&why);
+			Self::from_parts(Shared::new(config, None, Rc::new(Cell::new(false))))
 		};
 		if !lock::available() {
 			// Without liveness locks, nothing written could ever be safely adopted.
@@ -100,33 +131,29 @@ impl WebStore {
 		let shared = Shared::new(config, Some(db), closed);
 		// Held before anything is written under this tab, so its records never exist
 		// without it.
-		let name = lock::name(&shared.config.database_name, &shared.tab);
-		let liveness = match lock::acquire(&name, false).await {
-			Ok(Some(held)) => held,
-			outcome => {
-				if let Some(db) = &shared.db {
-					db.close();
-				}
-				let why = match outcome {
-					Err(e) => format!("Web Lock request failed ({e})"),
-					_ => "Web Lock not granted".into(),
-				};
-				return memory_only(shared.config, why);
+		let tab = shared.tab.borrow().clone();
+		if let Err(why) = shared.hold_liveness(&tab).await {
+			if let Some(db) = &shared.db {
+				db.close();
 			}
-		};
+			return memory_only(shared.config, why);
+		}
 
-		let mut store = Self::from_parts(shared, Some(liveness));
+		let mut store = Self::from_parts(shared);
+		// Before the first pass, so that a restore from the back/forward cache during it is
+		// not missed.
+		store.pageshow = pageshow::Listener::start(Rc::downgrade(&store.shared));
 		adopt::pass(&store.shared).await;
 		let every = store.shared.config.orphan_interval;
 		store.adoption = interval::Interval::start(Rc::downgrade(&store.shared), every);
 		store
 	}
 
-	fn from_parts(shared: Shared, liveness: Option<lock::Held>) -> Self {
+	fn from_parts(shared: Shared) -> Self {
 		Self {
 			shared: Rc::new(shared),
-			liveness,
 			adoption: None,
+			pageshow: None,
 		}
 	}
 
@@ -162,13 +189,14 @@ impl WebStore {
 }
 
 impl Drop for WebStore {
-	/// Stops adopting, then releases the liveness lock: from then on this store's records
-	/// are orphans, for another store to adopt. Writes already issued are ordered before
-	/// any adopter's read of them.
+	/// Stops adopting and listening for `pageshow`, then releases the liveness lock: from
+	/// then on this store's records are orphans, for another store to adopt. Writes
+	/// already issued are ordered before any adopter's read of them.
 	fn drop(&mut self) {
 		self.shared.dropped.set(true);
 		drop(self.adoption.take());
-		drop(self.liveness.take());
+		drop(self.pageshow.take());
+		drop(self.shared.liveness.take());
 	}
 }
 
@@ -188,9 +216,7 @@ impl DataStore for WebStore {
 		let shared = &self.shared;
 		let text = serialize::item_text(data, shared.config.max_item_size)?;
 		let (seq, dropped) = shared.queue.borrow_mut().push(text.clone())?;
-		if let Some(db) = shared.live_db() {
-			idb::fire_and_forget("write", idb::add(db, &shared.tab, seq, &text));
-		}
+		shared.write_to_idb(seq, &text);
 		shared.delete_from_idb(&dropped);
 		Ok(())
 	}
@@ -217,7 +243,7 @@ impl DataStore for WebStore {
 	/// items they already hold in memory, but those are no longer stored, so they are
 	/// lost if that tab goes away before sending them.
 	fn reset(&mut self) {
-		self.shared.resets.set(self.shared.resets.get() + 1);
+		self.shared.generation.set(self.shared.generation.get() + 1);
 		self.shared.queue.borrow_mut().reset();
 		if let Some(db) = self.shared.live_db() {
 			idb::fire_and_forget("clear", idb::clear(db));
@@ -227,4 +253,12 @@ impl DataStore for WebStore {
 	fn has_data(&self) -> bool {
 		self.shared.queue.borrow().has_data()
 	}
+}
+
+/// Logs that the store is in memory-only mode from now on, and why.
+pub(super) fn warn_memory_only(why: &str) {
+	warn(&format!(
+		"{why}, falling back to memory-only storage. Events will not persist across page \
+		 refreshes. Consider increasing flush frequency."
+	));
 }

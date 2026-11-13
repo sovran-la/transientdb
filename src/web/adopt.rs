@@ -10,6 +10,11 @@
 //!
 //! A pass never holds a borrow of the queue across an `await`, so the store's sync calls
 //! run normally between its steps, and it never runs alongside another pass.
+//!
+//! A reset, or the store starting over as a new tab (see [`pageshow`](super::pageshow)),
+//! ends the pass: what it would adopt into is gone. If the store started over, the pass
+//! begins again, as the new tab's, once that tab's lock is held; the pass the new tab
+//! starts itself does nothing while this one runs.
 
 use super::takeover::{distinct_tabs, take_over};
 use super::{lock, warn, Shared};
@@ -25,7 +30,7 @@ impl Drop for Passing<'_> {
 }
 
 /// Runs one adoption pass, unless one is running already. Logs what goes wrong, and
-/// stops early once the store is dropped or its connection closed.
+/// stops early once the store is dropped, its connection closed, or it is reset.
 pub(super) async fn pass(shared: &Rc<Shared>) {
 	if shared.passing.replace(true) {
 		return;
@@ -33,7 +38,23 @@ pub(super) async fn pass(shared: &Rc<Shared>) {
 	let _passing = Passing(shared);
 	#[cfg(test)]
 	shared.passes.set(shared.passes.get() + 1);
-	let Some(db) = shared.live_db().cloned().filter(|_| shared.active()) else {
+	loop {
+		let tab = shared.tab.borrow().clone();
+		pass_once(shared, &tab).await;
+		// Started over as a new tab meanwhile: adopt for that one. Unless its lock is
+		// not held yet, in which case it adopts once it is.
+		if *shared.tab.borrow() == tab || !shared.active() {
+			return;
+		}
+	}
+}
+
+/// One pass for the tab `own`: stops early once the store is no longer
+/// [`active`](Shared::active), or reset or started over since the pass began.
+async fn pass_once(shared: &Rc<Shared>, own: &str) {
+	let generation = shared.generation.get();
+	let current = || shared.active() && shared.generation.get() == generation;
+	let Some(db) = shared.live_db().cloned().filter(|_| current()) else {
 		return;
 	};
 	let tabs = match distinct_tabs(&db).await {
@@ -44,7 +65,7 @@ pub(super) async fn pass(shared: &Rc<Shared>) {
 		}
 	};
 	for tab in tabs {
-		if !shared.active() {
+		if !current() {
 			return;
 		}
 		let Some(id) = tab.as_string() else {
@@ -57,7 +78,7 @@ pub(super) async fn pass(shared: &Rc<Shared>) {
 			}
 			continue;
 		};
-		if id == shared.tab {
+		if id == own {
 			continue;
 		}
 		let name = lock::name(&shared.config.database_name, &id);
@@ -69,7 +90,7 @@ pub(super) async fn pass(shared: &Rc<Shared>) {
 				continue;
 			}
 		};
-		if !shared.active() {
+		if !current() {
 			return;
 		}
 		if let Err(e) = take_over(shared, &db, &tab, true).await {
@@ -78,7 +99,9 @@ pub(super) async fn pass(shared: &Rc<Shared>) {
 		// Released only now that the move has committed, or aborted.
 		drop(held);
 	}
-	trim(shared);
+	if current() {
+		trim(shared);
+	}
 }
 
 /// Drops the oldest items until the store holds at most `max_items`, deleting them from
