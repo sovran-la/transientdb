@@ -141,7 +141,8 @@ main flush on `visibilitychange` to `hidden`, while the page is still alive.
 - **`reset` scope.** All tabs' records (as above) or this tab's only.
 - **bfcache.** Some browsers keep pages that hold Web Locks out of the back/forward cache.
   Verify in Chrome, Firefox and Safari what the liveness lock costs a host page's bfcache
-  eligibility before shipping.
+  eligibility before shipping. (Measured, and handled: see "bfcache, measured" and
+  "bfcache restore, as implemented" below.)
 
 ## Implementation notes
 
@@ -186,7 +187,48 @@ was written, so these are measurements only.
 
 So in Firefox every page with a persisted `WebStore` loses the back/forward cache. In
 Chrome it keeps it unless another page of the origin requests its lock, which an adoption
-pass does only when the cached page has items stored. Safari was not measured:
-`safaridriver` needs "Allow remote automation" enabled in Safari's Developer settings.
-Releasing the lock on `pagehide` (persisted) and taking it again on `pageshow` would avoid
-the cost, at the price of a cached page's items being adoptable while it sits in the cache.
+pass does only when the cached page has items stored.
+
+Safari 26.2, measured 2026-11-13 the same way (WebDriver, `localhost`): it caches a page
+that holds a Web Lock, but **releases the page's locks when it enters the cache**. Another
+page's `ifAvailable` request for the lock is granted while the page is cached, and after
+the restore the lock is still gone (`navigator.locks.query()` shows nothing held), though
+the promise the page's lock callback returned never resolved. Nothing tells the page.
+iOS browsers are all WebKit, so presumably the same. With the store as first implemented,
+a restored page went on writing under its old tab id without its lock, while other tabs
+adopted those records and the page also sent them: ongoing duplicates.
+
+Chrome 157, for comparison: a cached page keeps its lock; a contending `ifAvailable`
+request is denied and the cached page evicted, and a restored page still holds its lock.
+Firefox 160 never caches a page holding a Web Lock (`pagehide` with `persisted` false).
+
+### bfcache restore, as implemented
+
+Agreed with Brandon 2026-11-13: a page restored from the back/forward cache starts over
+as a new tab, through the same steps as `new`. Nothing is done on `pagehide`.
+
+- A store opened persisted listens for `pageshow` on the window and stops on drop; a
+  memory-only store does not listen. On `pageshow` with `persisted` true
+  (`src/web/pageshow.rs`): it releases its old liveness lock if it still holds it (Chrome
+  keeps it; in Safari releasing it again is harmless), takes a new tab id and requests its
+  lock, and resets its queue in memory only (the `Items` epoch, as `reset` does, without
+  clearing IndexedDB). Once the new lock is granted, it writes what was appended meanwhile
+  under the new tab and runs an adoption pass, which adopts its own old records unless
+  another tab took them while it was cached.
+- Nothing is written under a tab id whose lock the store does not hold:
+  `Shared::liveness` is `None` from the restore until the grant, and appends, deletes and
+  adoption passes write only while it is `Some`. A grant that arrives after the store was
+  dropped, or after it started over again, is released at once.
+- `Shared::generation` (formerly `resets`) counts resets and restores. A move whose reads
+  return in a later generation adopts nothing, and a pass stops once the generation
+  changes. A pass interrupted by a restore starts again for the new tab, once its lock is
+  held; the new tab's own pass does nothing while it runs.
+- A store whose connection has closed (another page's upgrade) ignores a restore: it
+  holds its items in memory only, and starting over would lose them.
+- If the new lock's request fails, the store closes its connection and goes memory-only,
+  with a warning, as `new` would.
+- Items appended between the restore and the grant queue ahead of the page's re-adopted
+  old items: adopted items go behind, as always.
+- Tests drive the listener with synthetic `PageTransitionEvent`s in Chrome and Firefox,
+  and simulate Safari by releasing a store's lock behind its back (`Held::lose`). Safari
+  itself is verified separately.
