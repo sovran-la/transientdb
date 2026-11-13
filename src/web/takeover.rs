@@ -3,6 +3,7 @@
 
 use super::idb::{self, js_error, result_of};
 use super::{warn, Shared};
+use crate::queue::Stored;
 use js_sys::Array;
 use std::cell::RefCell;
 use std::io::{Error, Result};
@@ -56,19 +57,32 @@ pub(super) struct Taken {
 	pub(super) discarded: usize,
 }
 
+/// What a move's handler did: the items it re-keyed, held aside until its transaction
+/// commits, and how many records it discarded.
+#[derive(Default)]
+struct Moved {
+	items: Vec<Stored>,
+	discarded: usize,
+}
+
 /// In one read/write transaction, reads every record under the tab key `tab` in `seq`
 /// order and deletes it. With `adopt`, each valid item is added back under this store's
-/// tab with a new sequence number and queued in memory, in that order; without it, or for
-/// a record that is not a valid item, the record is discarded, with a warning.
+/// tab with a new sequence number; without it, or for a record that is not a valid item,
+/// the record is discarded, with a warning.
 ///
-/// If the store is reset before the records are read, nothing is adopted: the reset's
+/// The adopted items are queued in memory, in sequence order (ahead of anything appended
+/// since their numbers were given out), only once the transaction has committed. Until
+/// then nothing can fetch, remove or drop them. If it aborts, nothing changed in
+/// IndexedDB and nothing was queued: the numbers they got are skipped, and the records
+/// are still `tab`'s.
+///
+/// If the store is reset before the transaction commits, nothing is adopted: the reset's
 /// clear, ordered after this transaction, deletes them. If the store starts over as a new
-/// tab before then, nothing is adopted either, and the records are left as they are, for
-/// the new tab's pass to adopt.
+/// tab before the records are read, nothing is adopted either, and the records are left as
+/// they are, for the new tab's pass to adopt; if it does so after they are read, they are
+/// moved under the old tab, an orphan from then on, and not queued.
 ///
-/// The caller must hold `tab`'s liveness lock to adopt. If the transaction aborts,
-/// nothing changed in IndexedDB, and the items it had queued are taken out of memory
-/// again (an `Items` already holding one matches nothing for it).
+/// The caller must hold `tab`'s liveness lock to adopt.
 ///
 /// If this store runs out of sequence numbers, the records not yet adopted are left as
 /// they are, for another tab.
@@ -90,12 +104,12 @@ pub(super) async fn take_over(
 		.get_all_keys_with_key(&range)
 		.map_err(|e| js_error("GetAllKeys error", e))?;
 
-	let taken = Rc::new(RefCell::new(Taken::default()));
+	let moved = Rc::new(RefCell::new(Moved::default()));
 	let generation = shared.generation.get();
 	// The keys' request succeeds after the values' one, issued before it. Everything is
 	// done in its handler, while the transaction is active.
 	let on_keys = Closure::<dyn FnMut(web_sys::Event)>::new({
-		let (shared, taken, transaction) = (shared.clone(), taken.clone(), transaction.clone());
+		let (shared, moved, transaction) = (shared.clone(), moved.clone(), transaction.clone());
 		let keys_request = keys.clone();
 		move |_event: web_sys::Event| {
 			if shared.generation.get() != generation {
@@ -105,13 +119,16 @@ pub(super) async fn take_over(
 				let keys = result_of::<Array>(&keys_request)?;
 				Ok((values, keys))
 			});
-			let moved = read.and_then(|(values, keys)| {
-				let mut taken = taken.borrow_mut();
-				rewrite(&shared, &store, &values, &keys, adopt, &mut taken)
+			let rewritten = read.and_then(|(values, keys)| {
+				let mut moved = moved.borrow_mut();
+				rewrite(&shared, &store, &values, &keys, adopt, &mut moved)
 			});
-			if let Err(e) = moved {
-				warn(&format!("Adopting orphaned items failed: {e}"));
-				let _ = transaction.abort();
+			match rewritten {
+				Ok(()) => before_commit(&transaction),
+				Err(e) => {
+					warn(&format!("Adopting orphaned items failed: {e}"));
+					let _ = transaction.abort();
+				}
 			}
 		}
 	});
@@ -122,23 +139,31 @@ pub(super) async fn take_over(
 	}
 	let outcome = idb::completion(&transaction).await;
 	drop(on_keys);
-	let taken = taken.take();
-	if let Err(e) = outcome {
-		shared.queue.borrow_mut().discard(&taken.adopted);
-		return Err(e);
+	// Aborted: the items were never queued, so nothing was handed out.
+	outcome?;
+	let Moved { items, discarded } = moved.take();
+	let mut taken = Taken {
+		adopted: Vec::new(),
+		discarded,
+	};
+	// Reset or started over since: the queue they were for is gone.
+	if shared.generation.get() == generation {
+		taken.adopted = items.iter().map(|item| item.seq).collect();
+		shared.queue.borrow_mut().insert(items);
 	}
 	Ok(taken)
 }
 
 /// Deletes each of a tab's records, read as `values` under `keys`, and adds each valid
-/// item back under this store's tab with the next sequence number of its queue.
+/// item back under this store's tab with a sequence number reserved from its queue,
+/// keeping it in `moved` for the queue.
 fn rewrite(
 	shared: &Shared,
 	store: &IdbObjectStore,
 	values: &Array,
 	keys: &Array,
 	adopt: bool,
-	taken: &mut Taken,
+	moved: &mut Moved,
 ) -> Result<()> {
 	if values.length() != keys.length() {
 		return Err(Error::other("records and keys do not match"));
@@ -155,7 +180,7 @@ fn rewrite(
 			store
 				.delete(&key)
 				.map_err(|e| js_error("Delete error", e))?;
-			taken.discarded += 1;
+			moved.discarded += 1;
 			continue;
 		};
 		if text.len() > max {
@@ -166,30 +191,49 @@ fn rewrite(
 			store
 				.delete(&key)
 				.map_err(|e| js_error("Delete error", e))?;
-			taken.discarded += 1;
+			moved.discarded += 1;
 			continue;
 		}
-		let seq = match shared.queue.borrow_mut().adopt(text.clone()) {
+		let seq = match shared.queue.borrow_mut().reserve() {
 			Ok(seq) => seq,
 			Err(_) => {
 				warn("Sequence numbers exhausted: leaving the remaining orphaned items for another tab");
 				return Ok(());
 			}
 		};
-		taken.adopted.push(seq);
 		store
 			.delete(&key)
 			.map_err(|e| js_error("Delete error", e))?;
 		store
 			.add(&idb::to_js(&idb::record(&shared.tab.borrow(), seq, &text))?)
 			.map_err(|e| js_error("Add error", e))?;
+		moved.items.push(Stored { seq, text });
 	}
 	Ok(())
 }
+
+/// Runs the [`BEFORE_COMMIT`] hook, in tests.
+#[cfg(test)]
+fn before_commit(transaction: &web_sys::IdbTransaction) {
+	if let Some(hook) = BEFORE_COMMIT.take() {
+		hook(transaction);
+	}
+}
+
+#[cfg(not(test))]
+fn before_commit(_transaction: &web_sys::IdbTransaction) {}
+
+/// A hook given the move's transaction, for tests.
+#[cfg(test)]
+type TransactionHook = RefCell<Option<Box<dyn FnOnce(&web_sys::IdbTransaction)>>>;
 
 #[cfg(test)]
 thread_local! {
 	/// Called once, if set, by the next move, after it has issued its reads and before
 	/// their results come back, for tests.
 	pub(super) static BETWEEN_READS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+	/// Called once, if set, by the next move whose reads' handler succeeds, at its end:
+	/// every write is issued and the transaction has not committed yet. For tests.
+	pub(super) static BEFORE_COMMIT: TransactionHook = RefCell::new(None);
 }

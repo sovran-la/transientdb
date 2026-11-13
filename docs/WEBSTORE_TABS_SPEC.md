@@ -155,8 +155,12 @@ Recorded when the spec was implemented (branch `bsneed/webstore-tabs`).
   `src/web/lock.rs` binds `navigator.locks.request` directly with `wasm-bindgen`.
 - **Adoption transaction.** One tab's records are read (`getAll` and `getAllKeys` on the
   `tab` index) and rewritten inside the keys request's success handler, so the
-  transaction never depends on promise microtasks staying inside it. If the transaction
-  aborts, the items it queued are taken back out of memory, so nothing is held twice.
+  transaction never depends on promise microtasks staying inside it. The handler only
+  reserves the items' sequence numbers; the items are queued in memory, in sequence order,
+  once the transaction has committed. Until then nothing can fetch, remove or drop them,
+  so if it aborts (a failed add, or a commit-time failure such as a full disk), nothing
+  was handed out, the records are still the orphan's, and a later pass adopts them once.
+  A reset or restore before the commit queues nothing.
 - **Reset during a pass.** A reset issued after a move's transaction was created, but
   before its reads return, makes the move adopt nothing; the reset's clear, ordered after
   it, deletes the records.

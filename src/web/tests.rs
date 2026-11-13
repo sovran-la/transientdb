@@ -14,6 +14,7 @@ mod bfcache_listener;
 mod bfcache_races;
 mod capacity;
 mod close_flush;
+mod commit;
 mod depth;
 mod exact_items;
 mod foreign;

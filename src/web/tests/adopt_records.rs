@@ -181,7 +181,7 @@ async fn test_an_aborted_adoption_changes_nothing() {
 	append_all(&mut a, &tagged(0..4));
 	drop(a);
 	// Occupy the key B's second adopted item would get: its add fails, which aborts the
-	// whole transaction, after the first was queued in memory.
+	// whole transaction, after the first was written.
 	let blocker = idb::add(&b.db(), &b.tab(), 2, "\"blocker\"").unwrap();
 	idb::completion(&blocker).await.unwrap();
 	warnings();

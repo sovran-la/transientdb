@@ -43,51 +43,47 @@ impl Queue {
 	/// Appends `text` under the next sequence number and, if that takes the queue past
 	/// `max_items`, drops the oldest items, available or pending, until it holds
 	/// `max_items`. Returns the new item's sequence number and the dropped ones', oldest
-	/// first: at most one, unless [`adopt`](Self::adopt) has taken the queue past
+	/// first: at most one, unless [`insert`](Self::insert) has taken the queue past
 	/// `max_items` since it was last trimmed.
 	///
 	/// # Errors
 	/// An `Io` error, changing nothing, once sequence numbers are exhausted: they never
 	/// wrap, so no two items can share one.
 	pub(crate) fn push(&mut self, text: String) -> Result<(u64, Vec<u64>)> {
-		let seq = self.adopt(text)?;
+		let seq = self.reserve()?;
+		self.items.push_back(Stored { seq, text });
 		Ok((seq, self.drop_oldest_beyond(self.max_items)))
 	}
 
-	/// Appends `text` under the next sequence number, as `push` does, but drops nothing:
-	/// the queue may hold more than `max_items` until [`drop_oldest_beyond`] is called.
-	/// For items taken over from storage, which are trimmed once all are in.
-	///
-	/// [`drop_oldest_beyond`]: Self::drop_oldest_beyond
+	/// Gives out the next sequence number without queueing anything under it, for an item
+	/// to [`insert`](Self::insert) later. A number reserved and never inserted is skipped.
 	///
 	/// # Errors
 	/// As `push`.
-	pub(crate) fn adopt(&mut self, text: String) -> Result<u64> {
+	pub(crate) fn reserve(&mut self) -> Result<u64> {
 		let seq = self.next_seq;
 		if seq > self.max_seq {
 			return Err(Error::Io(io::Error::other("sequence numbers exhausted")));
 		}
 		self.next_seq = seq + 1;
-		self.items.push_back(Stored { seq, text });
 		Ok(seq)
 	}
 
-	/// Deletes the items under `seqs`, wherever they are in the queue, pending or not:
-	/// an `Items` holding one matches nothing for it. `seqs` need not be sorted, and a
-	/// sequence number the queue does not hold is skipped.
+	/// Queues `items`, each under a sequence number [`reserve`](Self::reserve)d for it and
+	/// not queued yet, in sequence order among the items already queued: ahead of any
+	/// pushed since the reservation. Drops nothing: the queue may hold more than
+	/// `max_items` until [`drop_oldest_beyond`] is called. For items taken over from
+	/// storage, which are trimmed once all are in.
+	///
+	/// [`drop_oldest_beyond`]: Self::drop_oldest_beyond
 	#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
-	pub(crate) fn discard(&mut self, seqs: &[u64]) {
-		if seqs.is_empty() {
+	pub(crate) fn insert(&mut self, items: Vec<Stored>) {
+		if items.is_empty() {
 			return;
 		}
-		let mut sorted = seqs.to_vec();
-		sorted.sort_unstable();
-		self.items
-			.retain(|item| sorted.binary_search(&item.seq).is_err());
-		let mut claims = self.ledger.lock();
-		for &seq in seqs {
-			claims.forget(seq);
-		}
+		self.items.extend(items);
+		// Two sorted runs: a stable sort merges them in linear time.
+		self.items.make_contiguous().sort_by_key(|item| item.seq);
 	}
 
 	/// Drops the oldest items until at most `max_items` remain; returns their sequence
