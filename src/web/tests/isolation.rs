@@ -23,8 +23,8 @@ async fn test_stores_on_different_databases_are_isolated() {
 
 	assert_eq!(available(&mut a), a_items);
 	assert_eq!(available(&mut b), b_items);
-	assert_eq!(hydrated(name_a).await, a_items);
-	assert_eq!(hydrated(name_b).await, b_items);
+	assert_eq!(persisted_values(&a).await, a_items);
+	assert_eq!(persisted_values(&b).await, b_items);
 
 	// Resetting one store clears only its own database.
 	a.reset();
@@ -32,8 +32,8 @@ async fn test_stores_on_different_databases_are_isolated() {
 	assert!(!a.has_data());
 	assert!(a.fetch(10, 4096).unwrap().is_none());
 	assert_eq!(available(&mut b), b_items);
-	assert!(hydrated(name_a).await.is_empty());
-	assert_eq!(hydrated(name_b).await, b_items);
+	assert!(records(&a).await.is_empty());
+	assert_eq!(persisted_values(&b).await, b_items);
 
 	// Removing from one store's fetch never removes the other's records.
 	let more_a = items("a2", 2);
@@ -43,9 +43,13 @@ async fn test_stores_on_different_databases_are_isolated() {
 	settle().await;
 	assert!(!b.has_data());
 	assert_eq!(available(&mut a), more_a);
-	assert_eq!(hydrated(name_a).await, more_a);
-	assert!(hydrated(name_b).await.is_empty());
-	a.reset();
+	assert_eq!(persisted_values(&a).await, more_a);
+	assert!(records(&b).await.is_empty());
+	drop((a, b));
+	// Once both are gone, each one's items are adopted from its own database only.
+	assert_eq!(adopted(name_a).await, more_a);
+	assert!(adopted(name_b).await.is_empty());
+	fresh_store(name_a, 4096, 1000).await;
 	settle().await;
 }
 
@@ -77,13 +81,18 @@ async fn test_any_database_name_persists_and_is_isolated() {
 
 	for (store, name) in stores.iter_mut().zip(names) {
 		assert_eq!(available(store), items(name, 2), "{name:?}");
-		assert_eq!(hydrated(name).await, items(name, 2), "{name:?}");
+		assert_eq!(persisted_values(store).await, items(name, 2), "{name:?}");
 	}
-	for store in &mut stores {
-		store.reset();
+	// Each database's lock names are its own: a store gone from one is adopted there.
+	drop(stores);
+	for name in names {
+		assert_eq!(adopted(name).await, items(name, 2), "{name:?}");
+	}
+	for name in names {
+		fresh_store(name, 4096, 1000).await;
 	}
 	settle().await;
 	for name in names {
-		assert!(hydrated(name).await.is_empty(), "{name:?}");
+		assert!(adopted(name).await.is_empty(), "{name:?}");
 	}
 }

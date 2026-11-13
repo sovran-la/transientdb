@@ -18,7 +18,7 @@
 //!   upgrade, the upgrade is aborted, so the database stays exactly as it was for the
 //!   next open; if it ever succeeds, the connection is closed at once.
 
-use super::idb::{js_error, result_of, DB_VERSION, KEY_PATH, STORE_NAME};
+use super::idb::{js_error, key_path, result_of, DB_VERSION, STORE_NAME, TAB_FIELD, TAB_INDEX};
 use std::cell::{Cell, RefCell};
 use std::io::{Error, Result};
 use std::rc::Rc;
@@ -168,7 +168,8 @@ fn set_handlers(
 	on_upgrade.forget();
 }
 
-/// Replaces whatever object stores an older version left with an empty current one.
+/// Replaces whatever object stores an older version left with an empty current one,
+/// keyed by `[tab, seq]` and indexed on `tab`.
 fn create_schema(request: &IdbRequest) -> std::result::Result<(), JsValue> {
 	let db: IdbDatabase = request.result()?.unchecked_into();
 	let names = db.object_store_names();
@@ -177,8 +178,9 @@ fn create_schema(request: &IdbRequest) -> std::result::Result<(), JsValue> {
 		db.delete_object_store(&name)?;
 	}
 	let params = web_sys::IdbObjectStoreParameters::new();
-	params.set_key_path(&JsValue::from_str(KEY_PATH));
-	db.create_object_store_with_optional_parameters(STORE_NAME, &params)?;
+	params.set_key_path(&key_path());
+	let store = db.create_object_store_with_optional_parameters(STORE_NAME, &params)?;
+	store.create_index_with_str(TAB_INDEX, TAB_FIELD)?;
 	Ok(())
 }
 

@@ -1,24 +1,36 @@
 use super::*;
-use crate::contract;
-use serde_json::json;
+use crate::{contract, DataStore, Items};
+use serde_json::{json, Value};
 use support::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+mod adopt_invalid;
+mod adopt_records;
+mod bfcache;
+mod bfcache_listener;
+mod bfcache_races;
 mod capacity;
+mod close_flush;
+mod commit;
 mod depth;
 mod exact_items;
 mod foreign;
-mod hydrate;
+mod interval;
 mod isolation;
+mod no_locks;
+mod orphans;
 mod persistence;
+mod races;
 mod reopen;
 mod schema;
 mod stored_text;
 mod support;
+mod tabs;
 mod upgrade;
+mod windows;
 mod write_failure;
 
 macro_rules! web_check {
@@ -31,6 +43,7 @@ macro_rules! web_check {
 			// What IndexedDB holds is exactly what the store still holds.
 			if store.is_persisted() {
 				assert_eq!(flushed(&store).await, stored(&store));
+				assert_eq!(records(&store).await.len(), stored(&store).len());
 			}
 			store.reset();
 			settle().await;
@@ -56,7 +69,7 @@ async fn test_basic_operations() {
 	let items = store.fetch(10, 1024).unwrap().unwrap();
 	assert_eq!(items.values(), vec![json!({"event": "test", "value": 123})]);
 	// Still stored, but held back from other fetches.
-	assert_eq!(store.queue.items.len(), 1);
+	assert_eq!(store.queue().items.len(), 1);
 	assert!(!store.has_data());
 
 	store.remove(items).unwrap();
@@ -83,4 +96,14 @@ async fn test_rejects_zero_max_item_size() {
 #[should_panic(expected = "max_items = 0?")]
 async fn test_rejects_zero_max_items() {
 	let _store = WebStore::new(config("test-panic", 1024, 0)).await;
+}
+
+#[wasm_bindgen_test]
+#[should_panic(expected = "orphan_interval = 0?")]
+async fn test_rejects_zero_orphan_interval() {
+	let _store = WebStore::new(WebConfig {
+		orphan_interval: std::time::Duration::ZERO,
+		..config("test-panic", 1024, 1000)
+	})
+	.await;
 }

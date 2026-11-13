@@ -16,7 +16,7 @@ async fn test_deepest_items_survive_a_reopen() {
 		})
 		.collect();
 	contract::append_all(&mut store, &items);
-	settle().await;
+	drop(store);
 
 	let mut reopened = WebStore::new(config(db_name, 1 << 20, 1000)).await;
 	let fetched = reopened.fetch(100, usize::MAX).unwrap().unwrap();

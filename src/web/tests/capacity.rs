@@ -24,7 +24,7 @@ async fn test_cap_of_one_holds_only_the_newest_item() {
 async fn test_append_remove_cycles_keep_counters_and_contents() {
 	let db_name = "test-capacity-cycles";
 	let mut store = fresh_store(db_name, 1024, 100_000).await;
-	let first_seq = store.queue.next_seq;
+	let first_seq = store.queue().next_seq;
 	let mut expected: VecDeque<Value> = VecDeque::new();
 	let mut next = 0;
 	for cycle in 0..30 {
@@ -40,12 +40,12 @@ async fn test_append_remove_cycles_keep_counters_and_contents() {
 		store.remove(fetched).unwrap();
 
 		assert_eq!(queued(&store), Vec::from(expected.clone()));
-		assert_eq!(store.queue.next_seq, first_seq + next as u64);
+		assert_eq!(store.queue().next_seq, first_seq + next as u64);
 		let seqs: Vec<u64> = stored(&store).into_iter().map(|(seq, _)| seq).collect();
 		assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
 	}
 	assert!(
-		store.queue.items.len() > 1000,
+		store.queue().items.len() > 1000,
 		"the store should have grown"
 	);
 	if store.is_persisted() {
@@ -67,10 +67,12 @@ async fn test_a_large_store_persists_everything() {
 	let appended = tagged(0..2000);
 	append_all(&mut store, &appended);
 	assert_eq!(flushed(&store).await, stored(&store));
+	drop(store);
 
-	let reopened = WebStore::new(config(db_name, 1024, 5000)).await;
+	let mut reopened = WebStore::new(config(db_name, 1024, 5000)).await;
 	assert!(reopened.is_persisted());
 	assert_eq!(queued(&reopened), appended);
-	store.reset();
+	assert_eq!(flushed(&reopened).await, stored(&reopened));
+	reopened.reset();
 	settle().await;
 }
