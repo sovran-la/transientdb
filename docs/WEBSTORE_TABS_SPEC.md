@@ -167,6 +167,13 @@ Recorded when the spec was implemented (branch `bsneed/webstore-tabs`).
 - **Over the cap mid-pass.** Between a move and the trim that ends the pass, the queue can
   hold more than `max_items`; `Queue::push` therefore reports every item it drops, so an
   append in that window deletes all of them from IndexedDB.
+- **`max_items` is a soft limit** (agreed with Brandon 2026-11-13). The store trims to
+  it, but can hold more for a while: during a pass, as above, and after a pass cut short
+  because the connection closed for another page's upgrade, which skips the trim. The
+  next append then drops the excess, in memory only, without the trim's warning.
+- **Delivery is at least once.** Live tabs never send each other's items, but a send in
+  flight when a page is cached or dies can repeat once its items are adopted; the server
+  dedupes, by an id each item carries (Segment's `messageId`).
 - **Records under a non-string tab key** (only another writer could store one) are
   discarded without a lock: no store's lock guards them, and deleting twice is harmless.
 - **Sequence numbers exhausted while adopting**: the rest of that orphan is left in place

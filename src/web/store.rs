@@ -201,8 +201,9 @@ impl Drop for WebStore {
 }
 
 impl DataStore for WebStore {
-	/// Appends an item, dropping the oldest one if the store holds `max_items` already,
-	/// in memory and in IndexedDB.
+	/// Appends an item, dropping the oldest items, in memory and in IndexedDB, until the
+	/// store holds at most `max_items`: one if it held `max_items` already, more if it
+	/// held more (see [`WebConfig::max_items`]).
 	///
 	/// # Errors
 	/// [`Error::ItemTooDeep`](crate::Error) or [`Error::ItemTooLarge`](crate::Error),

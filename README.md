@@ -296,7 +296,7 @@ A file that does not match the config (another id or `max_item_size`, another fo
 **WebConfig:**
 - `database_name`: Name of the IndexedDB database (use unique names per store; every tab of a page opens the same one)
 - `max_item_size`: Largest item, in bytes; see [Limits](#limits)
-- `max_items`: Most items one tab holds, its own and those it adopted; past it the oldest is dropped, in memory and in IndexedDB
+- `max_items`: Most items one tab holds, its own and those it adopted; past it the oldest is dropped, in memory and in IndexedDB. It is a soft limit: the store trims to it, but can hold more for a moment, while it adopts orphans (until the trim that ends the pass), or until the next append if the pass is cut short by another page's database upgrade
 - `orphan_interval`: How often the store looks for items left by tabs that are gone, besides once when it opens. `Duration::from_secs(30)` is a good default. Must not be zero
 
 **Persistence States:**
@@ -307,7 +307,7 @@ The store falls back to memory-only mode by itself and logs a warning to the con
 
 #### Several tabs
 
-Every tab of a page opens the same database. Each `WebStore` instance is a tab of its own: it gets a random tab id when it is created (a reloaded page is a new tab), keeps its records under that id, and fetches, sends and removes only its own items. Live tabs never see each other's items, so nothing is sent twice, and `max_items` is per tab.
+Every tab of a page opens the same database. Each `WebStore` instance is a tab of its own: it gets a random tab id when it is created (a reloaded page is a new tab), keeps its records under that id, and fetches, sends and removes only its own items. Live tabs never see each other's items, so two live tabs never send the same item, and `max_items` is per tab. Delivery is still at least once: a send in flight when a page is cached (see below) or dies can be sent again once its items are adopted, so the server should dedupe by an id each item carries (Segment's `messageId`, for example).
 
 Items left behind by a tab that is gone (closed, crashed, discarded by the browser, reloaded) are *orphans*. A live tab adopts them: it moves them under its own id, behind the items it already holds, and sends them as its own. A store adopts once when it opens, before `new` returns (so a reloaded page picks up what it left at once), and then every `orphan_interval` until it is dropped. Adopted items count toward the adopting tab's `max_items`; past it the oldest are dropped and logged. A record that is not an item, or an item larger than `max_item_size`, is discarded and logged when it is adopted. Items from different tabs have no order relative to each other.
 

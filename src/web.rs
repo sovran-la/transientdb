@@ -61,9 +61,12 @@ pub struct WebConfig {
 	/// item larger than this (persisted under a larger limit) is discarded, and logged,
 	/// when it is adopted. Must not be 0.
 	pub max_item_size: usize,
-	/// The most items the store holds at once: its own and those it adopted. Appending
-	/// past it drops the oldest item, fetched or not, in memory and in IndexedDB.
-	/// Adopting past it drops the oldest items until they fit, and logs it. Must not be 0.
+	/// The most items the store holds at once, its own and those it adopted: a soft limit.
+	/// Appending past it drops the oldest items, fetched or not, in memory and in
+	/// IndexedDB. Adopting past it drops the oldest items until they fit, and logs it,
+	/// once the adoption pass is over, so the store can hold more until then. A pass cut
+	/// short by another page's database upgrade (see [`WebStore`]'s "Database upgrades")
+	/// skips that, and the excess stays until the next append drops it. Must not be 0.
 	pub max_items: usize,
 	/// How often the store looks for orphans to adopt: items stored by a `WebStore` that
 	/// no longer exists, such as one in a tab that was closed, crashed or reloaded. It
