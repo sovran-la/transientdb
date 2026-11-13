@@ -21,6 +21,7 @@ async fn test_dropping_a_store_before_its_new_lock_is_granted() {
 		return;
 	};
 	append_all(&mut store, &tagged(0..3));
+	let old = store.tab();
 	let new = "bfcache-drop-pending-tab".to_owned();
 	let name = lock::name(db_name, &new);
 	let blocker = lock::acquire(&name, false).await.unwrap().unwrap();
@@ -29,7 +30,7 @@ async fn test_dropping_a_store_before_its_new_lock_is_granted() {
 	append_all(&mut store, &tagged(10..12));
 	drop(store);
 	drop(blocker);
-	settle().await;
+	until_free(db_name, &old).await;
 	until_free(db_name, &new).await;
 	let mut next = WebStore::new(config(db_name, 4096, 1000)).await;
 	assert_eq!(queued(&next), tagged(0..3));
@@ -51,10 +52,14 @@ async fn test_dropping_a_store_while_it_starts_over_loses_nothing() {
 		let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
 		let items: Vec<Value> = (0..5).map(|i| json!({"delay": delay, "i": i})).collect();
 		append_all(&mut store, &items);
+		let old = store.tab();
 		pageshow(true);
+		let new = store.tab();
 		ticks(delay).await;
 		drop(store);
-		settle().await;
+		// Both tabs' locks free, so that the next store can adopt from either.
+		until_free(db_name, &old).await;
+		until_free(db_name, &new).await;
 		let mut next = WebStore::new(config(db_name, 4096, 1000)).await;
 		assert_eq!(sorted(queued(&next)), sorted(items), "delay {delay}");
 		assert_eq!(flushed(&next).await, stored(&next), "delay {delay}");

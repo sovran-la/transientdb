@@ -110,8 +110,10 @@ async fn test_reset_clears_every_tabs_records() {
 	append_all(&mut a, &items("a", 0..3));
 	append_all(&mut b, &items("b", 0..3));
 	append_all(&mut orphan, &items("orphan", 0..3));
+	let orphan_tab = orphan.tab();
 	drop(orphan);
-	settle().await;
+	// Free, so that a pass would adopt what the reset left, if it left anything.
+	until_free(db_name, &orphan_tab).await;
 
 	a.reset();
 	assert!(records(&a).await.is_empty());

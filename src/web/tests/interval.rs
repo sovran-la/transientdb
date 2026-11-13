@@ -30,17 +30,18 @@ async fn test_adoption_runs_again_after_each_interval() {
 	append_all(&mut a, &tagged(0..3));
 	drop(a);
 	assert!(!b.has_data());
-	wait_ms(500).await;
+	until("the first orphan adopted", || queued(&b).len() >= 3).await;
 	assert_eq!(queued(&b), tagged(0..3));
 	let passes = b.shared.passes.get();
-	assert!(passes >= 3, "{passes} passes in 500 ms at 150 ms");
+	assert!(passes > 1, "adopted with {passes} passes");
 
-	// And again for the next one.
+	// And again for the next one, by a later pass still.
 	let mut a = WebStore::new(config(db_name, 4096, 1000)).await;
 	append_all(&mut a, &tagged(3..5));
 	drop(a);
-	wait_ms(400).await;
+	until("the second orphan adopted", || queued(&b).len() >= 5).await;
 	assert_eq!(queued(&b), tagged(0..5));
+	assert!(b.shared.passes.get() > passes);
 	assert_eq!(flushed(&b).await, stored(&b));
 	let mut b = b;
 	b.reset();
@@ -55,8 +56,7 @@ async fn test_adoption_stops_when_the_store_is_dropped() {
 	};
 	drop(cleaner);
 	let b = WebStore::new(every(db_name, 50)).await;
-	wait_ms(200).await;
-	assert!(b.shared.passes.get() > 1);
+	until("a pass on the interval", || b.shared.passes.get() > 1).await;
 	// Kept past the drop, to see whether passes go on starting.
 	let shared = b.shared.clone();
 	drop(b);

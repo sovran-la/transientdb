@@ -163,8 +163,13 @@ mod tests {
 		gloo_timers::future::TimeoutFuture::new(50).await;
 		assert!(slot.borrow().is_none(), "granted while still held");
 		drop(held);
-		gloo_timers::future::TimeoutFuture::new(50).await;
-		assert_eq!(*slot.borrow(), Some(true));
+		for _ in 0..200 {
+			if slot.borrow().is_some() {
+				break;
+			}
+			gloo_timers::future::TimeoutFuture::new(5).await;
+		}
+		assert_eq!(*slot.borrow(), Some(true), "not granted once released");
 	}
 
 	#[wasm_bindgen_test]

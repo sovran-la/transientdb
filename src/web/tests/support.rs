@@ -160,6 +160,18 @@ pub(super) fn spawn_pass(store: &WebStore) -> Rc<Cell<bool>> {
 	done
 }
 
+/// Waits, a few milliseconds at a time, until `done` is true, failing with `what` if it
+/// still is not after about five seconds.
+pub(super) async fn until(what: &str, done: impl Fn() -> bool) {
+	for _ in 0..1000 {
+		if done() {
+			return;
+		}
+		gloo_timers::future::TimeoutFuture::new(5).await;
+	}
+	panic!("{what}: still not done");
+}
+
 /// Waits, a few milliseconds at a time, until every flag is set.
 pub(super) async fn until_all(flags: &[Rc<Cell<bool>>]) {
 	for _ in 0..1000 {

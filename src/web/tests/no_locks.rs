@@ -34,8 +34,9 @@ async fn test_without_web_locks_the_store_is_memory_only() {
 		return;
 	};
 	append_all(&mut a, &tagged(0..2));
+	let a_tab = a.tab();
 	drop(a);
-	settle().await;
+	until_free(db_name, &a_tab).await;
 
 	warnings();
 	let hidden = NoLocks::hide();
