@@ -20,6 +20,7 @@ fn test_config(db_name: &str) -> WebConfig {
 		database_name: db_name.to_string(),
 		max_item_size: 64 * 1024,
 		max_items: 1000,
+		orphan_interval: std::time::Duration::from_secs(30),
 	}
 }
 
@@ -129,12 +130,17 @@ async fn test_transientdb_pending_items_are_available_after_a_reload() {
 		first.append(json!({"index": i})).unwrap();
 	}
 	let held = first.fetch(10, 1024).unwrap().unwrap();
-	settle().await;
-
+	// While the first lives, its items are its own.
 	let second = TransientDB::new(WebStore::new(test_config(db_name)).await);
-	assert_eq!(available(&second).len(), 3, "pending is not persisted");
+	assert!(!second.has_data(), "a live store's items are never adopted");
+	drop(second);
+
+	// The page reloads: the first goes, and the next store adopts its items.
+	drop(first);
+	let reloaded = TransientDB::new(WebStore::new(test_config(db_name)).await);
+	assert_eq!(available(&reloaded).len(), 3, "pending is not persisted");
 	drop(held);
-	first.reset();
+	reloaded.reset();
 	settle().await;
 }
 

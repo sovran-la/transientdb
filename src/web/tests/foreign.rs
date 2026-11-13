@@ -27,8 +27,8 @@ async fn test_another_stores_items_remove_nothing() {
 	assert_eq!(available(&mut a), tagged(0..5));
 	assert_eq!(available(&mut b), tagged(0..5));
 	if a.is_persisted() {
-		assert_eq!(hydrated(name_a).await, tagged(0..5));
-		assert_eq!(hydrated(name_b).await, tagged(0..5));
+		assert_eq!(persisted_values(&a).await, tagged(0..5));
+		assert_eq!(persisted_values(&b).await, tagged(0..5));
 	}
 
 	// Each store's own Items still removes exactly what it fetched.
@@ -37,8 +37,8 @@ async fn test_another_stores_items_remove_nothing() {
 	assert_eq!(queued(&a), tagged(3..5));
 	assert_eq!(queued(&b), tagged(0..5));
 	if a.is_persisted() {
-		assert_eq!(hydrated(name_a).await, tagged(3..5));
-		assert_eq!(hydrated(name_b).await, tagged(0..5));
+		assert_eq!(persisted_values(&a).await, tagged(3..5));
+		assert_eq!(persisted_values(&b).await, tagged(0..5));
 	}
 	a.reset();
 	b.reset();
@@ -53,24 +53,26 @@ async fn test_a_second_instance_on_the_same_database_ignores_the_firsts_items() 
 		web_sys::console::log_1(&"Skipping same-database test - no persistence".into());
 		return;
 	}
-	settle().await;
 	let mut second = WebStore::new(config(db_name, 4096, 1000)).await;
-	// The same items under the same sequence numbers, but a different instance.
+	append_all(&mut second, &tagged(0..5));
+	// The same items under the same sequence numbers, but a different instance and tab.
 	assert_eq!(stored(&second), stored(&first));
-	assert!(!first.queue.ledger.same(&second.queue.ledger));
+	assert!(!first.queue().ledger.same(&second.queue().ledger));
 
 	let items = first.fetch(3, 4096).unwrap().unwrap();
 	second.remove(items).unwrap();
 	assert_eq!(queued(&second), tagged(0..5));
-	assert_eq!(hydrated(db_name).await, tagged(0..5));
+	assert_eq!(persisted_values(&first).await, tagged(0..5));
+	assert_eq!(persisted_values(&second).await, tagged(0..5));
 	// Released back to the first instance by being ignored.
 	let items = first.fetch(3, 4096).unwrap().unwrap();
 	assert_eq!(items.values(), tagged(0..3));
 
-	// Removed through the instance that fetched them, they are gone after a reopen.
+	// Removed through the instance that fetched them, they are gone from its tab only.
 	first.remove(items).unwrap();
 	assert_eq!(queued(&first), tagged(3..5));
-	assert_eq!(hydrated(db_name).await, tagged(3..5));
+	assert_eq!(persisted_values(&first).await, tagged(3..5));
+	assert_eq!(persisted_values(&second).await, tagged(0..5));
 	first.reset();
 	settle().await;
 }
@@ -84,7 +86,7 @@ async fn test_every_instance_has_its_own_ledger() {
 	stores.push(fresh_store("test-foreign-id-0", 64, 8).await);
 	for (i, a) in stores.iter().enumerate() {
 		for (j, b) in stores.iter().enumerate() {
-			assert_eq!(a.queue.ledger.same(&b.queue.ledger), i == j);
+			assert_eq!(a.queue().ledger.same(&b.queue().ledger), i == j);
 		}
 	}
 }

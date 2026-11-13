@@ -1,12 +1,15 @@
 //! IndexedDB plumbing for `WebStore`: the database schema, its record format, and the
 //! requests the store issues. Opening the database is in [`connect`](super::connect).
 //!
-//! Every record holds one stored item as `{ "seq": <number>, "text": "<item>" }` in the
-//! object store [`STORE_NAME`], whose key path is `seq` with no auto-increment. `seq` is
-//! the item's sequence number, assigned by the store, so memory and IndexedDB always
-//! agree on it; `text` is the item's compact `serde_json` text, kept as a string so that
-//! an integer above 2^53 or a float such as `42.0` comes back exactly. Nothing else is
-//! stored: fetched items are pending in memory only.
+//! Every record holds one stored item as `{ "tab": "<id>", "seq": <number>, "text":
+//! "<item>" }` in the object store [`STORE_NAME`], whose key path is `["tab", "seq"]`
+//! with no auto-increment, and which has the index [`TAB_INDEX`] on `tab`. `tab` is the
+//! id of the store instance that holds the item (see [`tab`](super::tab)); `seq` is the
+//! item's sequence number in that instance's queue, assigned by the store, so memory and
+//! IndexedDB always agree on it, and the pair is unique across instances. `text` is the
+//! item's compact `serde_json` text, kept as a string so that an integer above 2^53 or a
+//! float such as `42.0` comes back exactly. Nothing else is stored: fetched items are
+//! pending in memory only.
 //!
 //! An IndexedDB number key is a JavaScript number, an `f64`. Sequence numbers are `u64`,
 //! so the store gives out only `1..=`[`MAX_SEQ`], every one of which an `f64` holds
@@ -30,11 +33,15 @@ use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransa
 /// Version 1 stored items in-line under an auto-incremented `_idb_key`. Version 2
 /// stores wrapper records keyed by the store's own counter. Version 3 adds each item's
 /// batch number, and the boundary record. Version 4 stores each item as JSON text.
-/// Version 5 stores `{seq, text}` and nothing about batches.
-pub(super) const DB_VERSION: u32 = 5;
+/// Version 5 stores `{seq, text}` and nothing about batches. Version 6 stores
+/// `{tab, seq, text}` keyed by `[tab, seq]`, with an index on `tab`.
+pub(super) const DB_VERSION: u32 = 6;
 pub(super) const STORE_NAME: &str = "events";
-pub(super) const KEY_PATH: &str = "seq";
+pub(super) const TAB_FIELD: &str = "tab";
+pub(super) const SEQ_FIELD: &str = "seq";
 const TEXT_FIELD: &str = "text";
+/// The index on [`TAB_FIELD`], for finding every tab with records, and each one's records.
+pub(super) const TAB_INDEX: &str = "tab";
 /// The last sequence number the store gives out: `Number.MAX_SAFE_INTEGER`, 2^53 - 1.
 pub(super) const MAX_SEQ: u64 = (1 << 53) - 1;
 
@@ -42,14 +49,24 @@ pub(super) fn js_error(what: &str, e: JsValue) -> Error {
 	Error::other(format!("{what}: {e:?}"))
 }
 
-/// The record stored for the item `text` under `seq`.
-pub(super) fn record(seq: u64, text: &str) -> Value {
-	json!({ (KEY_PATH): seq, (TEXT_FIELD): text })
+/// The key path of the object store: `["tab", "seq"]`.
+pub(super) fn key_path() -> JsValue {
+	js_sys::Array::of2(&TAB_FIELD.into(), &SEQ_FIELD.into()).into()
+}
+
+/// The record stored for the item `text` under `seq` in tab `tab`.
+pub(super) fn record(tab: &str, seq: u64, text: &str) -> Value {
+	json!({ (TAB_FIELD): tab, (SEQ_FIELD): seq, (TEXT_FIELD): text })
+}
+
+/// The key of the record under `seq` in tab `tab`.
+pub(super) fn key(tab: &str, seq: u64) -> JsValue {
+	js_sys::Array::of2(&tab.into(), &JsValue::from_f64(seq as f64)).into()
 }
 
 /// The sequence number of a record, if its key is one the store could have given out.
 pub(super) fn record_seq(record: &Value) -> Option<u64> {
-	let seq = record.get(KEY_PATH)?.as_u64()?;
+	let seq = record.get(SEQ_FIELD)?.as_u64()?;
 	(1..=MAX_SEQ).contains(&seq).then_some(seq)
 }
 
@@ -62,17 +79,12 @@ pub(super) fn parse_record(record: &Value) -> Option<(u64, String)> {
 	(!text.is_empty()).then(|| (seq, text.to_owned()))
 }
 
-/// The key a record is stored under, whatever it is, for deleting the record.
-pub(super) fn record_key(record: &Value) -> Option<JsValue> {
-	js_sys::JSON::parse(&record.get(KEY_PATH)?.to_string()).ok()
-}
-
 /// Every record in the object store, in key order, as JSON.
 ///
 /// A record that `JSON.stringify` or `serde_json` rejects (a BigInt or a cycle in it, say)
-/// comes back as `{"seq": <its key>}` alone: not a stored item, but its key still counts
-/// and the record can still be deleted. Only a key that cannot be read either is skipped,
-/// with a warning.
+/// comes back as `{}`: not a stored item. Only for tests and diagnostics; adopting reads
+/// a tab's records together with their keys instead.
+#[cfg(test)]
 pub(super) async fn read_all(db: &IdbDatabase) -> Result<Vec<Value>> {
 	let transaction = db
 		.transaction_with_str_and_mode(STORE_NAME, IdbTransactionMode::Readonly)
@@ -85,26 +97,19 @@ pub(super) async fn read_all(db: &IdbDatabase) -> Result<Vec<Value>> {
 
 	let mut records = Vec::with_capacity(array.length() as usize);
 	for record in array.iter() {
-		let key_only = || {
-			let key = js_sys::Reflect::get(&record, &JsValue::from_str(KEY_PATH)).ok()?;
-			Some(json!({ (KEY_PATH): as_json(&key)? }))
-		};
-		match as_json(&record).or_else(key_only) {
-			Some(json) => records.push(json),
-			None => web_sys::console::warn_1(&"Skipping an unreadable IndexedDB record".into()),
-		}
+		records.push(as_json(&record).unwrap_or_else(|| json!({})));
 	}
 	Ok(records)
 }
 
 /// `value` as JSON, if `JSON.stringify` and `serde_json` both accept it.
-fn as_json(value: &JsValue) -> Option<Value> {
+pub(super) fn as_json(value: &JsValue) -> Option<Value> {
 	let text = js_sys::JSON::stringify(value).ok()?.as_string()?;
 	serde_json::from_str(&text).ok()
 }
 
 /// Starts a read/write transaction on the object store.
-fn begin_write(db: &IdbDatabase) -> Result<(IdbTransaction, IdbObjectStore)> {
+pub(super) fn begin_write(db: &IdbDatabase) -> Result<(IdbTransaction, IdbObjectStore)> {
 	let transaction = db
 		.transaction_with_str_and_mode(STORE_NAME, IdbTransactionMode::Readwrite)
 		.map_err(|e| js_error("Transaction error", e))?;
@@ -114,33 +119,26 @@ fn begin_write(db: &IdbDatabase) -> Result<(IdbTransaction, IdbObjectStore)> {
 	Ok((transaction, store))
 }
 
-fn to_js(record: &Value) -> Result<JsValue> {
+pub(super) fn to_js(record: &Value) -> Result<JsValue> {
 	js_sys::JSON::parse(&record.to_string()).map_err(|e| js_error("JS JSON parse error", e))
 }
 
-/// Issues the add of the item `text` under `seq`.
-pub(super) fn add(db: &IdbDatabase, seq: u64, text: &str) -> Result<IdbTransaction> {
+/// Issues the add of the item `text` under `seq` in tab `tab`.
+pub(super) fn add(db: &IdbDatabase, tab: &str, seq: u64, text: &str) -> Result<IdbTransaction> {
 	let (transaction, store) = begin_write(db)?;
 	store
-		.add(&to_js(&record(seq, text))?)
+		.add(&to_js(&record(tab, seq, text))?)
 		.map_err(|e| js_error("Add error", e))?;
 	Ok(transaction)
 }
 
-/// Issues the deletes of the records under `seqs`, in one transaction.
-pub(super) fn delete(db: &IdbDatabase, seqs: &[u64]) -> Result<IdbTransaction> {
-	let keys: Vec<JsValue> = seqs
-		.iter()
-		.map(|&seq| JsValue::from_f64(seq as f64))
-		.collect();
-	delete_keys(db, &keys)
-}
-
-/// Issues the deletes of the records under `keys`, whatever they are, in one transaction.
-pub(super) fn delete_keys(db: &IdbDatabase, keys: &[JsValue]) -> Result<IdbTransaction> {
+/// Issues the deletes of the records under `seqs` in tab `tab`, in one transaction.
+pub(super) fn delete(db: &IdbDatabase, tab: &str, seqs: &[u64]) -> Result<IdbTransaction> {
 	let (transaction, store) = begin_write(db)?;
-	for key in keys {
-		store.delete(key).map_err(|e| js_error("Delete error", e))?;
+	for &seq in seqs {
+		store
+			.delete(&key(tab, seq))
+			.map_err(|e| js_error("Delete error", e))?;
 	}
 	Ok(transaction)
 }
@@ -157,13 +155,13 @@ pub(super) fn fire_and_forget(what: &'static str, issued: Result<IdbTransaction>
 	let done = match issued {
 		Ok(transaction) => completion(&transaction),
 		Err(e) => {
-			web_sys::console::warn_1(&format!("IndexedDB {what} failed: {e}").into());
+			super::warn(&format!("IndexedDB {what} failed: {e}"));
 			return;
 		}
 	};
 	spawn_local(async move {
 		if let Err(e) = done.await {
-			web_sys::console::warn_1(&format!("IndexedDB {what} failed: {e}").into());
+			super::warn(&format!("IndexedDB {what} failed: {e}"));
 		}
 	});
 }
@@ -202,6 +200,7 @@ pub(super) fn completion(transaction: &IdbTransaction) -> impl Future<Output = R
 }
 
 /// Awaits an IdbRequest and extracts its result.
+#[cfg(test)]
 pub(super) async fn await_request<T: JsCast>(request: &IdbRequest) -> Result<T> {
 	let (sender, receiver) = futures_channel::oneshot::channel();
 	let sender = Rc::new(RefCell::new(Some(sender)));

@@ -5,6 +5,7 @@
 //! removing what was delivered, and giving back what was not.
 
 use serde_json::{json, Value};
+use std::time::Duration;
 use transientdb::{Error, PersistenceState, TransientDB, WebConfig, WebStore};
 use wasm_bindgen::prelude::*;
 
@@ -125,8 +126,11 @@ async fn run_demo() -> Result<(), Error> {
 		database_name: "transientdb-demo".to_string(),
 		max_item_size: 8 * 1024, // no event over 8 KiB serialized
 		max_items: 100,          // the 101st append drops the oldest event
+		// Take over events left by closed tabs this often, as well as once now.
+		orphan_interval: Duration::from_secs(30),
 	};
 
+	// Opening adopts what earlier visits (closed or reloaded tabs) left unsent.
 	let store = WebStore::new(config).await;
 
 	// Check persistence state
@@ -222,7 +226,7 @@ async fn run_demo() -> Result<(), Error> {
 	log("🎉 Demo complete!");
 	log("");
 	log("One event is left queued. Refresh the page: if IndexedDB is available,");
-	log("step 2 sends it.");
+	log("the reloaded page adopts it and step 2 sends it.");
 
 	Ok(())
 }

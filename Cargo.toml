@@ -33,8 +33,12 @@ features = [
     "Window",
     "Event",
     "EventTarget",
+    "IdbCursor",
+    "IdbCursorDirection",
     "IdbFactory",
     "IdbDatabase",
+    "IdbIndex",
+    "IdbKeyRange",
     "IdbObjectStore",
     "IdbObjectStoreParameters",
     "IdbOpenDbRequest",
@@ -43,6 +47,7 @@ features = [
     "IdbTransactionMode",
     "IdbVersionChangeEvent",
     "DomStringList",
+    "Navigator",
 ]
 
 [dev-dependencies]

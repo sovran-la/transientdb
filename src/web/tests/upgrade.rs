@@ -69,10 +69,7 @@ async fn read_all_finished(db: &IdbDatabase) -> Vec<Value> {
 async fn assert_opens_upgraded(db_name: &str) {
 	let mut store = WebStore::new(config(db_name, 4096, 1000)).await;
 	assert!(store.is_persisted());
-	assert_eq!(
-		store.db.as_ref().unwrap().version(),
-		f64::from(idb::DB_VERSION)
-	);
+	assert_eq!(store.db().version(), f64::from(idb::DB_VERSION));
 	assert!(!store.has_data());
 	append_all(&mut store, &tagged(0..2));
 	assert_eq!(flushed(&store).await, stored(&store));
@@ -109,7 +106,7 @@ async fn test_open_gives_up_while_an_older_version_is_held_open() {
 
 	let opened = within_two_seconds(WebStore::new(config(db_name, 4096, 1000))).await;
 	let mut store = opened.expect("WebStore::new waited for the old connection to close");
-	assert!(store.db.is_none());
+	assert!(store.shared.db.is_none());
 	assert_works_in_memory(&mut store, vec![]);
 
 	// The old page goes away. The abandoned request's upgrade is aborted, not done: the

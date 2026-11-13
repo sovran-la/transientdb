@@ -17,6 +17,7 @@ fn test_config(db_name: &str) -> WebConfig {
 		database_name: db_name.to_string(),
 		max_item_size: 64 * 1024,
 		max_items: 1000,
+		orphan_interval: std::time::Duration::from_secs(30),
 	}
 }
 
@@ -141,14 +142,14 @@ async fn test_transientdb_numeric_edge_cases() {
 		"small_float": 0.0000001
 	});
 	db.append(item.clone()).unwrap();
-	settle().await;
 	// Exactly, after a reload too.
+	drop(db);
 	let reloaded = TransientDB::new(WebStore::new(test_config(db_name)).await);
 	let fetched = reloaded.fetch(1, 1024).unwrap().unwrap();
 	assert_eq!(fetched.values(), vec![item.clone()]);
 	assert_eq!(fetched.iter().next().unwrap(), item.to_string());
 	assert!(fetched.json().contains("18446744073709551615") && fetched.json().contains("42.0"));
 	drop(fetched);
-	db.reset();
+	reloaded.reset();
 	settle().await;
 }

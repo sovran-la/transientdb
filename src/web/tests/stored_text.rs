@@ -1,7 +1,7 @@
-//! What a fetch hands out after a reload is the text that was stored. An item's JSON is
-//! checked when it is appended, not when the store opens, so a record holding text
-//! `append` would not have written (put there by something else: another script, devtools)
-//! is kept and handed out as it is, and can be released and removed like any other. A
+//! What a fetch hands out after adopting is the text that was stored. An item's JSON is
+//! checked when it is appended, not when it is adopted, so a record holding text `append`
+//! would not have written (put there by something else: another script, devtools) is
+//! adopted and handed out as it is, and can be released and removed like any other. A
 //! record larger than `max_item_size` is still discarded.
 
 use super::schema::add_raw;
@@ -10,17 +10,17 @@ use crate::serialize::{nested, Shape, MAX_ITEM_DEPTH};
 use contract::tagged;
 
 /// Opens a fresh, persisted store on `db_name`, adds a record for each of `texts` under
-/// sequence numbers 1 up, and opens the store again over them. `None`, after logging,
-/// when IndexedDB is unavailable.
+/// sequence numbers 1 up in a tab that no longer exists, and opens a store that adopts
+/// them. `None`, after logging, when IndexedDB is unavailable.
 async fn reopened_over(db_name: &str, max_item_size: usize, texts: &[&str]) -> Option<WebStore> {
 	let store = persisted(db_name, 1 << 20, 1000).await?;
 	settle().await;
 	let records: Vec<Value> = texts
 		.iter()
 		.enumerate()
-		.map(|(i, text)| idb::record(i as u64 + 1, text))
+		.map(|(i, text)| idb::record("gone", i as u64 + 1, text))
 		.collect();
-	add_raw(store.db.as_ref().unwrap(), &records).await;
+	add_raw(&store.db(), &records).await;
 	drop(store);
 	let reopened = WebStore::new(config(db_name, max_item_size, 1000)).await;
 	assert!(reopened.is_persisted());
@@ -109,15 +109,17 @@ async fn test_a_record_larger_than_max_item_size_is_still_discarded() {
 	let Some(store) = reopened_over(db_name, 64, &texts).await else {
 		return;
 	};
+	// The adopted ones are renumbered in order, under the adopter's tab.
 	assert_eq!(
 		stored(&store),
 		vec![
 			(1, "\"ok\"".to_string()),
-			(3, "not json".to_string()),
-			(4, "\"also ok\"".to_string())
+			(2, "not json".to_string()),
+			(3, "\"also ok\"".to_string())
 		]
 	);
 	// The discarded record was deleted from IndexedDB.
 	assert_eq!(flushed(&store).await, stored(&store));
+	assert_eq!(records(&store).await.len(), 3);
 	cleared(store).await;
 }

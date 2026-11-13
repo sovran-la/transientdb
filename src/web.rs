@@ -2,21 +2,26 @@
 //!
 //! This module provides a DataStore implementation for WASM targets that:
 //! - Uses an in-memory queue as the source of truth for sync operations
-//! - Persists to IndexedDB via fire-and-forget async writes
-//! - Hydrates from IndexedDB on initialization
+//! - Persists to IndexedDB via fire-and-forget async writes, under the instance's tab id
+//! - Adopts the records of instances that no longer exist (orphans), when it opens and
+//!   every `orphan_interval`
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────┐
-//! │                    WebStore                          │
-//! │                                                      │
-//! │  append() ──► queue ──► spawn_local() ──► IndexedDB  │
-//! │                 │            (fire & forget)         │
-//! │  fetch()  ◄─────┘                                    │
-//! │                                                      │
-//! │  On init: IndexedDB ──► hydrate ──► queue            │
-//! └─────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────┐
+//! │                        WebStore (tab T)                   │
+//! │                                                           │
+//! │  append() ──► queue ──► IndexedDB [T, seq]                │
+//! │                 │       (issued now, fire & forget)       │
+//! │  fetch()  ◄─────┘                                         │
+//! │                                                           │
+//! │  holds Web Lock "transientdb:{db}:tab:T" while it lives   │
+//! │                                                           │
+//! │  On open, every orphan_interval:                          │
+//! │    tab U's lock free? ──► move U's records to [T, new seq]│
+//! │                           and into the queue              │
+//! └──────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! The store assigns every item's sequence number itself, so an item has the same key in
@@ -24,34 +29,49 @@
 //! IndexedDB during the call that causes it, so writes take effect in call order; see
 //! [`idb`]. Which items a fetch has handed out is kept in memory only: fetching and
 //! releasing write nothing.
+//!
+//! The queue is shared with the adoption pass ([`adopt`]), which runs in the background
+//! between the store's synchronous calls. Neither holds a borrow of it across an `await`.
 
+mod adopt;
 mod connect;
-mod hydrate;
 mod idb;
+mod interval;
+mod lock;
+mod store;
+mod tab;
+mod takeover;
 
 use crate::queue::Queue;
-use crate::{serialize, DataStore, Items, Result};
-use serde_json::Value;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 use web_sys::IdbDatabase;
 
 /// Configuration for the web-based data store.
 #[derive(Clone, Debug)]
 pub struct WebConfig {
 	/// Name of the IndexedDB database.
-	/// Different stores should use different database names to avoid collisions.
+	/// Different stores should use different database names to avoid collisions. Every
+	/// tab of a page opens the same database; see [`WebStore`]'s "Several tabs".
 	pub database_name: String,
 	/// The largest item the store accepts: its compact `serde_json` text, in bytes.
 	/// `append` rejects a larger item with [`Error::ItemTooLarge`](crate::Error). A stored
 	/// item larger than this (persisted under a larger limit) is discarded, and logged,
-	/// when the store opens. Must not be 0.
+	/// when it is adopted. Must not be 0.
 	pub max_item_size: usize,
-	/// The most items the store holds at once. Appending past it drops the oldest item,
-	/// fetched or not, in memory and in IndexedDB. A store opened over more stored items
-	/// than this (persisted under a larger limit) drops the oldest until they fit, and
-	/// logs it. Must not be 0.
+	/// The most items the store holds at once: its own and those it adopted. Appending
+	/// past it drops the oldest item, fetched or not, in memory and in IndexedDB.
+	/// Adopting past it drops the oldest items until they fit, and logs it. Must not be 0.
 	pub max_items: usize,
+	/// How often the store looks for orphans to adopt: items stored by a `WebStore` that
+	/// no longer exists, such as one in a tab that was closed, crashed or reloaded. It
+	/// also looks once when it opens, so a reloaded page picks up what it left at once.
+	///
+	/// `Duration::from_secs(30)` is a good default: an orphan waits at most that long for
+	/// a live tab to send it. Browsers may run timers in a hidden tab less often. Must not
+	/// be zero.
+	pub orphan_interval: Duration,
 }
 
 /// Indicates the persistence state of the WebStore.
@@ -59,10 +79,10 @@ pub struct WebConfig {
 pub enum PersistenceState {
 	/// IndexedDB is available and working. Events persist across page refreshes.
 	Persisted,
-	/// IndexedDB is unavailable (private browsing, blocked by browser policy, etc), or
-	/// the database is held open at an older version by another page, or the store gave
-	/// up its connection so that another page could upgrade the database. See
-	/// [`WebStore`]'s "Database upgrades".
+	/// IndexedDB or Web Locks are unavailable (private browsing, blocked by browser
+	/// policy, not a secure context, an old browser, etc), or the database is held open at
+	/// an older version by another page, or the store gave up its connection so that
+	/// another page could upgrade the database. See [`WebStore`]'s "Database upgrades".
 	/// Events are held in memory only and will be lost on page refresh.
 	///
 	/// When in this state, callers should consider:
@@ -75,18 +95,65 @@ pub enum PersistenceState {
 ///
 /// Items are stored in an in-memory queue for fast synchronous access, with asynchronous
 /// fire-and-forget writes to IndexedDB for persistence across page refreshes. Each item
-/// is persisted as its JSON text, so one restored after a reload equals the appended
+/// is persisted as its JSON text, so one adopted after a reload equals the appended
 /// value and serializes to the same bytes.
 ///
-/// Items are stored until an [`Items`] holding them is passed to `remove`, they are
-/// dropped to make room, or the store is reset. Which items a fetch has handed out is
-/// kept in memory only, so after a reload every stored item can be fetched again.
+/// Items are stored until an [`Items`](crate::Items) holding them is passed to `remove`,
+/// they are dropped to make room, or the store is reset. Which items a fetch has handed
+/// out is kept in memory only, so items adopted after a reload can all be fetched again.
+///
+/// # Several tabs
+///
+/// Every tab of a page opens the same database. Each `WebStore` instance is a *tab*: it
+/// gets a random tab id when it is created (so a reloaded page is a new tab), keeps its
+/// records under that id, and only ever fetches, sends and removes its own items. Live
+/// tabs do not coordinate and never see each other's items, and `max_items` is per tab.
+///
+/// Items left behind by a tab that no longer exists (closed, crashed, discarded by the
+/// browser, reloaded) are *orphans*. A live tab adopts them: it moves them under its own
+/// id, behind the items it already holds, and from then on they are its own, counting
+/// toward its `max_items`. A store looks for orphans when it opens, before `new` returns,
+/// and then every [`orphan_interval`](WebConfig::orphan_interval). Nothing is shared, so
+/// items from several tabs have no order relative to each other.
+///
+/// Whether a tab still exists is told by a [Web Lock]: each store holds the lock
+/// `transientdb:{database_name}:tab:{tab id}` from before it writes anything until it is
+/// dropped, and the browser releases it when the page goes away. Adopting a tab's items
+/// takes that tab's lock first, so two tabs never adopt the same items, and a tab's items
+/// are never adopted while it lives. Dropping a store releases its lock: its items are
+/// orphans from then on, and any store on the same database, even in the same page, may
+/// adopt them.
+///
+/// Web Locks need a secure context (https, or `localhost`). Without them the store works
+/// in memory only (see below): items it wrote could never be safely adopted.
+///
+/// [Web Lock]: https://developer.mozilla.org/docs/Web/API/Web_Locks_API
+///
+/// # Flushing when the page closes
+///
+/// A send started while the page is closing cannot report back, so the store cannot learn
+/// that it succeeded. For the last batch, remove the items *before* sending them:
+///
+/// ```ignore
+/// if let Some(items) = store.fetch(100, 64 * 1024)? {
+///     let body = items.json();
+///     store.remove(items)?; // the IndexedDB delete is issued during this call
+///     navigator.send_beacon_with_opt_str(url, Some(&body));
+/// }
+/// ```
+///
+/// If the beacon fails, that batch is lost: at most once, and the last batch only. If the
+/// delete does not commit before the page is gone, the batch is adopted by another tab,
+/// or the reloaded page, and sent again. Do the main flush on `visibilitychange` to
+/// `hidden`, while the page is still alive and sends can report back, and keep this for
+/// what is left.
 ///
 /// # Persistence Behavior
 ///
-/// The store attempts to use IndexedDB for durable storage. If IndexedDB is
-/// unavailable (private browsing, third-party context, storage blocked, etc),
-/// the store falls back to memory-only mode and logs a warning to the console.
+/// The store attempts to use IndexedDB for durable storage. If IndexedDB or Web Locks
+/// are unavailable (private browsing, third-party context, storage blocked, an insecure
+/// context, etc), the store falls back to memory-only mode and logs a warning to the
+/// console. In memory-only mode nothing is written, and nothing is adopted.
 ///
 /// Use [`persistence_state()`](Self::persistence_state) to check the current
 /// mode and adjust behavior accordingly (e.g., flush more aggressively when
@@ -111,7 +178,7 @@ pub enum PersistenceState {
 ///   store closes its connection at once and carries on in memory-only mode, with every
 ///   item it holds, and logs a warning. Its items stored in IndexedDB stay there for the
 ///   newer version to deal with; nothing it does from then on is written, so the items it
-///   removes afterwards stay there too.
+///   removes afterwards stay there too. It adopts nothing more.
 ///
 /// So [`persistence_state()`](Self::persistence_state) can change from `Persisted` to
 /// `MemoryOnly` while the store is in use, but never back.
@@ -123,176 +190,49 @@ pub enum PersistenceState {
 /// upcoming changes all affect this. In third-party contexts, expect memory-only
 /// mode to be common.
 pub struct WebStore {
+	shared: Rc<Shared>,
+	/// This store's liveness lock, held until the store is dropped. `None` in memory-only
+	/// mode.
+	liveness: Option<lock::Held>,
+	/// The timer that runs an adoption pass every `orphan_interval`. `None` in memory-only
+	/// mode.
+	adoption: Option<interval::Interval>,
+}
+
+/// What the store and its adoption passes share.
+struct Shared {
 	config: WebConfig,
-	/// In-memory queue - this is the source of truth for sync operations
-	queue: Queue,
+	/// This store's tab id, under which its records are kept.
+	tab: String,
+	/// The source of truth for sync operations. Never borrowed across an `await`.
+	queue: RefCell<Queue>,
 	/// IndexedDB database handle (None if unavailable/blocked)
-	db: Option<Rc<IdbDatabase>>,
+	db: Option<IdbDatabase>,
 	/// Set once `db` has closed itself for another page's upgrade; see [`connect`].
 	closed: Rc<Cell<bool>>,
+	/// Set while an adoption pass runs, so that no other starts.
+	passing: Cell<bool>,
+	/// Set once the store is dropped, so that a pass still running stops.
+	dropped: Cell<bool>,
+	/// How many times the store has been reset: an adoption that began before a reset
+	/// adopts nothing, as the reset clears what it would.
+	resets: Cell<u64>,
+	/// How many adoption passes have started, for tests.
+	#[cfg(test)]
+	passes: Cell<usize>,
 }
 
-impl WebStore {
-	/// Creates a new WebStore with IndexedDB persistence.
-	///
-	/// This opens (or creates) the IndexedDB database and hydrates in-memory state from
-	/// any previously persisted items. An item's text is not parsed again: it was checked
-	/// when it was appended. A stored record that is not an item (without a usable
-	/// sequence number and a non-empty text string), or whose text is larger than
-	/// `max_item_size`, is discarded, and if more items are stored than `max_items`
-	/// allows, the oldest are dropped; both are logged to the console and deleted from
-	/// IndexedDB.
-	///
-	/// If IndexedDB is unavailable (private browsing, third-party context,
-	/// storage blocked, etc), or its contents cannot be read, the store falls
-	/// back to memory-only mode and logs a warning to the console. Check
-	/// [`persistence_state()`](Self::persistence_state) to detect this condition.
-	///
-	/// # Panics
-	/// * If `max_item_size` is 0
-	/// * If `max_items` is 0
-	pub async fn new(config: WebConfig) -> Self {
-		if config.max_item_size == 0 {
-			panic!("max_item_size = 0? Even `0` takes a byte. There is no item that small.");
-		}
-		if config.max_items == 0 {
-			panic!("max_items = 0? So... you want a store that stores nothing? That's what /dev/null is for.");
-		}
-
-		let mut store = Self {
-			queue: Queue::new(config.max_items, idb::MAX_SEQ),
-			config,
-			db: None,
-			closed: Rc::new(Cell::new(false)),
-		};
-
-		// Attempt to open IndexedDB - fall back to memory-only if it fails
-		let warn = |message: String| web_sys::console::warn_1(&message.into());
-		let db = match connect::open(&store.config.database_name).await {
-			Ok(db) => db,
-			Err(e) => {
-				warn(format!(
-					"IndexedDB unavailable ({e}), falling back to memory-only storage. Events \
-					 will not persist across page refreshes. Consider increasing flush frequency."
-				));
-				return store;
-			}
-		};
-		// Before hydrating, so that a newer version asked for meanwhile is not blocked.
-		store.closed = connect::close_on_versionchange(&db);
-		match store.hydrate(&db).await {
-			Ok(()) => store.db = Some(Rc::new(db)),
-			Err(e) => {
-				// Without the stored sequence numbers, new ones could collide with them, so
-				// writing to this database is not safe. Leave it untouched.
-				db.close();
-				store.queue = Queue::new(store.config.max_items, idb::MAX_SEQ);
-				warn(format!(
-					"Failed to hydrate from IndexedDB ({e:?}), falling back to memory-only storage."
-				));
-			}
-		}
-		store
-	}
-
-	/// Returns the current persistence state of the store.
-	///
-	/// Use this to detect when the store is operating in degraded mode
-	/// and adjust behavior accordingly (e.g., flush more frequently).
-	///
-	/// # Example
-	///
-	/// ```ignore
-	/// let store = WebStore::new(config).await;
-	///
-	/// let flush_interval = match store.persistence_state() {
-	///     PersistenceState::Persisted => Duration::from_secs(30),
-	///     PersistenceState::MemoryOnly => Duration::from_secs(5), // Flush aggressively
-	/// };
-	/// ```
-	pub fn persistence_state(&self) -> PersistenceState {
-		match self.live_db() {
-			Some(_) => PersistenceState::Persisted,
-			None => PersistenceState::MemoryOnly,
-		}
-	}
-
-	/// Returns `true` if IndexedDB persistence is available.
-	///
-	/// Convenience method equivalent to checking if
-	/// `persistence_state() == PersistenceState::Persisted`.
-	pub fn is_persisted(&self) -> bool {
-		self.persistence_state() == PersistenceState::Persisted
-	}
-
-	/// The connection to write to: `None` when there is none, or it has been closed.
-	fn live_db(&self) -> Option<&IdbDatabase> {
-		self.db.as_deref().filter(|_| !self.closed.get())
-	}
-
-	/// Fire-and-forget delete of `seqs` from IndexedDB
-	fn delete_from_idb(&self, seqs: &[u64]) {
-		let Some(db) = self.live_db() else { return };
-		if seqs.is_empty() {
-			return;
-		}
-		idb::fire_and_forget("delete", idb::delete(db, seqs));
-	}
+/// Logs a warning to the console, and, in tests, keeps it in `WARNINGS`.
+fn warn(message: &str) {
+	#[cfg(test)]
+	WARNINGS.with_borrow_mut(|warnings| warnings.push(message.to_owned()));
+	web_sys::console::warn_1(&message.into());
 }
 
-impl DataStore for WebStore {
-	/// Appends an item, dropping the oldest one if the store holds `max_items` already,
-	/// in memory and in IndexedDB.
-	///
-	/// # Errors
-	/// [`Error::ItemTooDeep`](crate::Error) or [`Error::ItemTooLarge`](crate::Error),
-	/// changing nothing and writing nothing, as described on [`DataStore::append`]. An
-	/// `Io` error, changing nothing, once the store has used up its sequence numbers: they
-	/// never wrap, so no two items can share one. That takes 2^53 - 1 appends (the most an
-	/// IndexedDB number key holds exactly), or fewer, none at all, if the database held a
-	/// record numbered at or near that limit when the store opened (only possible if
-	/// something else wrote it; only records numbered 1 to 2^53 - 1 count). It lasts until
-	/// the record is gone (`reset` deletes it) and the store is opened again, as on a page
-	/// reload. A failed IndexedDB write is not an error; it is logged, and the item is
-	/// still queued in memory.
-	fn append(&mut self, data: Value) -> Result<()> {
-		let text = serialize::item_text(data, self.config.max_item_size)?;
-		let (seq, dropped) = self.queue.push(text.clone())?;
-		if let Some(db) = self.live_db() {
-			idb::fire_and_forget("write", idb::add(db, seq, &text));
-		}
-		self.delete_from_idb(&dropped);
-		Ok(())
-	}
-
-	/// Hands out the oldest items, as described on [`DataStore::fetch`]. Writes nothing
-	/// to IndexedDB.
-	fn fetch(&mut self, count: usize, max_bytes: usize) -> Result<Option<Items>> {
-		Ok(self.queue.fetch(count, max_bytes))
-	}
-
-	/// Deletes the items in `items`, in memory and in IndexedDB.
-	///
-	/// Only an `Items` this instance issued counts, so one from another `WebStore` opened
-	/// on the same `database_name`, holding the same items under the same sequence
-	/// numbers, is ignored.
-	fn remove(&mut self, items: Items) -> Result<()> {
-		let gone = self.queue.remove(items);
-		self.delete_from_idb(&gone);
-		Ok(())
-	}
-
-	/// Removes every item, in memory and in IndexedDB.
-	fn reset(&mut self) {
-		self.queue.reset();
-		if let Some(db) = self.live_db() {
-			idb::fire_and_forget("clear", idb::clear(db));
-		}
-	}
-
-	fn has_data(&self) -> bool {
-		self.queue.has_data()
-	}
+#[cfg(test)]
+thread_local! {
+	/// Every warning the store has logged through [`warn`], for tests to check and clear.
+	static WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

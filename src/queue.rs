@@ -72,19 +72,22 @@ impl Queue {
 		Ok(seq)
 	}
 
-	/// Adds an item read back from storage. Items must be restored in sequence order;
-	/// the next sequence number given out is above every restored one.
+	/// Deletes the items under `seqs`, wherever they are in the queue, pending or not:
+	/// an `Items` holding one matches nothing for it. `seqs` need not be sorted, and a
+	/// sequence number the queue does not hold is skipped.
 	#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
-	pub(crate) fn restore(&mut self, seq: u64, text: String) {
-		debug_assert!(self.items.back().map(|last| last.seq) < Some(seq));
-		self.items.push_back(Stored { seq, text });
-		self.skip_past(seq);
-	}
-
-	/// Makes sure no sequence number up to `seq` is given out.
-	#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
-	pub(crate) fn skip_past(&mut self, seq: u64) {
-		self.next_seq = self.next_seq.max(seq.saturating_add(1));
+	pub(crate) fn discard(&mut self, seqs: &[u64]) {
+		if seqs.is_empty() {
+			return;
+		}
+		let mut sorted = seqs.to_vec();
+		sorted.sort_unstable();
+		self.items
+			.retain(|item| sorted.binary_search(&item.seq).is_err());
+		let mut claims = self.ledger.lock();
+		for &seq in seqs {
+			claims.forget(seq);
+		}
 	}
 
 	/// Drops the oldest items until at most `max_items` remain; returns their sequence

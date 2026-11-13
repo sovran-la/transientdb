@@ -18,8 +18,9 @@ async fn test_failed_write_leaves_memory_and_other_records_intact() {
 	// Occupy the sequence number the next append will be stored under, so its add fails
 	// with a constraint error and its transaction aborts.
 	let blocker = json!("already stored under this key");
-	let db = store.db.clone().unwrap();
-	let occupied = idb::add(&db, store.queue.next_seq, &blocker.to_string()).unwrap();
+	let db = store.db();
+	let next_seq = store.queue().next_seq;
+	let occupied = idb::add(&db, store.tab(), next_seq, &blocker.to_string()).unwrap();
 	idb::completion(&occupied).await.unwrap();
 
 	let failed = json!({"i": "fails to persist"});
@@ -36,14 +37,13 @@ async fn test_failed_write_leaves_memory_and_other_records_intact() {
 
 	// IndexedDB keeps every other record, and the writes after the failure persisted.
 	assert_eq!(
-		hydrated(db_name).await,
+		persisted_values(&store).await,
 		[before.clone(), vec![blocker.clone()], after.clone()].concat()
 	);
 
 	// Removing items, the failed one included, still works in both places. Removing
 	// the failed item deletes its key, the one the blocking record was put under.
 	store.remove(fetched).unwrap();
-	settle().await;
 	assert!(!store.has_data());
-	assert!(hydrated(db_name).await.is_empty());
+	assert!(records(&store).await.is_empty());
 }

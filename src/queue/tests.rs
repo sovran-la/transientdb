@@ -70,16 +70,19 @@ fn test_adopt_stops_at_max_seq() {
 }
 
 #[test]
-fn test_restore_keeps_order_and_moves_next_seq_past_it() {
-	let mut queue = Queue::new(10, 1000);
-	queue.restore(4, "x".into());
-	queue.restore(9, "y".into());
-	assert_eq!(queue.next_seq, 10);
-	assert_eq!(queue.push("z".into()).unwrap(), (10, vec![]));
-	queue.skip_past(20);
-	assert_eq!(queue.push("w".into()).unwrap(), (21, vec![]));
-	queue.skip_past(5);
-	assert_eq!(queue.next_seq, 22);
+fn test_discard_deletes_wherever_and_forgets_claims() {
+	let mut queue = queue_of(&["a", "b", "c", "d", "e"], 10);
+	let held = queue.fetch(3, 100).unwrap();
+	queue.discard(&[4, 2, 99]);
+	assert_eq!(texts(&queue), ["a", "c", "e"]);
+	// The discarded pending item is no longer pending; the others still are.
+	assert_eq!(queue.ledger.lock().pending_count(), 2);
+	assert_eq!(queue.remove(held), vec![1, 3]);
+	assert_eq!(texts(&queue), ["e"]);
+	queue.discard(&[]);
+	assert_eq!(texts(&queue), ["e"]);
+	// Discarding does not rewind the sequence.
+	assert_eq!(queue.push("f".into()).unwrap(), (6, vec![]));
 }
 
 #[test]

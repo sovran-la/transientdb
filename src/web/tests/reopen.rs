@@ -1,4 +1,4 @@
-//! Hydration is WebStore's recovery step: reopening any number of times, and repeating a
+//! Adoption is WebStore's recovery step: reopening any number of times, and repeating a
 //! fetch, never changes or duplicates what is stored.
 
 use super::*;
@@ -11,15 +11,17 @@ async fn test_repeated_reopening_changes_nothing() {
 		return;
 	};
 	append_all(&mut store, &tagged(0..4));
-	settle().await;
+	drop(store);
 
+	// Each reopened store adopts the last one's items, and leaves them when it goes:
+	// never more, never fewer, never another order.
 	for _ in 0..4 {
 		let reopened = WebStore::new(config(db_name, 4096, 1000)).await;
-		assert_eq!(stored(&reopened), stored(&store));
-		let db = reopened.db.clone().unwrap();
-		assert_eq!(idb::read_all(&db).await.unwrap().len(), 4);
+		assert_eq!(queued(&reopened), tagged(0..4));
+		assert_eq!(flushed(&reopened).await, stored(&reopened));
+		assert_eq!(records(&reopened).await.len(), 4);
 	}
-	store.reset();
+	fresh_store(db_name, 4096, 1000).await;
 	settle().await;
 }
 
@@ -38,7 +40,7 @@ async fn test_fetching_and_releasing_writes_nothing() {
 	}
 	if store.is_persisted() {
 		assert_eq!(flushed(&store).await, stored(&store));
-		assert_eq!(hydrated(db_name).await, appended);
+		assert_eq!(persisted_values(&store).await, appended);
 	}
 	assert_eq!(drain(&mut store, 100, 4096).concat(), appended);
 	settle().await;

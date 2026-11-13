@@ -14,10 +14,11 @@ async fn web_db(db_name: &str, max_item_size: usize) -> TransientDB {
 			database_name: db_name.to_string(),
 			max_item_size,
 			max_items: 10_000,
+			orphan_interval: std::time::Duration::from_secs(30),
 		})
 		.await,
 	);
-	// Discard anything hydrated from a previous run.
+	// Discard anything adopted from a previous run.
 	db.reset();
 	db
 }
