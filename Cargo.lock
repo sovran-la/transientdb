@@ -318,6 +318,7 @@ dependencies = [
  "getrandom",
  "gloo-timers",
  "js-sys",
+ "log",
  "rand",
  "serde",
  "serde_json",

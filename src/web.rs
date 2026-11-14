@@ -175,8 +175,8 @@ pub enum PersistenceState {
 ///
 /// The store attempts to use IndexedDB for durable storage. If IndexedDB or Web Locks
 /// are unavailable (private browsing, third-party context, storage blocked, an insecure
-/// context, etc), the store falls back to memory-only mode and logs a warning to the
-/// console. In memory-only mode nothing is written, and nothing is adopted.
+/// context, etc), the store falls back to memory-only mode and logs a warning (see
+/// [Logging](crate#logging)). In memory-only mode nothing is written, and nothing is adopted.
 ///
 /// Use [`persistence_state()`](Self::persistence_state) to check the current
 /// mode and adjust behavior accordingly (e.g., flush more aggressively when
@@ -250,11 +250,11 @@ struct Shared {
 	passes: Cell<usize>,
 }
 
-/// Logs a warning to the console, and, in tests, keeps it in `WARNINGS`.
+/// Logs a warning through the `log` facade, and, in tests, keeps it in `WARNINGS`.
 fn warn(message: &str) {
 	#[cfg(test)]
 	WARNINGS.with_borrow_mut(|warnings| warnings.push(message.to_owned()));
-	web_sys::console::warn_1(&message.into());
+	log::warn!(target: crate::LOG_TARGET, "WebStore: {message}");
 }
 
 #[cfg(test)]

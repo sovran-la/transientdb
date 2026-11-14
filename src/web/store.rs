@@ -92,11 +92,11 @@ impl WebStore {
 	/// stored record that is not an item (without a usable sequence number and a non-empty
 	/// text string), or whose text is larger than `max_item_size`, is discarded, and if
 	/// adopting takes the store past `max_items`, the oldest are dropped; both are logged
-	/// to the console and deleted from IndexedDB.
+	/// (see [Logging](crate#logging)) and deleted from IndexedDB.
 	///
 	/// If IndexedDB or Web Locks are unavailable (private browsing, third-party context,
 	/// storage blocked, not a secure context, etc), the store falls back to memory-only
-	/// mode and logs a warning to the console. Check
+	/// mode and logs a warning. Check
 	/// [`persistence_state()`](Self::persistence_state) to detect this condition.
 	///
 	/// # Panics

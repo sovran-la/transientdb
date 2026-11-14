@@ -165,6 +165,7 @@ dependencies = [
  "futures-channel",
  "getrandom",
  "js-sys",
+ "log",
  "serde",
  "serde_json",
  "wasm-bindgen",
