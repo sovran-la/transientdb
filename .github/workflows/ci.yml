@@ -333,3 +333,32 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --${{ matrix.browser }} --features web
+
+  wasm-tests-safari:
+    name: WASM Tests - safari
+    # Safari only runs on macOS. Every browser on iOS uses the same engine (WebKit), so
+    # this is also our only coverage of how iPhones and iPads behave.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Enable safaridriver
+        # Safari refuses WebDriver sessions until remote automation is allowed.
+        run: sudo safaridriver --enable
+
+      - name: Run WASM tests
+        # Safari has no headless mode; --headless makes wasm-pack drive it through
+        # safaridriver instead of serving an interactive test page.
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: wasm-pack test --headless --safari --features web
