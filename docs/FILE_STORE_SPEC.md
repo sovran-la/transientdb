@@ -433,6 +433,17 @@ Only the store's own operations return a `Result`. Nothing on `Items` does.
 Things the store handles itself are not errors: a file that does not match, a
 damaged item, a full store. Those are logged.
 
+### Logging
+
+Every log line goes through the `log` facade with the target `transientdb`
+(`LOG_TARGET`), names the file (`FileStore {path}: ...`), and never contains an
+item's text. Something the store worked around (a file that does not match and is
+discarded, a damaged or lost item freed, the oldest item dropped from a full store,
+a second store refused the file) is a warning. A read or write the OS refused
+(opening the file, a failed write, freeing a slot, cutting the file back, a reset
+that did nothing) is an error, as is running out of sequence numbers. Nothing is
+written to stderr: where the lines go is the application's logger's choice.
+
 ## When the store is full
 
 When `max_items` items are live, `append` drops the oldest item: the live item

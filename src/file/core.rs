@@ -47,7 +47,7 @@ impl FileCore {
 				match read_header(&mut file, len, config)? {
 					Ok(()) => return Self::scan(file, path, layout, len, config.max_items),
 					Err(mismatch) => {
-						log(path, format_args!("discarding the file: {mismatch}"));
+						warn(path, format_args!("discarding the file: {mismatch}"));
 						drop(file);
 						delete(path, &hook)?;
 					}
@@ -81,14 +81,25 @@ impl FileCore {
 		})
 	}
 
-	pub(super) fn log(&self, message: std::fmt::Arguments) {
-		log(&self.path, message);
+	/// Logs a warning about this store's file: something the store handled itself.
+	pub(super) fn warn(&self, message: std::fmt::Arguments) {
+		warn(&self.path, message);
+	}
+
+	/// Logs an error about this store's file: a read or write the OS refused.
+	pub(super) fn error(&self, message: std::fmt::Arguments) {
+		error(&self.path, message);
 	}
 }
 
-/// Logs one line about the store file at `path`.
-pub(super) fn log(path: &Path, message: std::fmt::Arguments) {
-	eprintln!("FileStore {}: {message}", path.display());
+/// Logs a warning about the store file at `path`, through the `log` facade.
+pub(super) fn warn(path: &Path, message: std::fmt::Arguments) {
+	log::warn!(target: crate::LOG_TARGET, "FileStore {}: {message}", path.display());
+}
+
+/// Logs an error about the store file at `path`, through the `log` facade.
+pub(super) fn error(path: &Path, message: std::fmt::Arguments) {
+	log::error!(target: crate::LOG_TARGET, "FileStore {}: {message}", path.display());
 }
 
 /// Checks the header of a file of `len` bytes against `config`'s.

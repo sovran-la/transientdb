@@ -61,7 +61,7 @@ impl FileCore {
 			core.index.renew_exhausted_sequences();
 		}
 		if core.index.upcoming_sequence().is_err() {
-			core.log(format_args!(
+			core.error(format_args!(
 				"sequence numbers are exhausted: every append fails until the store is reset, \
 				 or emptied and opened again"
 			));
@@ -74,8 +74,8 @@ impl FileCore {
 	fn clear_state(&mut self, slot: u64, why: &str) {
 		let offset = self.layout.entry_offset(slot);
 		match self.file.write_at(offset, &[FREE], Op::State) {
-			Ok(()) => self.log(format_args!("freed slot {slot}: {why}")),
-			Err(e) => self.log(format_args!(
+			Ok(()) => self.warn(format_args!("freed slot {slot}: {why}")),
+			Err(e) => self.error(format_args!(
 				"slot {slot} is treated as free ({why}), but clearing it failed: {e}"
 			)),
 		}
@@ -95,13 +95,13 @@ impl FileCore {
 			self.index.remove(sequence);
 			let offset = self.layout.entry_offset(live.slot);
 			if let Err(e) = self.file.write_at(offset, &[FREE], Op::State) {
-				self.log(format_args!(
+				self.error(format_args!(
 					"dropping item {sequence} for max_items, clearing slot {} failed: {e}",
 					live.slot
 				));
 			}
 		}
-		self.log(format_args!(
+		self.warn(format_args!(
 			"dropped the {excess} oldest items: more were stored than max_items ({}) allows",
 			self.max_items
 		));

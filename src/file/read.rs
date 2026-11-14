@@ -82,7 +82,7 @@ impl FileCore {
 	/// which is not this store's to free.
 	fn forget(&mut self, sequence: u64, why: &str) {
 		if let Some(slot) = self.index.remove(sequence) {
-			self.log(format_args!(
+			self.warn(format_args!(
 				"lost item {sequence} in slot {slot}: {why}; is another process using this file?"
 			));
 			self.shrink_if_empty();

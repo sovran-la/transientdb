@@ -66,14 +66,14 @@ impl FileCore {
 		} = target
 		{
 			self.index.remove(oldest);
-			self.log(format_args!(
+			self.warn(format_args!(
 				"dropped item {oldest}, the oldest: the store holds {} items at most",
 				self.max_items
 			));
 		}
 		if let Err(e) = committed {
 			if let Err(state) = self.file.write_at(entry_offset, &[FREE], Op::State) {
-				self.log(format_args!(
+				self.error(format_args!(
 					"writing item {sequence}'s entry failed ({e}), and so did freeing slot {slot}: {state}"
 				));
 			}
@@ -95,7 +95,7 @@ impl FileCore {
 		};
 		let offset = self.layout.entry_offset(live.slot);
 		if let Err(e) = self.file.write_at(offset, &[FREE], Op::State) {
-			self.log(format_args!("removing item {sequence} failed: {e}"));
+			self.error(format_args!("removing item {sequence} failed: {e}"));
 			return Err(e);
 		}
 		self.index.remove(sequence);
@@ -112,8 +112,8 @@ impl FileCore {
 		};
 		let offset = self.layout.entry_offset(slot);
 		match self.file.write_at(offset, &[FREE], Op::State) {
-			Ok(()) => self.log(format_args!("freed item {sequence} in slot {slot}: {why}")),
-			Err(e) => self.log(format_args!(
+			Ok(()) => self.warn(format_args!("freed item {sequence} in slot {slot}: {why}")),
+			Err(e) => self.error(format_args!(
 				"skipping item {sequence} in slot {slot} ({why}), but freeing it failed: {e}"
 			)),
 		}
@@ -136,7 +136,7 @@ impl FileCore {
 				true
 			}
 			Err(e) => {
-				self.log(format_args!(
+				self.error(format_args!(
 					"cutting the file back to its header failed: {e}"
 				));
 				false
