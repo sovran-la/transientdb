@@ -352,13 +352,28 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Enable safaridriver
-        # Safari refuses WebDriver sessions until remote automation is allowed.
-        run: sudo safaridriver --enable
+      - name: Start safaridriver
+        # Safari refuses WebDriver sessions until remote automation is allowed. The test
+        # runner's own safaridriver launch gives up before a fresh runner's first launch
+        # binds its port ("driver failed to bind port during startup"), so start one here,
+        # wait until it answers, and hand it to the runner with SAFARIDRIVER_REMOTE.
+        run: |
+          sudo safaridriver --enable
+          safaridriver --port 4444 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:4444/status > /dev/null; then
+              echo "safaridriver is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "safaridriver did not start within 60s"
+          exit 1
 
       - name: Run WASM tests
         # Safari has no headless mode; --headless makes wasm-pack drive it through
         # safaridriver instead of serving an interactive test page.
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
+          SAFARIDRIVER_REMOTE: http://127.0.0.1:4444
         run: wasm-pack test --headless --safari --features web
