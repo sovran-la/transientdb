@@ -25,9 +25,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest};
 
-fn warn(message: &str) {
-	web_sys::console::warn_1(&message.into());
-}
+use super::warn;
 
 /// How long `open` waits, once it is `blocked`, for the upgrade to start before it gives
 /// up: long enough for a closing connection's last transactions to commit. Once the

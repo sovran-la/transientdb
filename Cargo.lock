@@ -312,12 +312,13 @@ dependencies = [
 
 [[package]]
 name = "transientdb"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "futures-channel",
  "getrandom",
  "gloo-timers",
  "js-sys",
+ "log",
  "rand",
  "serde",
  "serde_json",

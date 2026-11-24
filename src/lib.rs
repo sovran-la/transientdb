@@ -25,6 +25,15 @@
 //! }
 //! assert!(!db.has_data());
 //! ```
+//!
+//! # Logging
+//!
+//! What a store handles itself without returning an error (a file that does not match
+//! its config, a damaged item, the oldest item dropped from a full store, an IndexedDB
+//! that is unavailable) is reported through the [`log`](https://docs.rs/log) facade, with
+//! the target [`LOG_TARGET`]: as a warning, or as an error when the OS refused a read or
+//! a write. Nothing is printed to stderr or the console directly, so the messages go
+//! wherever the application's logger sends them, and nowhere if it installs none.
 
 mod claims;
 #[cfg(test)]
@@ -44,6 +53,9 @@ mod transient;
 mod web;
 
 use serde_json::Value;
+
+/// The `log` target of every message this crate logs (see [Logging](crate#logging)).
+pub const LOG_TARGET: &str = "transientdb";
 
 pub use error::{Error, Result};
 #[cfg(not(target_arch = "wasm32"))]

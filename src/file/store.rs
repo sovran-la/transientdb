@@ -2,7 +2,7 @@
 //! ledger.
 
 use super::config::FileConfig;
-use super::core::{log, FileCore};
+use super::core::{error, warn, FileCore};
 use super::faults::Hook;
 use super::index::Target;
 use super::registry::{self, Lease};
@@ -121,13 +121,13 @@ impl FileStore {
 		};
 		match store.parts() {
 			Ok(_) => {}
-			Err(Error::InUse) => log(
+			Err(Error::InUse) => warn(
 				&store.config.path,
 				format_args!(
 					"another store in this process is using this file; this one waits for it"
 				),
 			),
-			Err(e) => log(
+			Err(e) => error(
 				&store.config.path,
 				format_args!("could not open the file ({e}); every call tries again"),
 			),
@@ -278,7 +278,7 @@ impl DataStore for FileStore {
 			Ok(parts) => parts,
 			Err(Error::InUse) => return,
 			Err(e) => {
-				log(&self.config.path, format_args!("reset did nothing: {e}"));
+				error(&self.config.path, format_args!("reset did nothing: {e}"));
 				return;
 			}
 		};
